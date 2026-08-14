@@ -162,10 +162,11 @@ fixed; it is all recorded so it can be picked up deliberately.
 - [x] ~~Per-server memory and CPU had no UI~~ — a Resources panel on each
       server's Settings page now edits both, showing the JVM heap the container
       will actually be given (reported by the agent, not recomputed).
-- [ ] **MCP tokens have no UI at all.** `GET/POST/DELETE /api/mcp-tokens` are
-      implemented and admin-gated, and the MCP server is a headline feature —
-      but there is no way to mint or revoke a token from the panel. Today it
-      takes a `curl` with a session cookie, which nobody will do.
+- [x] ~~MCP tokens have no UI~~ — Settings now has an "Agent access (MCP)"
+      panel: list, create and revoke. The token is rendered once in a
+      selectable field with a copy button rather than a toast, since only its
+      hash is stored and it cannot be recovered. Lifecycle verified end to end,
+      including that a revoked token stops authenticating.
 - [ ] **`/api/capabilities` is never read by the panel's own client.** It exists
       so a client can decide whether to offer a feature, and the one client
       that ships ignores it. Either wire it up or the endpoint is decoration.
@@ -176,10 +177,13 @@ fixed; it is all recorded so it can be picked up deliberately.
 
 ### 8b. Accessibility — currently none
 
-- [ ] **Zero `aria-` attributes** anywhere in the frontend.
-- [ ] **Zero `:focus-visible` rules** and only three `:focus` rules, so keyboard
-      navigation gives almost no visible indication of where you are. The panel
-      is effectively mouse-only.
+- [x] ~~Zero `aria-` attributes~~ — landmarks on the rail, tab strip and main
+      region, and toasts are a polite live region so they are announced.
+- [x] ~~Zero `:focus-visible` rules~~ — focus rings on every control, the
+      console scroll region, and a skip link (the icon rail is first in tab
+      order on every page, so without one a keyboard user walks the whole rail
+      to reach content). `:focus-visible` not `:focus`, so a mouse click does
+      not leave a ring behind — which is why the blunt version gets deleted.
 - [x] ~~`<button>` elements with no `type`~~ — 56 given `type="button"`; the
       login form's submit button kept `type="submit"` deliberately.
 

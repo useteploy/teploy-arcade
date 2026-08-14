@@ -273,11 +273,12 @@ async function viewBackups(id) {
 
 async function viewAdmin() {
   const root = h(`<div class="content"><div class="empty"><span class="spin"></span></div></div>`);
-  let me, users = [], audit = [];
+  let me, users = [], audit = [], tokens = [];
   try {
     me = await api('/api/me');
     if ((me.user && me.user.role === 'admin') || me.unclaimed) {
       try { users = (await api('/api/users')).users; } catch {}
+      try { tokens = (await api('/api/mcp-tokens')).tokens || []; } catch {}
     }
     audit = (await api('/api/audit?limit=80')).entries;
   } catch (e) { /* audit needs a session when auth is on */ }
@@ -386,6 +387,31 @@ async function viewAdmin() {
     </div>
 
     <div class="panelbox">
+      <h3>Agent access (MCP)</h3>
+      <div class="row"><span class="muted" style="font-size:12px;line-height:1.5">
+        Tokens let an AI agent drive this panel over MCP: reads, the lifecycle
+        verbs and backups. Deliberately narrower than the HTTP API &mdash; no
+        delete, no restore, no user management, no kill. A token is shown once
+        and stored only as a hash, so it cannot be recovered later.
+      </span></div>
+      ${!isAdmin ? '<div class="row muted">Admins only.</div>' : `
+        ${tokens.map((tk) => `<div class="row">
+            <span class="k">${esc(tk.name)}</span>
+            <span class="muted" style="font-size:12px">created ${new Date(tk.created * 1000).toLocaleDateString()}</span>
+            <span class="muted" style="font-size:12px">${tk.last_use ? 'last used ' + new Date(tk.last_use * 1000).toLocaleString() : 'never used'}</span>
+            <span class="spacer"></span>
+            <button type="button" class="btn btn-ghost btn-sm btn-icon" data-revoke="${esc(tk.name)}" title="Revoke"><i class="ico ico-sm ico-trash"></i></button>
+          </div>`).join('') || '<div class="row muted">No tokens yet.</div>'}
+        <div class="row"><span class="k">New token</span>
+          <span class="spacer"></span>
+          <input class="inp" id="mtName" placeholder="what will use it, e.g. claude-desktop" style="width:250px">
+          <button type="button" class="btn btn-sm" id="mtBtn">Create</button>
+        </div>
+        <div class="row" id="mtOut" hidden></div>
+      `}
+    </div>
+
+    <div class="panelbox">
       <h3>Audit log</h3>
       ${audit.length ? audit.map((e) => `<div class="row">
           <span class="muted" style="width:150px;flex:none;font-size:11.5px">${new Date(e.ts * 1000).toLocaleString()}</span>
@@ -458,6 +484,45 @@ async function viewAdmin() {
       toast('Admin created - auth is now enforced');
       router(true);
     } catch (e) { toast(e.message, 'err'); }
+  });
+
+  const mt = $('#mtBtn', root);
+  if (mt) mt.addEventListener('click', async () => {
+    const name = $('#mtName', root).value.trim();
+    if (!name) { toast('Name the token so you can tell them apart later', 'err'); return; }
+    mt.disabled = true;
+    try {
+      const res = await api('/api/mcp-tokens', {
+        method: 'POST',
+        body: JSON.stringify({ name }),
+      });
+      // Shown once, deliberately: only a hash is stored. Rendered rather than
+      // toasted so it can be selected and copied without racing a timeout.
+      const out = $('#mtOut', root);
+      out.hidden = false;
+      out.innerHTML = `<span class="k">Token</span><span class="spacer"></span>
+        <input class="inp mono" readonly value="${esc(res.token)}" style="width:420px" id="mtVal">
+        <button type="button" class="btn btn-sm" id="mtCopy">Copy</button>`;
+      $('#mtVal', root).select();
+      $('#mtCopy', root).addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(res.token); toast('Copied'); }
+        catch { $('#mtVal', root).select(); toast('Press cmd/ctrl+C to copy', 'err'); }
+      });
+      toast('Token created - copy it now, it is not shown again');
+    } catch (e) { toast(e.message, 'err'); }
+    mt.disabled = false;
+  });
+
+  root.querySelectorAll('[data-revoke]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const name = b.dataset.revoke;
+      if (!confirm(`Revoke the token "${name}"? Anything using it stops working immediately.`)) return;
+      try {
+        await api(`/api/mcp-tokens/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        toast('Token revoked');
+        router(true);
+      } catch (e) { toast(e.message, 'err'); }
+    });
   });
 
   const nu = $('#nuBtn', root);

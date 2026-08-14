@@ -14,10 +14,11 @@
 <script>(function(){try{var q=new URLSearchParams(location.search),r=document.documentElement;var t=q.get("theme")||localStorage.getItem("arcade-theme");if(t)r.setAttribute("data-theme",t);var c=q.get("contrast")||localStorage.getItem("arcade-contrast");if(c)r.setAttribute("data-contrast",c);var b=q.get("bg")||localStorage.getItem("arcade-bg");if(b)r.setAttribute("data-bg",b);}catch(e){}})();</script>
 </head>
 <body>
+  <a class="skip-link" href="#view">Skip to content</a>
 
 <div class="app">
 
-  <nav class="rail">
+  <nav class="rail" aria-label="Sections">
     <a class="rail-brand" href="#/servers" title="Teploy Arcade">
       <b>Teploy</b><i>Arcade</i>
     </a>
@@ -42,14 +43,14 @@
 
   <div class="main">
     <div class="tabstrip-wrap" id="tabstripWrap">
-      <div class="tabstrip" id="tabstrip"></div>
+      <div class="tabstrip" id="tabstrip" role="tablist" aria-label="Open servers"></div>
     </div>
-    <div id="view" class="viewhost"></div>
+    <div id="view" role="main" class="viewhost"></div>
   </div>
 </div>
 
 <div id="modalHost"></div>
-<div id="toasts" class="toasts"></div>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
 <script src="views.js"></script>
 <script src="views2.js"></script>
