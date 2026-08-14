@@ -1,0 +1,33 @@
+version: 2
+
+project_name: teploy-arcade
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: teploy-arcade
+    main: ./cmd/teploy-arcade
+    binary: teploy-arcade
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github

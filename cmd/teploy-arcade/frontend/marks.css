@@ -1,0 +1,27 @@
+/* marks.css - generated. Per-software identity marks for the server list,
+   tab strip and template picker. Original silhouettes, not vendor logos.
+   Usage: <span class="gm gm-purpur"></span> */
+
+.gm {
+  display: inline-block;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: contain;
+}
+.gm-xs { width: 18px; height: 18px; }
+.gm-sm { width: 26px; height: 26px; }
+.gm-lg { width: 42px; height: 42px; }
+
+.gm-purpur { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Cpolygon%20points='16,3%2027,9.2%2016,15.4%205,9.2'%20fill='%237fd8ee'/%3E%20%3Cpolygon%20points='5,9.2%2016,15.4%2016,28.6%205,22.4'%20fill='%238b5cf6'/%3E%20%3Cpolygon%20points='27,9.2%2016,15.4%2016,28.6%2027,22.4'%20fill='%23c0409f'/%3E%20%3Cpath%20d='M16%203%205%209.2v13.2L16%2028.6l11-6.2V9.2z'%20fill='none'%20stroke='%23241a2e'%20stroke-width='.7'/%3E%3C/svg%3E"); }
+.gm-paper { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20x='2.5'%20y='2.5'%20width='27'%20height='27'%20rx='4'%20fill='%23343a3f'/%3E%20%3Cpath%20d='M26%207%206.5%2015.4l7%202.3z'%20fill='%23f2f5f7'/%3E%20%3Cpath%20d='M26%207%2013.5%2017.7l.6%206.9%203.4-4.4z'%20fill='%23c9d2d8'/%3E%20%3Cpath%20d='M17.5%2020.2%2026%207l-8.5%2013.2%204.9%203.4z'%20fill='%23e4eaee'/%3E%3C/svg%3E"); }
+.gm-vanilla { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Cpolygon%20points='16,3.5%2027,9.6%2016,15.7%205,9.6'%20fill='%237cb342'/%3E%20%3Cpolygon%20points='5,9.6%2016,15.7%2016,28.5%205,22.4'%20fill='%238d6748'/%3E%20%3Cpolygon%20points='27,9.6%2016,15.7%2016,28.5%2027,22.4'%20fill='%236f5138'/%3E%20%3Cpath%20d='M16%203.5%205%209.6v12.8L16%2028.5l11-6.1V9.6z'%20fill='none'%20stroke='%23242018'%20stroke-width='.7'/%3E%3C/svg%3E"); }
+.gm-spigot { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20x='2.5'%20y='2.5'%20width='27'%20height='27'%20rx='4'%20fill='%23343a3f'/%3E%20%3Cpath%20d='M9%2012h11v4H9z'%20fill='%23e0b355'/%3E%20%3Cpath%20d='M16%2016h4v6a2%202%200%200%201-4%200z'%20fill='%23c9993c'/%3E%20%3Ccircle%20cx='11.5'%20cy='10'%20r='3.2'%20fill='%23e0b355'/%3E%20%3Crect%20x='19'%20y='10.5'%20width='4.5'%20height='2.4'%20rx='1.2'%20fill='%23c9993c'/%3E%3C/svg%3E"); }
+.gm-forge { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20x='2.5'%20y='2.5'%20width='27'%20height='27'%20rx='4'%20fill='%23343a3f'/%3E%20%3Cpath%20d='M6%2011.5h15l3.5%203-3.5%201.2H6z'%20fill='%23a2a8ad'/%3E%20%3Cpath%20d='M11%2015.7h6l-1.2%205.2h3.4v2.6H9.8v-2.6h3.4z'%20fill='%238d9398'/%3E%3C/svg%3E"); }
+.gm-fabric { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20x='2.5'%20y='2.5'%20width='27'%20height='27'%20rx='4'%20fill='%23343a3f'/%3E%20%3Crect%20x='7'%20y='7'%20width='18'%20height='18'%20rx='2'%20fill='%23d9d4c6'/%3E%20%3Cpath%20d='M11%207v18M16%207v18M21%207v18'%20stroke='%23b3ac99'%20stroke-width='1.1'/%3E%20%3Cpath%20d='M7%2011h18M7%2016h18M7%2021h18'%20stroke='%23c4bdab'%20stroke-width='1.1'/%3E%3C/svg%3E"); }
+.gm-proxy { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Cpath%20d='M9.5%2016%2022%208.5M9.5%2016%2022%2023.5'%20stroke='%236aa832'%20stroke-width='2.2'%20stroke-linecap='round'/%3E%20%3Ccircle%20cx='8'%20cy='16'%20r='4.6'%20fill='%238ccc45'/%3E%20%3Ccircle%20cx='23.5'%20cy='8'%20r='4'%20fill='%238ccc45'/%3E%20%3Ccircle%20cx='23.5'%20cy='24'%20r='4'%20fill='%238ccc45'/%3E%3C/svg%3E"); }
+.gm-bedrock { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Cpolygon%20points='16,3.5%2027,9.6%2016,15.7%205,9.6'%20fill='%238b9095'/%3E%20%3Cpolygon%20points='5,9.6%2016,15.7%2016,28.5%205,22.4'%20fill='%23646a6f'/%3E%20%3Cpolygon%20points='27,9.6%2016,15.7%2016,28.5%2027,22.4'%20fill='%234f5459'/%3E%20%3Cpath%20d='M16%203.5%205%209.6v12.8L16%2028.5l11-6.1V9.6z'%20fill='none'%20stroke='%23232629'%20stroke-width='.7'/%3E%3C/svg%3E"); }
+.gm-rust { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20x='2.5'%20y='2.5'%20width='27'%20height='27'%20rx='4'%20fill='%23343a3f'/%3E%20%3Cpath%20d='M8%2020.5%2017%2011.5l3.2%203.2-9%209a2.3%202.3%200%200%201-3.2-3.2z'%20fill='%23b8552f'/%3E%20%3Cpath%20d='m16%209%207%207%202.6-2.6a2%202%200%200%200%200-2.8l-4.2-4.2a2%202%200%200%200-2.8%200z'%20fill='%23cf6a3c'/%3E%3C/svg%3E"); }
+.gm-valheim { background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Cpath%20d='M16%203.5%2026%207v9.5c0%206.6-5.6%2010.6-10%2012.2-4.4-1.6-10-5.6-10-12.2V7z'%20fill='%235b8fb0'/%3E%20%3Cpath%20d='M16%203.5%2026%207v9.5c0%206.6-5.6%2010.6-10%2012.2z'%20fill='%234a7794'/%3E%20%3Cpath%20d='M16%209v13.5'%20stroke='%23cfe2ee'%20stroke-width='1.6'/%3E%20%3Cpath%20d='M10%2014h12'%20stroke='%23cfe2ee'%20stroke-width='1.6'/%3E%3C/svg%3E"); }

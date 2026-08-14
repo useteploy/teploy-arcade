@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Teploy Arcade</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="apple-touch-icon" href="favicon.svg">
+<meta name="theme-color" content="#08080e">
+<link rel="stylesheet" href="icons.css">
+<link rel="stylesheet" href="marks.css">
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="app.css">
+<script>(function(){try{var q=new URLSearchParams(location.search),r=document.documentElement;var t=q.get("theme")||localStorage.getItem("arcade-theme");if(t)r.setAttribute("data-theme",t);var c=q.get("contrast")||localStorage.getItem("arcade-contrast");if(c)r.setAttribute("data-contrast",c);var b=q.get("bg")||localStorage.getItem("arcade-bg");if(b)r.setAttribute("data-bg",b);}catch(e){}})();</script>
+</head>
+<body>
+
+<div class="app">
+
+  <nav class="rail">
+    <a class="rail-brand" href="#/servers" title="Teploy Arcade">
+      <b>Teploy</b><i>Arcade</i>
+    </a>
+    <a class="rail-item" data-nav="dashboard" href="#/dashboard"><i class="ico ico-dashboard"></i> Dashboard</a>
+    <a class="rail-item" data-nav="servers" href="#/servers"><i class="ico ico-layers"></i> Servers</a>
+    <a class="rail-item" data-nav="templates" href="#/templates"><i class="ico ico-box"></i> Templates</a>
+    <a class="rail-item" data-nav="settings" href="#/settings"><i class="ico ico-sliders"></i> Settings</a>
+    <div class="rail-foot">
+      <a class="rail-stat" id="dockerStat" href="#/host">
+        <span class="dot"></span> <span class="lb">Docker</span>
+      </a>
+      <a class="rail-stat" id="agentStat" href="#/host">
+        <span class="dot dot-on"></span> <span class="lb">Agent</span>
+      </a>
+      <div class="rail-ver" id="railVer">dev</div>
+    </div>
+  </nav>
+
+  <div class="main">
+    <div class="tabstrip" id="tabstrip"></div>
+    <div id="view" class="viewhost"></div>
+  </div>
+</div>
+
+<div id="modalHost"></div>
+<div id="toasts" class="toasts"></div>
+
+<script src="views.js"></script>
+<script src="views2.js"></script>
+<script src="views-plugins.js"></script>
+<script src="views-import.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

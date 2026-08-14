@@ -1,0 +1,15 @@
+# Local panel state: servers.json, users.json, audit.json, mcp-tokens.json,
+# and the servers/ + backups/ trees. Real worlds and real credentials.
+/data/
+
+# Build output
+/bin/
+/dist/
+# Root-anchored: a bare 'teploy-arcade' would also match cmd/teploy-arcade/,
+# which is the entire binary and frontend.
+/teploy-arcade
+
+# Local scratch
+*.tmp
+*.log
+.DS_Store

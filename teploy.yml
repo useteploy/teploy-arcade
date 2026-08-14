@@ -1,0 +1,88 @@
+# Teploy deployment for Teploy Arcade.
+#
+# READ THIS BEFORE USING IT: teploy cannot currently deploy this app, and this
+# file is kept as the target shape rather than a working config. The blocker is
+# not in Arcade.
+#
+# Arcade manages game servers by driving the host's Docker daemon, so the panel
+# container needs two host bind mounts:
+#
+#   /var/run/docker.sock  - the socket it creates game containers through
+#   <data dir>            - at the SAME path inside and out, because the game
+#                           containers are siblings and their -v paths are
+#                           resolved by the daemon on the host, not inside the
+#                           panel's filesystem
+#
+# teploy's `volumes:` maps a NAME to a container path and binds it under
+# /deployments/<app>/volumes/<name>. Volume keys are validated against
+# ^[a-z0-9][a-z0-9-]*[a-z0-9]$, so an absolute host path cannot be expressed,
+# and there is no raw-docker-options escape hatch. That rules out the socket.
+#
+# This affects a whole class of apps, not just this one - anything that talks to
+# the Docker socket (dashboards, CI runners, monitoring agents). Host bind
+# mounts in teploy would close it.
+#
+# HOW IT IS ACTUALLY DEPLOYED TODAY: natively, as a systemd unit, on a Docker
+# host. That is simpler than the container anyway - running the panel as a
+# sibling of the containers it manages is what creates the path-translation
+# problem in the first place, and running it natively means the paths simply
+# agree. See DEPLOY.md.
+#
+# The data volume below uses the one trick that does work: the container path is
+# set to the exact host path teploy will bind it at, so the two agree.
+
+app: teploy-arcade
+
+# Empty = publish a raw port with no HTTPS routing. Set a hostname to put Caddy
+# in front. On a LAN host with no public DNS, add `tls: {internal: true}` as
+# well, or Caddy will fail an ACME challenge it can never complete.
+domain: ""
+ingress: host
+port: 3457
+
+# A host alias from ~/.teploy/servers.yml, or a bare IP. teploy does not
+# interpolate environment variables here, so this is edited per deployment.
+server: arcade
+user: root
+
+dockerfile: ./Dockerfile
+context: .
+
+volumes:
+  # Container path deliberately equals the host path teploy binds it at
+  # (/deployments/<app>/volumes/<name>), so a sibling container's -v resolves to
+  # the same directory the panel sees. The Dockerfile CMD must be given
+  # `-data /deployments/teploy-arcade/volumes/data` to match.
+  data: /deployments/teploy-arcade/volumes/data
+
+health:
+  # /api/health, NOT /api/host. Every read route including /api/host requires a
+  # session once the first admin exists, so a healthcheck pointed there returns
+  # 200 on a fresh panel and 401 from the moment setup is completed - the
+  # container is then unhealthy forever, and the deploy that broke it is not the
+  # one that gets blamed.
+  path: /api/health
+  timeout_seconds: 60
+  interval_seconds: 2
+
+# No game-server ports are published here. The panel does not proxy game
+# traffic: it creates each server as a sibling container with its own
+# `-p <port>:<port>`. Publishing 25565-25600 on the panel would take those host
+# ports and every game server would fail with "port is already allocated".
+#
+# The ranges do need opening in the host firewall, which is a host concern:
+#   ufw allow 25565:25600/tcp
+#   ufw allow 19132:19140/udp    # Bedrock
+#   ufw allow 28015:28020/tcp    # Rust
+#
+# Provisioning the first admin means the panel is never unclaimed and the
+# operator never meets the setup flow or its token - the same role
+# TEPLOY_ARCADE_ADMIN_PASSWORD plays here that TEPLOY_DASH_PASSWORD plays for
+# teploy-dash. Omit it and the panel opens first-run setup instead, printing a
+# 30-minute token to its log.
+#
+# The password is a secret reference, not a literal: teploy resolves
+# `secret:NAME` from its own secret store, so it never lands in this file.
+env:
+  TEPLOY_ARCADE_ADMIN_USER: admin
+  TEPLOY_ARCADE_ADMIN_PASSWORD: secret:TEPLOY_ARCADE_ADMIN_PASSWORD
