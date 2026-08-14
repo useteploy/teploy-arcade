@@ -54,6 +54,15 @@ type Manager struct {
 	// SSE subscribers for panel-wide events (status changes, metrics).
 	subMu sync.Mutex
 	subs  map[chan []byte]struct{}
+
+	// Host CPU is a rate, so it needs the previous reading to mean anything.
+	// Directory sizes are walked on a slow ticker rather than per request: a
+	// world is gigabytes, and the dashboard asks for every server at once.
+	usageMu   sync.RWMutex
+	lastCPU   cpuSample
+	hostCPU   float64
+	dirSizes  map[string]int64
+	dirWalked time.Time
 }
 
 func NewManager(dataDir string, hub *Hub) *Manager {
@@ -68,6 +77,7 @@ func NewManager(dataDir string, hub *Hub) *Manager {
 		mcp:     newMCPTokens(dataDir),
 	}
 	m.reservedPorts = map[int]string{}
+	m.dirSizes = map[string]int64{}
 	m.sched = newScheduler(dataDir, m)
 	m.sim = &simRunner{mgr: m}
 	m.docker = &dockerRunner{mgr: m}
@@ -961,6 +971,10 @@ func (m *Manager) listSnapshot() []map[string]any {
 		// A real trace on the card, not a decorative squiggle. Thinned to 24
 		// points because that is all a 200px sparkline can show.
 		snap["spark"] = m.metrics.Series(s.ID, 15*time.Minute, 24)
+		// What the server costs on disk - worlds and backups are the reason a
+		// game host runs out of space, and it is per-server information the
+		// operator cannot get anywhere else in the panel.
+		snap["disk_mb"] = m.dirSizeMB(s.ID)
 		out = append(out, snap)
 	}
 	return out
@@ -972,6 +986,8 @@ func (m *Manager) metricsLoop() {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	for range t.C {
+		m.sampleHostCPU()
+		m.refreshDirSizes()
 		if len(m.List()) == 0 {
 			continue
 		}
@@ -986,6 +1002,70 @@ func (m *Manager) metricsLoop() {
 
 // Host reports the machine's allocation ledger. Allocated, not used: the
 // overcommit check is about the sum of limits.
+// sampleHostCPU turns two cumulative readings into a percentage. The first
+// tick after start has nothing to compare against and reports nothing rather
+// than a number derived from boot-time totals.
+func (m *Manager) sampleHostCPU() {
+	cur, ok := readCPUSample()
+	if !ok {
+		return
+	}
+	m.usageMu.Lock()
+	prev := m.lastCPU
+	m.lastCPU = cur
+	if prev.total > 0 && cur.total > prev.total {
+		busy := float64(cur.busy - prev.busy)
+		total := float64(cur.total - prev.total)
+		m.hostCPU = busy / total * 100
+	}
+	m.usageMu.Unlock()
+}
+
+// dirSizeMB is the on-disk size of a server's directory, refreshed on a slow
+// ticker. Walking a multi-gigabyte world on every dashboard render would make
+// the panel the most expensive thing on the host.
+func (m *Manager) dirSizeMB(id string) int64 {
+	m.usageMu.RLock()
+	v := m.dirSizes[id]
+	m.usageMu.RUnlock()
+	return v
+}
+
+const dirSizeInterval = 2 * time.Minute
+
+// refreshDirSizes walks every server directory. Called from the metrics loop,
+// rate-limited by dirWalked.
+func (m *Manager) refreshDirSizes() {
+	m.usageMu.RLock()
+	fresh := time.Since(m.dirWalked) < dirSizeInterval
+	m.usageMu.RUnlock()
+	if fresh {
+		return
+	}
+	m.usageMu.Lock()
+	m.dirWalked = time.Now()
+	m.usageMu.Unlock()
+
+	sizes := map[string]int64{}
+	for _, s := range m.List() {
+		var total int64
+		root := m.serverDir(s)
+		_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil // an unreadable corner should not abandon the total
+			}
+			if !info.IsDir() {
+				total += info.Size()
+			}
+			return nil
+		})
+		sizes[s.ID] = total / (1 << 20)
+	}
+	m.usageMu.Lock()
+	m.dirSizes = sizes
+	m.usageMu.Unlock()
+}
+
 func (m *Manager) Host() map[string]any {
 	var allocCPU float64
 	var allocMem, disk int
@@ -998,10 +1078,47 @@ func (m *Manager) Host() map[string]any {
 			running++
 		}
 	}
+	// Usage and commitment are different questions and were being conflated.
+	// Summing every server's limit answers "if everything ran at once", which
+	// on a host deliberately overcommitted (limits are caps, not reservations)
+	// reads as a crisis - 22 vCPU allocated on a 4 vCPU box, next to "5 of 8
+	// running". What an operator actually watches is what is in use now.
+	m.usageMu.RLock()
+	cpuPct := m.hostCPU
+	m.usageMu.RUnlock()
+
+	var players, usedMem int
+	for _, s := range m.List() {
+		if s.State() != StatusRunning {
+			continue
+		}
+		snap := s.Snapshot()
+		if mem, ok := snap["memory"].(map[string]any); ok {
+			if u, ok := mem["used_mb"].(int); ok {
+				usedMem += u
+			}
+		}
+		if p, ok := snap["players"].(map[string]any); ok {
+			if o, ok := p["online"].(int); ok {
+				players += o
+			}
+		}
+	}
+
 	return map[string]any{
-		"cpu":     map[string]any{"allocated_vcpu": allocCPU, "total_vcpu": hostCPUs},
-		"memory":  map[string]any{"allocated_mb": allocMem, "total_mb": hostMemMB},
-		"disk":    map[string]any{"allocated_gb": disk, "total_gb": hostDiskGB},
+		"cpu": map[string]any{
+			"allocated_vcpu": allocCPU, "total_vcpu": hostCPUs,
+			"used_percent": round1(cpuPct),
+		},
+		"memory": map[string]any{
+			"allocated_mb": allocMem, "total_mb": hostMemMB,
+			"used_mb": memUsedMB(), "servers_mb": usedMem,
+		},
+		"disk": map[string]any{
+			"allocated_gb": disk, "total_gb": hostDiskGB,
+			"used_gb": diskUsedGB(m.dataDir),
+		},
+		"players": players,
 		"servers": len(m.List()), "running": running,
 		"docker": dockerAvailable(),
 		"agent":  map[string]any{"version": agentVersion, "healthy": true},

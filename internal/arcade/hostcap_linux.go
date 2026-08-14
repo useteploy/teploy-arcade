@@ -72,3 +72,68 @@ func memTotalMB() int {
 
 	return best
 }
+
+// memUsedMB reports memory actually in use, from the same source as memTotalMB
+// so the two agree.
+//
+// MemTotal - MemAvailable, not MemFree: page cache is free for the asking, and
+// reporting it as used makes a healthy box look full.
+func memUsedMB() int {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	var total, avail int
+	for _, ln := range strings.Split(string(b), "\n") {
+		f := strings.Fields(ln)
+		if len(f) < 2 {
+			continue
+		}
+		n, err := strconv.Atoi(f[1])
+		if err != nil {
+			continue
+		}
+		switch f[0] {
+		case "MemTotal:":
+			total = n / 1024
+		case "MemAvailable:":
+			avail = n / 1024
+		}
+	}
+	if total <= 0 || avail <= 0 || avail > total {
+		return 0
+	}
+	return total - avail
+}
+
+// cpuSample is one reading of the host's cumulative CPU counters.
+type cpuSample struct{ busy, total uint64 }
+
+// readCPUSample reads /proc/stat's aggregate line. CPU usage is a rate, not a
+// level, so it can only be derived from two readings - a single one says
+// nothing.
+func readCPUSample() (cpuSample, bool) {
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return cpuSample{}, false
+	}
+	for _, ln := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(ln, "cpu ") {
+			continue
+		}
+		var s cpuSample
+		for i, f := range strings.Fields(ln)[1:] {
+			n, err := strconv.ParseUint(f, 10, 64)
+			if err != nil {
+				continue
+			}
+			s.total += n
+			// Fields 3 and 4 are idle and iowait; everything else is work.
+			if i != 3 && i != 4 {
+				s.busy += n
+			}
+		}
+		return s, s.total > 0
+	}
+	return cpuSample{}, false
+}

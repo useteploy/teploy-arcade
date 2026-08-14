@@ -177,15 +177,50 @@ button { font: inherit; color: inherit; }
   background: var(--rail);
   padding-left: 4px;
   /* Every server has a tab, so the strip scrolls rather than hiding the
-     overflow behind a count you cannot click. Thin scrollbar: at 36px tall a
-     default one eats the tabs. */
+     overflow behind a count you cannot click.
+     The bar floats over the tabs instead of sitting in a track: a 36px strip
+     cannot spare the height, and the platform default paints a pale box that
+     reads as a foreign element dropped into a dark panel. */
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: thin;
+  scrollbar-width: none;              /* Firefox: hide, we draw our own */
+  -ms-overflow-style: none;
+  position: relative;
 }
 
-.tabstrip::-webkit-scrollbar { height: 3px; }
-.tabstrip::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 2px; }
+.tabstrip::-webkit-scrollbar {
+  height: 0;                          /* no reserved track */
+  background: transparent;
+}
+
+/* Drawn as a fading edge instead: the strip tells you there is more by
+   letting the last tab run under a gradient, and the pointer scrolls it. */
+.tabstrip-wrap {
+  position: relative;
+  flex: none;
+}
+
+.tabstrip-wrap::after {
+  content: '';
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: 34px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .15s ease;
+  background: linear-gradient(to right, transparent, var(--rail));
+}
+
+.tabstrip-wrap.has-overflow::after { opacity: 1; }
+
+/* A slim bar that appears while scrolling or hovering, over the tabs. */
+.tabstrip:hover { scrollbar-width: thin; }
+.tabstrip:hover::-webkit-scrollbar { height: 4px; }
+.tabstrip::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .16);
+  border-radius: 99px;
+}
+.tabstrip:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .28); }
 .tabstrip::-webkit-scrollbar-track { background: transparent; }
 
 /* Tabs must not shrink to nothing as the count grows - a strip of illegible
@@ -1016,3 +1051,42 @@ button { font: inherit; color: inherit; }
 }
 
 .mock-note b { color: var(--t-0); display: block; margin-bottom: 3px; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; }
+
+
+/* ======================================================== dashboard table */
+/* Per-server operational figures in one place: what each server is costing in
+   CPU, memory and disk, and whether anyone is on it. */
+.dtable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.dtable th {
+  text-align: left;
+  font-weight: 500;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--t-2);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.dtable td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+
+.dtable tr:last-child td { border-bottom: 0; }
+.dtable tr:hover td { background: rgba(255, 255, 255, .02); }
+.dtable a { color: var(--t-0); font-weight: 500; }
+.dtable a:hover { color: var(--lime); }
+
+/* Actions stay on one line and do not stretch the row. */
+.dtable td.dact { white-space: nowrap; width: 1%; }
+.dtable td.dact .btn { margin-right: 2px; }
+
+/* A bar above the readout, so the column scans as a magnitude first. */
+.bar-sm { height: 4px; margin-bottom: 3px; }

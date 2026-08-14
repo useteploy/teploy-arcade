@@ -33,3 +33,22 @@ func diskTotalGB(dir string) int {
 	total := uint64(st.Blocks) * uint64(st.Bsize)
 	return int(total / (1 << 30))
 }
+
+// diskUsedGB reports how much of the filesystem holding dir is in use.
+//
+// Bavail, not Bfree: the reserved blocks only root can touch are not space the
+// panel or a game server can ever use, so counting them as free would promise
+// room that does not exist.
+func diskUsedGB(dir string) int {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		return 0
+	}
+	bs := uint64(st.Bsize)
+	total := uint64(st.Blocks) * bs
+	avail := uint64(st.Bavail) * bs
+	if total < avail {
+		return 0
+	}
+	return int((total - avail) / (1 << 30))
+}

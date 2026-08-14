@@ -107,9 +107,17 @@ function renderRail() {
   }
 }
 
+let tabDragging = false;
+
 function renderTabstrip() {
   const strip = $('#tabstrip');
   const cur = state.route.id;
+
+  // The metrics feed redraws this every two seconds. Rebuilding the strip
+  // mid-drag destroys the element under the pointer, which cancels the drag and
+  // drops the indicator - the whole interaction felt unreliable for that reason
+  // alone. Defer the redraw; dragend renders once at the end.
+  if (tabDragging) return;
 
   // Every server gets a tab. This used to cap at five with a "+3" that was a
   // bare <span> - so with more servers than the cap, the ones past it were not
@@ -135,6 +143,17 @@ function renderTabstrip() {
   // Keep the server you are looking at in view when the strip scrolls.
   const active = strip.querySelector('.stab.is-active');
   if (active) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  markTabOverflow(strip);
+  strip.onscroll = () => markTabOverflow(strip);
+}
+
+// Fade the right edge only while there is something past it, so the strip says
+// "there is more" without spending height on a permanent affordance.
+function markTabOverflow(strip) {
+  const wrap = $('#tabstripWrap');
+  if (!wrap) return;
+  const more = strip.scrollWidth - strip.clientWidth - strip.scrollLeft > 4;
+  wrap.classList.toggle('has-overflow', more);
 }
 
 // Drag to reorder. The order is the operator's, and it persists: the tab strip
@@ -146,6 +165,7 @@ function wireTabDrag(strip) {
   strip.querySelectorAll('.stab').forEach((el) => {
     el.addEventListener('dragstart', (e) => {
       dragId = el.dataset.sid;
+      tabDragging = true;
       el.classList.add('is-dragging');
       e.dataTransfer.effectAllowed = 'move';
       // Firefox needs data set or the drag never starts.
@@ -156,6 +176,8 @@ function wireTabDrag(strip) {
       el.classList.remove('is-dragging');
       strip.querySelectorAll('.stab').forEach((x) => x.classList.remove('drop-before', 'drop-after'));
       dragId = null;
+      tabDragging = false;
+      renderTabstrip();
     });
 
     el.addEventListener('dragover', (e) => {
@@ -191,6 +213,7 @@ function wireTabDrag(strip) {
       // in flight, then let the server's answer be authoritative.
       const byId = Object.fromEntries(state.servers.map((s) => [s.id, s]));
       state.servers = ids.map((id) => byId[id]).filter(Boolean);
+      tabDragging = false;
       renderTabstrip();
 
       try {
@@ -1084,32 +1107,89 @@ function viewTemplates() {
 function viewDashboard() {
   const host = state.host;
   const running = state.servers.filter((s) => s.status === 'running');
-  const players = running.reduce((a, s) => a + (s.players ? s.players.online : 0), 0);
-  const mem = running.reduce((a, s) => a + s.memory.used_mb, 0);
+  const players = host && typeof host.players === 'number'
+    ? host.players
+    : running.reduce((a, s) => a + (s.players ? s.players.online : 0), 0);
+
+  // Host figures come from the host itself now. They used to be the sum of
+  // every server's configured limit, which answers "if everything ran at once"
+  // - on a deliberately overcommitted box that reads as 22 vCPU on a 4 vCPU
+  // host, sitting next to "5 of 8 running". Commitment is still shown, below
+  // and clearly labelled, because it is what a new server is checked against.
+  const cpuPct = host && host.cpu.used_percent != null ? host.cpu.used_percent : null;
+  const memUsed = host ? host.memory.used_mb : 0;
+  const memTotal = host ? host.memory.total_mb : 0;
+  const diskUsed = host ? host.disk.used_gb : 0;
+  const diskTotal = host ? host.disk.total_gb : 0;
+
+  const bar = (used, total) => capKnown(total)
+    ? `<div class="bar"><i class="${used / total > 0.9 ? 'warn' : ''}" style="width:${capPct(used, total)}%"></i></div>` : '';
 
   return h(`<div class="content">
     <div class="page-head"><h1 class="page-title">Dashboard</h1></div>
+
     <div class="tiles">
       <div class="tile"><div class="k"><i class="ico ico-sm ico-layers"></i> Running</div>
-        <div class="v">${running.length}<small> / ${state.servers.length}</small></div></div>
+        <div class="v">${running.length}<small> / ${state.servers.length} servers</small></div></div>
       <div class="tile"><div class="k"><i class="ico ico-sm ico-users"></i> Players online</div>
         <div class="v">${players}</div></div>
-      <div class="tile"><div class="k"><i class="ico ico-sm ico-memory"></i> Memory in use</div>
-        <div class="v">${(mem / 1024).toFixed(1)}<small> GB</small></div></div>
-      <div class="tile"><div class="k"><i class="ico ico-sm ico-cpu"></i> Host</div>
-        <div class="v">${host ? host.cpu.total_vcpu : '-'}<small> vCPU</small></div></div>
+      <div class="tile"><div class="k"><i class="ico ico-sm ico-cpu"></i> Host CPU</div>
+        <div class="v">${cpuPct == null ? '-' : cpuPct + '<small> %</small>'}</div>
+        ${cpuPct == null ? '' : bar(cpuPct, 100)}</div>
+      <div class="tile"><div class="k"><i class="ico ico-sm ico-memory"></i> Host memory</div>
+        <div class="v">${(memUsed / 1024).toFixed(1)}<small> / ${capKnown(memTotal) ? (memTotal / 1024).toFixed(0) + ' GB' : 'unknown'}</small></div>
+        ${bar(memUsed, memTotal)}</div>
+      <div class="tile"><div class="k"><i class="ico ico-sm ico-box"></i> Disk</div>
+        <div class="v">${diskUsed}<small> / ${capKnown(diskTotal) ? diskTotal + ' GB' : 'unknown'}</small></div>
+        ${bar(diskUsed, diskTotal)}</div>
     </div>
+
     <div class="panelbox">
       <h3>Servers</h3>
-      ${state.servers.map((s) => `<div class="row">
-        <span class="gm gm-sm gm-${esc(s.mark)}"></span>
-        <a href="#/s/${s.id}/console"><b>${esc(s.name)}</b></a>
-        <span class="st ${STATUS_CLASS[s.status]}" style="font-size:12px">${STATUS_LABEL[s.status]}</span>
-        <span class="spacer"></span>
-        <span class="muted">${s.status === 'running' ? fmtUptime(s.uptime) : '-'}</span>
-        <span class="muted mono">:${s.address.port}</span>
-      </div>`).join('') || '<div class="row muted">No servers.</div>'}
+      <table class="dtable">
+        <thead><tr>
+          <th>Server</th><th>Actions</th><th>CPU</th><th>Memory</th>
+          <th>Disk</th><th>Players</th><th>Status</th>
+        </tr></thead>
+        <tbody>
+        ${state.servers.map((s) => {
+          const up = s.status === 'running';
+          const cpu = up ? s.cpu.percent : 0;
+          const memU = up ? s.memory.used_mb : 0;
+          const memL = s.memory.limit_mb || 0;
+          const cls = STATUS_CLASS[s.status] || 'off';
+          return `<tr>
+            <td><span class="gm gm-xs gm-${esc(s.mark)}"></span>
+                <a href="#/s/${s.id}/console">${esc(s.name)}</a>
+                <div class="muted mono" style="font-size:11px">:${s.address.port}</div></td>
+            <td class="dact">
+              ${up
+                ? `<button class="btn btn-ghost btn-sm btn-icon" data-dact="stop" data-sid="${esc(s.id)}" title="Stop"><i class="ico ico-sm ico-stop"></i></button>
+                   <button class="btn btn-ghost btn-sm btn-icon" data-dact="restart" data-sid="${esc(s.id)}" title="Restart"><i class="ico ico-sm ico-restart"></i></button>`
+                : `<button class="btn btn-ghost btn-sm btn-icon" data-dact="start" data-sid="${esc(s.id)}" title="Start"><i class="ico ico-sm ico-play"></i></button>`}
+            </td>
+            <td><div class="bar bar-sm"><i style="width:${Math.min(100, cpu)}%"></i></div>
+                <span class="muted">${up ? cpu + '%' : '—'}</span></td>
+            <td><div class="bar bar-sm"><i style="width:${capPct(memU, memL)}%"></i></div>
+                <span class="muted">${up ? fmtMB(memU) + ' / ' + fmtMB(memL) : '—'}</span></td>
+            <td class="mono">${s.disk_mb ? fmtMB(s.disk_mb) : '—'}</td>
+            <td class="mono">${s.players ? s.players.online + ' / ' + s.players.max : '—'}</td>
+            <td><span class="st ${cls}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span></td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="7" class="muted">No servers.</td></tr>'}
+        </tbody>
+      </table>
     </div>
+
+    <div class="panelbox">
+      <h3>Committed</h3>
+      <div class="row"><span class="k">CPU</span><span class="spacer"></span>
+        <span class="mono">${host ? host.cpu.allocated_vcpu : '-'} / ${host ? host.cpu.total_vcpu : '-'} vCPU</span></div>
+      <div class="row"><span class="k">Memory</span><span class="spacer"></span>
+        <span class="mono">${host ? (host.memory.allocated_mb / 1024).toFixed(1) : '-'} / ${host && capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) : '?'} GB</span></div>
+      <div class="row"><span class="muted" style="font-size:12px">Every server's configured limit added up, running or not. Limits are caps rather than reservations, so exceeding the host is normal &mdash; it only matters if they all run at once.</span></div>
+    </div>
+
     <div class="panelbox">
       <h3>Not built yet</h3>
       <div class="row"><span class="k">Plugin catalogue</span><span class="muted">Browse a plugin index &mdash; installing from a URL already works.</span></div>
@@ -1117,6 +1197,33 @@ function viewDashboard() {
       <div class="row"><span class="k">Disk quotas</span><span class="muted">Declared but not enforced &mdash; needs XFS project quotas.</span></div>
     </div>
   </div>`);
+}
+
+// Pull the server list again after an action, so the row updates without
+// waiting for the next metrics tick.
+async function refreshServers() {
+  try {
+    const data = await api('/api/servers');
+    state.servers = data.servers;
+    state.host = data.host;
+    renderTabstrip();
+  } catch { /* the metrics feed will catch up */ }
+}
+
+// Row actions on the dashboard table.
+function wireDashboardActions(root) {
+  root.querySelectorAll('[data-dact]').forEach((b) => {
+    b.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const act = b.dataset.dact, id = b.dataset.sid;
+      b.disabled = true;
+      try {
+        await api(`/api/servers/${id}/${act}`, { method: 'POST' });
+        toast(`${act} requested`);
+      } catch (err) { toast(err.message, 'err'); }
+      await refreshServers();
+    });
+  });
 }
 
 // ------------------------------------------------------------------ router
@@ -1155,6 +1262,7 @@ async function router(force) {
     case 'import': el = await window.extraViews.viewImport(); break;
     case 'dashboard':
       el = next.id ? await window.extraViews.viewServerDashboard(next.id) : viewDashboard();
+      if (!next.id) wireDashboardActions(el);
       break;
     case 'templates':
       if (!state.templates.length) { try { state.templates = (await api('/api/templates')).templates; } catch {} }
@@ -1194,6 +1302,7 @@ function connectEvents() {
         if (prev) prev.dispatchEvent(new CustomEvent('gss:teardown'));
         host.innerHTML = '';
         const el = state.route.name === 'servers' ? viewServers() : viewDashboard();
+        if (state.route.name === 'dashboard') wireDashboardActions(el);
         host.appendChild(el);
         el.scrollTop = keepScroll;
       }

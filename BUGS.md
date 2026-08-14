@@ -177,6 +177,32 @@ same bounds as Create and StartImport, and reports `pending_restart` when the
 server is running, because the limits only reach the container on the next
 `docker run`.
 
+**Seventh pass (2026-08-14) — what the dashboard was actually measuring.** Three
+issues, all found by an operator looking at a panel running eight real servers:
+
+- **Host figures were commitment, not usage.** Every "allocated" number summed
+  each server's configured limit regardless of whether it was running, so a
+  deliberately overcommitted host read as a crisis: *22 / 4 vCPU* and
+  *30.5 / 12 GB*, sitting next to "5 of 8 running". Limits are caps, not
+  reservations, so exceeding the host is normal. The dashboard now leads with
+  what is in use - host CPU from `/proc/stat` deltas, memory from
+  `MemAvailable`, disk from `statfs` on the data directory - and keeps
+  commitment in its own clearly-labelled panel, because it is still what a new
+  server is checked against.
+- **Per-server cost was invisible.** No screen answered "what is this server
+  costing me". The dashboard now carries a table: CPU, memory against its
+  limit, on-disk size, players and status, with start/stop/restart per row.
+  Directory sizes are walked on a two-minute ticker rather than per request -
+  a world is gigabytes and the dashboard asks for every server at once.
+- **The tab strip hid servers.** It capped at five and put the rest behind a
+  "+N" that was a bare `<span>` with no handler, so past the cap they were not
+  reachable from the strip at all. Every server has a tab now and the strip
+  scrolls; tabs also drag to reorder, which persists.
+
+The drag felt unreliable for a reason worth recording: the metrics feed
+redraws the strip every two seconds, and rebuilding the element under the
+pointer cancels an in-flight drag. Redraws are deferred while dragging.
+
 Fixes are in `internal/arcade/critical_test.go`, one test per finding:
 
 | | Fix | Test |
