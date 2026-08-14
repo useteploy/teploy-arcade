@@ -492,6 +492,80 @@ async function viewAdmin() {
 
 // ------------------------------------------------------------------ login
 
+// First-run: an unclaimed panel takes over the page.
+//
+// This lived in a row inside Settings, which meant a fresh panel dropped you on
+// an empty server list with no indication that it had no accounts, that anyone
+// reaching it could claim it, or that a token was waiting in the log. Nobody
+// found it without being told. The one thing that must happen should be the
+// only thing on screen.
+function viewSetup() {
+  const root = h(`<div class="loginwrap">
+    <form class="loginbox" style="max-width:460px">
+      <div class="row-flex" style="gap:11px;margin-bottom:6px">
+        <span class="gm gm-purpur"></span>
+        <div><div style="font-size:16px;font-weight:600">Teploy Arcade</div>
+        <div class="muted" style="font-size:12px">This panel has no account yet</div></div>
+      </div>
+
+      <p class="muted" style="font-size:12.5px;line-height:1.55;margin:10px 0 16px">
+        Until an admin exists, anyone who can reach this panel could claim it &mdash;
+        and an admin here creates containers as root on the host. Creating the
+        first account needs the setup token, which is written to the panel's log
+        at startup and never sent over the network.
+      </p>
+
+      <div class="field" style="margin-bottom:12px">
+        <label style="display:block;font-size:12px;color:var(--t-1);margin-bottom:6px">Setup token</label>
+        <input class="inp mono" id="stToken" placeholder="from the panel's log" autocomplete="off">
+        <div class="muted" style="font-size:11.5px;margin-top:6px">
+          <code>journalctl -u teploy-arcade | grep "Bootstrap token"</code><br>
+          Valid 30 minutes. Restart the panel for a fresh one.
+        </div>
+      </div>
+
+      <div class="field" style="margin-bottom:12px">
+        <label style="display:block;font-size:12px;color:var(--t-1);margin-bottom:6px">Username</label>
+        <input class="inp" id="stName" autocomplete="username">
+      </div>
+      <div class="field" style="margin-bottom:16px">
+        <label style="display:block;font-size:12px;color:var(--t-1);margin-bottom:6px">Password</label>
+        <input class="inp" id="stPass" type="password" autocomplete="new-password" placeholder="8 characters or more">
+      </div>
+
+      <button type="submit" class="btn btn-primary" id="stBtn" style="width:100%;justify-content:center">Create admin</button>
+      <div id="stErr" style="color:var(--offline);font-size:12px;margin-top:12px"></div>
+      <div class="muted" style="font-size:11.5px;margin-top:14px;line-height:1.5">
+        Provisioning <code>TEPLOY_ARCADE_ADMIN_PASSWORD</code> at startup skips
+        this screen entirely &mdash; see DEPLOY.md.
+      </div>
+    </form>
+  </div>`);
+
+  const submit = async (ev) => {
+    ev.preventDefault();
+    const btn = $('#stBtn', root);
+    btn.disabled = true;
+    try {
+      await api('/api/setup', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: $('#stName', root).value,
+          password: $('#stPass', root).value,
+          token: $('#stToken', root).value.trim(),
+        }),
+      });
+      location.reload();
+    } catch (e) {
+      $('#stErr', root).textContent = e.message;
+      btn.disabled = false;
+    }
+  };
+  root.querySelector('.loginbox').addEventListener('submit', submit);
+  setTimeout(() => $('#stToken', root).focus(), 40);
+  return root;
+}
+
 function viewLogin() {
   const root = h(`<div class="loginwrap">
     <form class="loginbox">
@@ -528,4 +602,4 @@ function viewLogin() {
   return root;
 }
 
-window.extraViews = { viewFiles, viewBackups, viewAdmin, viewLogin, openEditor };
+window.extraViews = { viewFiles, viewBackups, viewAdmin, viewLogin, viewSetup, openEditor };

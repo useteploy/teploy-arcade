@@ -1079,3 +1079,21 @@ button { font: inherit; color: inherit; }
 
 /* A bar above the readout, so the column scans as a magnitude first. */
 .bar-sm { height: 4px; margin-bottom: 3px; }
+
+
+/* Which panel this is. Small, permanent, and impossible to confuse with a
+   status: two instances on the same port look identical without it. */
+.rail-host {
+  font-size: 9.5px;
+  color: var(--t-2);
+  text-align: center;
+  padding: 2px 4px 0;
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A local dev instance is the one people mistake for production. Say so. */
+.rail-host.is-local { color: var(--amber); }

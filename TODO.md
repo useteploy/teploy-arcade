@@ -68,15 +68,14 @@ and it costs nothing sitting stopped.
 
 Each of these is understood; none is fixed.
 
-- [ ] **No first-run screen.** A fresh panel lands on an empty server list, and
-      the one thing that must happen — claiming the panel — is buried in
-      Settings, with its token in a log nobody would think to read. This caused
-      real confusion during setup. It should take over the page when
-      `needs_setup` is true.
-- [ ] **No panel identity in the header.** Two instances on the same port are
-      indistinguishable on screen. This cost a long debugging detour when a
-      stray local panel on `localhost:3457` was mistaken for the real one.
-      Show which host you are connected to.
+- [x] ~~No first-run screen~~ — an unclaimed panel now takes over the page:
+      it says it has no account, explains why the token exists and where to get
+      it, and takes the username and password. Verified end to end on a scratch
+      instance.
+- [x] ~~No panel identity in the header~~ — the rail shows the host you are
+      connected to, taken from `location.hostname` so a second instance cannot
+      claim to be the first. A local instance is called out in amber, since
+      that is the one mistaken for production.
 - [x] ~~Version reads "unknown" for jars that do not carry one~~ — the scan
       now reads `version.json` from inside the jar, which is where Paper,
       Purpur, Spigot and vanilla all record the exact Minecraft version.

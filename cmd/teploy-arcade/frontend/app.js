@@ -91,6 +91,18 @@ function renderRail() {
   document.querySelectorAll('.rail-item').forEach((el) => {
     el.classList.toggle('is-active', !!railActiveFor(el.dataset.nav, state.route));
   });
+  // Name the panel you are connected to. location.host is the honest source:
+  // it is what the browser actually reached, so a second instance cannot claim
+  // to be the first.
+  const rh = $('#railHost');
+  if (rh) {
+    const h = location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+      ? 'local' : location.hostname;
+    rh.textContent = h;
+    rh.title = `Connected to ${location.host}`;
+    rh.classList.toggle('is-local', h === 'local');
+  }
+
   if (state.host) {
     $('#railVer').textContent =
       state.host.agent.version === 'dev' ? 'dev' : 'v' + state.host.agent.version;
@@ -1353,6 +1365,14 @@ async function boot() {
   try {
     state.me = await api('/api/me');
   } catch { state.me = null; }
+
+  // An unclaimed panel has exactly one thing to do. Show that instead of an
+  // empty server list with the real task buried in Settings.
+  if (state.me && state.me.needs_setup) {
+    document.querySelector('.app').style.display = 'none';
+    document.body.appendChild(window.extraViews.viewSetup());
+    return;
+  }
 
   try {
     const data = await api('/api/servers');
