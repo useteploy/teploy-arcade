@@ -176,7 +176,29 @@ button { font: inherit; color: inherit; }
   height: 36px;
   background: var(--rail);
   padding-left: 4px;
+  /* Every server has a tab, so the strip scrolls rather than hiding the
+     overflow behind a count you cannot click. Thin scrollbar: at 36px tall a
+     default one eats the tabs. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
+
+.tabstrip::-webkit-scrollbar { height: 3px; }
+.tabstrip::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 2px; }
+.tabstrip::-webkit-scrollbar-track { background: transparent; }
+
+/* Tabs must not shrink to nothing as the count grows - a strip of illegible
+   slivers is worse than scrolling. */
+.tabstrip .stab { flex: none; }
+
+/* Drag to reorder */
+.stab[draggable="true"] { cursor: grab; }
+.stab.is-dragging { opacity: .4; cursor: grabbing; }
+
+/* The insertion point, on the side you are actually dropping. */
+.stab.drop-before { box-shadow: inset 2px 0 0 var(--lime); }
+.stab.drop-after { box-shadow: inset -2px 0 0 var(--lime); }
 
 .stab {
   display: flex;
@@ -224,15 +246,6 @@ button { font: inherit; color: inherit; }
 .stab .st.off { color: var(--offline); }
 .stab .st.starting { color: var(--starting); }
 
-.tabstrip .strip-end {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 0 7px;
-  color: var(--t-2);
-}
-
 .strip-btn {
   width: 26px;
   height: 26px;
@@ -243,14 +256,6 @@ button { font: inherit; color: inherit; }
 }
 
 .strip-btn:hover { background: #2a2a2a; color: var(--t-0); }
-
-/* Blind < > chevrons say nothing. A count says what is off-screen. */
-.strip-more {
-  font-size: 11px;
-  color: var(--t-2);
-  padding: 0 6px;
-  font-variant-numeric: tabular-nums;
-}
 
 /* ======================================================== ServerHeader */
 

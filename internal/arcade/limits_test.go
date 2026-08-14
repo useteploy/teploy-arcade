@@ -168,3 +168,116 @@ func TestServerResourcesCanBeChangedAfterCreation(t *testing.T) {
 		t.Errorf("new cpu limit not in the container command:\n%s", joined)
 	}
 }
+
+// Order was creation order with no way to change it. That stops being a detail
+// once there are more servers than fit on screen: the tab strip is how you move
+// between them, and you could not put the one you watch all day first.
+func TestServersCanBeReordered(t *testing.T) {
+	_, mgr := newTestAgent(t)
+	for _, n := range []string{"alpha", "bravo", "charlie"} {
+		if _, err := mgr.Create(n, "paper", "1.20.4", 0, 2048, 2, RuntimeSim); err != nil {
+			t.Fatalf("create %s: %v", n, err)
+		}
+	}
+	names := func() []string {
+		out := []string{}
+		for _, s := range mgr.List() {
+			out = append(out, s.Name)
+		}
+		return out
+	}
+	byName := map[string]string{}
+	for _, s := range mgr.List() {
+		byName[s.Name] = s.ID
+	}
+
+	// Reverse the three we created, leaving the seeded ones alone.
+	if err := mgr.Reorder([]string{byName["charlie"], byName["bravo"], byName["alpha"]}); err != nil {
+		t.Fatalf("reorder: %v", err)
+	}
+	got := names()
+	if got[0] != "charlie" || got[1] != "bravo" || got[2] != "alpha" {
+		t.Errorf("order = %v, want charlie/bravo/alpha first", got[:3])
+	}
+
+	// Servers the caller did not mention keep their relative order and follow.
+	// A client holding a stale list must not silently drop a server created
+	// while the operator was mid-drag.
+	before := names()
+	if err := mgr.Reorder([]string{byName["alpha"]}); err != nil {
+		t.Fatalf("partial reorder: %v", err)
+	}
+	after := names()
+	if after[0] != "alpha" {
+		t.Errorf("named server did not move to the front: %v", after[:2])
+	}
+	if len(after) != len(before) {
+		t.Errorf("reorder changed the server count: %d -> %d", len(before), len(after))
+	}
+
+	// An id for a server that no longer exists is ignored, not fatal - it may
+	// have been deleted while the drag was in flight.
+	if err := mgr.Reorder([]string{"s-does-not-exist", byName["bravo"]}); err != nil {
+		t.Fatalf("reorder with a stale id: %v", err)
+	}
+	if names()[0] != "bravo" {
+		t.Errorf("a stale id stopped the rest of the reorder: %v", names()[:2])
+	}
+	if len(names()) != len(before) {
+		t.Errorf("a stale id changed the server count")
+	}
+
+	// Duplicates cannot clone a server into the list.
+	id := byName["alpha"]
+	if err := mgr.Reorder([]string{id, id, id}); err != nil {
+		t.Fatalf("reorder with duplicates: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, s := range mgr.List() {
+		if seen[s.ID] {
+			t.Fatalf("server %s appears twice after a duplicate reorder", s.ID)
+		}
+		seen[s.ID] = true
+	}
+	if len(names()) != len(before) {
+		t.Errorf("duplicates changed the server count: %v", names())
+	}
+}
+
+// The order has to outlive the process, or it is a UI toy rather than a
+// preference: the panel restarts on every upgrade.
+func TestReorderSurvivesAPanelRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	hub := NewHub()
+	mgr := NewManager(dir, hub)
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	for _, n := range []string{"one", "two", "three"} {
+		if _, err := mgr.Create(n, "paper", "1.20.4", 0, 2048, 2, RuntimeSim); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+	}
+	byName := map[string]string{}
+	for _, s := range mgr.List() {
+		byName[s.Name] = s.ID
+	}
+	want := []string{byName["three"], byName["one"], byName["two"]}
+	if err := mgr.Reorder(want); err != nil {
+		t.Fatalf("reorder: %v", err)
+	}
+
+	// A second manager over the same directory is what a restart looks like.
+	again := NewManager(dir, NewHub())
+	if err := again.Load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	got := again.List()
+	for i, id := range want {
+		if got[i].ID != id {
+			t.Fatalf("position %d after restart is %q (%s), want %q",
+				i, got[i].Name, got[i].ID, id)
+		}
+	}
+}

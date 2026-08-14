@@ -110,28 +110,101 @@ function renderRail() {
 function renderTabstrip() {
   const strip = $('#tabstrip');
   const cur = state.route.id;
-  let open = state.servers.slice(0, 5);
-  // The server you are looking at must have a tab, even if it sorts past the
-  // fifth - otherwise opening #6 shows a strip with no active tab in it.
-  if (cur && !open.some((s) => s.id === cur)) {
-    const active = state.servers.find((s) => s.id === cur);
-    if (active) open = [active, ...open.slice(0, 4)];
-  }
+
+  // Every server gets a tab. This used to cap at five with a "+3" that was a
+  // bare <span> - so with more servers than the cap, the ones past it were not
+  // reachable from the strip at all and you had to go via the Servers list.
+  // The strip scrolls instead; the point of it is that every server is one
+  // click away.
+  const open = state.servers;
   if (!open.length) { strip.innerHTML = ''; return; }
 
   strip.innerHTML = open.map((s) => {
     const cls = STATUS_CLASS[s.status] || 'off';
     const pc = s.players ? `<span class="pc">${s.players.online}/${s.players.max}</span>` : '';
-    return `<a class="stab ${s.id === cur ? 'is-active' : ''}" href="#/s/${s.id}/console">
+    return `<a class="stab ${s.id === cur ? 'is-active' : ''}" href="#/s/${s.id}/console"
+        draggable="true" data-sid="${esc(s.id)}" title="${esc(s.name)}">
         <span class="gm gm-xs gm-${esc(s.mark)}"></span>
         <span class="nm">${esc(s.name)}</span>
         ${pc}
         <span class="st ${cls}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span>
       </a>`;
-  }).join('') +
-    (state.servers.length > open.length
-      ? `<div class="strip-end"><span class="strip-more">+${state.servers.length - open.length}</span></div>`
-      : '');
+  }).join('');
+
+  wireTabDrag(strip);
+  // Keep the server you are looking at in view when the strip scrolls.
+  const active = strip.querySelector('.stab.is-active');
+  if (active) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
+// Drag to reorder. The order is the operator's, and it persists: the tab strip
+// is how you move between servers, so being unable to put the one you watch
+// all day first is a real limitation once there are more than a handful.
+function wireTabDrag(strip) {
+  let dragId = null;
+
+  strip.querySelectorAll('.stab').forEach((el) => {
+    el.addEventListener('dragstart', (e) => {
+      dragId = el.dataset.sid;
+      el.classList.add('is-dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      // Firefox needs data set or the drag never starts.
+      e.dataTransfer.setData('text/plain', dragId);
+    });
+
+    el.addEventListener('dragend', () => {
+      el.classList.remove('is-dragging');
+      strip.querySelectorAll('.stab').forEach((x) => x.classList.remove('drop-before', 'drop-after'));
+      dragId = null;
+    });
+
+    el.addEventListener('dragover', (e) => {
+      if (!dragId || el.dataset.sid === dragId) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      // Which half you are over decides which side it lands on.
+      const box = el.getBoundingClientRect();
+      const after = e.clientX > box.left + box.width / 2;
+      el.classList.toggle('drop-after', after);
+      el.classList.toggle('drop-before', !after);
+    });
+
+    el.addEventListener('dragleave', () => el.classList.remove('drop-before', 'drop-after'));
+
+    el.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!dragId || el.dataset.sid === dragId) return;
+      const box = el.getBoundingClientRect();
+      const after = e.clientX > box.left + box.width / 2;
+
+      const ids = state.servers.map((s) => s.id);
+      const from = ids.indexOf(dragId);
+      if (from < 0) return;
+      ids.splice(from, 1);
+      let to = ids.indexOf(el.dataset.sid);
+      if (to < 0) return;
+      if (after) to += 1;
+      ids.splice(to, 0, dragId);
+
+      // Reorder locally first so the strip does not jump while the request is
+      // in flight, then let the server's answer be authoritative.
+      const byId = Object.fromEntries(state.servers.map((s) => [s.id, s]));
+      state.servers = ids.map((id) => byId[id]).filter(Boolean);
+      renderTabstrip();
+
+      try {
+        const res = await api('/api/servers/order', {
+          method: 'POST',
+          body: JSON.stringify({ order: ids }),
+        });
+        if (res && res.servers) state.servers = res.servers;
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      renderTabstrip();
+    });
+  });
 }
 
 // server header shared by console + settings views

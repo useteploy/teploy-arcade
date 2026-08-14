@@ -384,6 +384,43 @@ func contains(xs []string, want string) bool {
 	return false
 }
 
+// Reorder sets the order servers are listed and tabbed in.
+//
+// Order was creation order with no way to change it, which stops being a
+// detail once someone runs more servers than fit on screen: the tab strip is
+// the primary way you move between them, and you cannot put the one you watch
+// all day first.
+//
+// Ids not mentioned keep their relative order and follow the ones that were,
+// so a client holding a stale list cannot silently drop a server that was
+// created while the operator was dragging. Unknown ids are ignored rather than
+// rejected - a server deleted mid-drag should not fail the whole reorder.
+func (m *Manager) Reorder(ids []string) error {
+	m.mu.Lock()
+	seen := make(map[string]bool, len(ids))
+	next := make([]string, 0, len(m.order))
+	for _, id := range ids {
+		if _, ok := m.servers[id]; !ok || seen[id] {
+			continue
+		}
+		seen[id] = true
+		next = append(next, id)
+	}
+	for _, id := range m.order {
+		if !seen[id] {
+			next = append(next, id)
+		}
+	}
+	m.order = next
+	m.mu.Unlock()
+
+	if err := m.Save(); err != nil {
+		return err
+	}
+	m.broadcastEvent("servers.reordered", "")
+	return nil
+}
+
 func (m *Manager) Delete(id string) error {
 	// Held from the state check through the map mutation, so a Start cannot
 	// slip between them and leave a runner attached to a deleted server.

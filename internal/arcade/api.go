@@ -41,6 +41,9 @@ func (a *API) Routes(mux *http.ServeMux) {
 	// Resource limits are a host-capacity decision, not a per-server setting, so
 	// this sits with the admin routes rather than with patchSettings.
 	mux.HandleFunc("PATCH /api/servers/{id}", auth.require(RoleAdmin, a.patchServer))
+	// Reordering is a view preference, not a privileged change, so an operator
+	// can arrange their own tab strip.
+	mux.HandleFunc("POST /api/servers/order", auth.require(RoleOperator, a.reorderServers))
 
 	// The socket authorises on connect; a viewer may watch but not type.
 	mux.HandleFunc("GET /ws/console", auth.require(RoleViewer, a.console))
@@ -150,6 +153,26 @@ func (a *API) patchServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"server": s.Snapshot(), "pending_restart": pending,
 	})
+}
+
+func (a *API) reorderServers(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Order []string `json:"order"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if len(body.Order) == 0 {
+		writeErr(w, 400, fmt.Errorf("order is required"))
+		return
+	}
+	if err := a.mgr.Reorder(body.Order); err != nil {
+		writeErr(w, 500, err)
+		return
+	}
+	a.mgr.audit(actorOf(r), "servers.reorder", "", fmt.Sprintf("%d servers", len(body.Order)))
+	writeJSON(w, 200, map[string]any{"servers": a.mgr.listSnapshot()})
 }
 
 func (a *API) deleteServer(w http.ResponseWriter, r *http.Request) {
