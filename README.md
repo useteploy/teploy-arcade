@@ -7,6 +7,16 @@ long-running runtime, not part of the CLI (`PLAN.md` §9).
 Covers `PLAN.md` **phases 1-8** to varying depth — see "What is and isn't done"
 at the bottom, and the per-phase notes in `PLAN.md` itself.
 
+**The documents, and what each is for:**
+
+| | |
+|---|---|
+| `TODO.md` | Everything not done: blockers, gaps, deferred decisions. Start here. |
+| `BUGS.md` | Every defect found and fixed, with what each one taught. |
+| `DEPLOY.md` | How to install, provision the first admin, and migrate from another panel. |
+| `PLAN.md` | The original concept, architecture and build order. |
+| `NEUTRON-ISSUES.md` | Framework bugs and gaps found while building. |
+
 ## Run
 
 ```sh
