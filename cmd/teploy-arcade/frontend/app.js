@@ -305,29 +305,48 @@ function wireHeaderActions(root, id) {
 
 // ------------------------------------------------------------ servers view
 
+// Host tiles, shared by the Servers page and the Dashboard.
+//
+// These were duplicated and drifted: one page was corrected to show measured
+// usage while the other kept summing every server's configured limit, so the
+// same host read as "7% CPU" on one screen and "22 / 4 vCPU" in red on the
+// other. Limits are caps, not reservations - the sum only matters if every
+// server runs at once, which is a planning question, not a live one.
+function hostTiles(host) {
+  if (!host) return '';
+  const bar = (used, total) => capKnown(total)
+    ? `<div class="bar"><i class="${used / total > 0.9 ? 'warn' : ''}" style="width:${capPct(used, total)}%"></i></div>` : '';
+  const cpuPct = host.cpu.used_percent != null ? host.cpu.used_percent : null;
+
+  return `<div class="tiles">
+    <div class="tile">
+      <div class="k"><i class="ico ico-sm ico-layers"></i> Servers</div>
+      <div class="v">${host.running}<small> / ${host.servers} running</small></div>
+    </div>
+    <div class="tile">
+      <div class="k"><i class="ico ico-sm ico-cpu"></i> Host CPU</div>
+      <div class="v">${cpuPct == null ? '-' : cpuPct + '<small> %</small>'}</div>
+      ${cpuPct == null ? '' : bar(cpuPct, 100)}
+    </div>
+    <div class="tile">
+      <div class="k"><i class="ico ico-sm ico-memory"></i> Host memory</div>
+      <div class="v">${(host.memory.used_mb / 1024).toFixed(1)}<small> / ${capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) + ' GB' : 'unknown'}</small></div>
+      ${bar(host.memory.used_mb, host.memory.total_mb)}
+    </div>
+    <div class="tile">
+      <div class="k"><i class="ico ico-sm ico-box"></i> Disk</div>
+      <div class="v">${host.disk.used_gb}<small> / ${capKnown(host.disk.total_gb) ? host.disk.total_gb + ' GB' : 'unknown'}</small></div>
+      ${bar(host.disk.used_gb, host.disk.total_gb)}
+    </div>
+    <div class="tile">
+      <div class="k"><i class="ico ico-sm ico-flask"></i> Runtime</div>
+      <div class="v" style="font-size:15px;padding-top:4px">${host.docker ? 'Docker + simulator' : 'Simulator only'}</div>
+    </div>
+  </div>`;
+}
+
 function viewServers() {
-  const host = state.host;
-  const hostBar = host ? `
-    <div class="tiles">
-      <div class="tile">
-        <div class="k"><i class="ico ico-sm ico-layers"></i> Servers</div>
-        <div class="v">${host.running}<small> / ${host.servers} running</small></div>
-      </div>
-      <div class="tile">
-        <div class="k"><i class="ico ico-sm ico-cpu"></i> CPU allocated</div>
-        <div class="v">${host.cpu.allocated_vcpu}<small> / ${capKnown(host.cpu.total_vcpu) ? host.cpu.total_vcpu + ' vCPU' : 'unknown'}</small></div>
-        <div class="bar"><i class="${capOver(host.cpu.allocated_vcpu, host.cpu.total_vcpu) ? 'warn' : ''}" style="width:${capPct(host.cpu.allocated_vcpu, host.cpu.total_vcpu)}%"></i></div>
-      </div>
-      <div class="tile">
-        <div class="k"><i class="ico ico-sm ico-memory"></i> Memory allocated</div>
-        <div class="v">${(host.memory.allocated_mb / 1024).toFixed(1)}<small> / ${capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) + ' GB' : 'unknown'}</small></div>
-        <div class="bar"><i class="${capOver(host.memory.allocated_mb, host.memory.total_mb) ? 'warn' : ''}" style="width:${capPct(host.memory.allocated_mb, host.memory.total_mb)}%"></i></div>
-      </div>
-      <div class="tile">
-        <div class="k"><i class="ico ico-sm ico-box"></i> Runtime</div>
-        <div class="v" style="font-size:15px;padding-top:4px">${host.docker ? 'Docker + simulator' : 'Simulator only'}</div>
-      </div>
-    </div>` : '';
+  const hostBar = hostTiles(state.host);
 
   const cards = state.servers.map(serverCard).join('');
 
@@ -1116,33 +1135,10 @@ function viewDashboard() {
   // - on a deliberately overcommitted box that reads as 22 vCPU on a 4 vCPU
   // host, sitting next to "5 of 8 running". Commitment is still shown, below
   // and clearly labelled, because it is what a new server is checked against.
-  const cpuPct = host && host.cpu.used_percent != null ? host.cpu.used_percent : null;
-  const memUsed = host ? host.memory.used_mb : 0;
-  const memTotal = host ? host.memory.total_mb : 0;
-  const diskUsed = host ? host.disk.used_gb : 0;
-  const diskTotal = host ? host.disk.total_gb : 0;
-
-  const bar = (used, total) => capKnown(total)
-    ? `<div class="bar"><i class="${used / total > 0.9 ? 'warn' : ''}" style="width:${capPct(used, total)}%"></i></div>` : '';
-
   return h(`<div class="content">
     <div class="page-head"><h1 class="page-title">Dashboard</h1></div>
 
-    <div class="tiles">
-      <div class="tile"><div class="k"><i class="ico ico-sm ico-layers"></i> Running</div>
-        <div class="v">${running.length}<small> / ${state.servers.length} servers</small></div></div>
-      <div class="tile"><div class="k"><i class="ico ico-sm ico-users"></i> Players online</div>
-        <div class="v">${players}</div></div>
-      <div class="tile"><div class="k"><i class="ico ico-sm ico-cpu"></i> Host CPU</div>
-        <div class="v">${cpuPct == null ? '-' : cpuPct + '<small> %</small>'}</div>
-        ${cpuPct == null ? '' : bar(cpuPct, 100)}</div>
-      <div class="tile"><div class="k"><i class="ico ico-sm ico-memory"></i> Host memory</div>
-        <div class="v">${(memUsed / 1024).toFixed(1)}<small> / ${capKnown(memTotal) ? (memTotal / 1024).toFixed(0) + ' GB' : 'unknown'}</small></div>
-        ${bar(memUsed, memTotal)}</div>
-      <div class="tile"><div class="k"><i class="ico ico-sm ico-box"></i> Disk</div>
-        <div class="v">${diskUsed}<small> / ${capKnown(diskTotal) ? diskTotal + ' GB' : 'unknown'}</small></div>
-        ${bar(diskUsed, diskTotal)}</div>
-    </div>
+    ${hostTiles(host)}
 
     <div class="panelbox">
       <h3>Servers</h3>
