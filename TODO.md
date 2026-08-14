@@ -167,13 +167,17 @@ fixed; it is all recorded so it can be picked up deliberately.
       selectable field with a copy button rather than a toast, since only its
       hash is stored and it cannot be recovered. Lifecycle verified end to end,
       including that a revoked token stops authenticating.
-- [ ] **`/api/capabilities` is never read by the panel's own client.** It exists
-      so a client can decide whether to offer a feature, and the one client
-      that ships ignores it. Either wire it up or the endpoint is decoration.
+- [x] ~~`/api/capabilities` is never read by the panel's own client~~ — the
+      dashboard's "Not built yet" list is now driven by what the agent
+      advertises, instead of a list hand-maintained in the UI that could drift
+      out of step with it.
 - [ ] **Global `/api/metrics` is unused by the UI.** Per-server metrics are
       consumed; the host-wide series is not.
-- [ ] **No console search or filter.** The console is the panel's hero surface
-      and there is no way to find anything in it. No copy-to-clipboard either.
+- [x] ~~No console search or filter~~ — a filter box in the console bar, with
+      a live match count, Escape to clear, and cmd/ctrl+F bound to it. Lines are
+      hidden rather than dropped, and output arriving while a filter is active
+      respects it. The browser's own find cannot do this: the stream is a
+      bounded ring, so anything scrolled out is not in the DOM.
 
 ### 8b. Accessibility — currently none
 

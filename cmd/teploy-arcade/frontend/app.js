@@ -492,6 +492,13 @@ function viewConsole(id) {
         <span class="sep">|</span>
         <span id="replayNote">-</span>
         <span class="spacer"></span>
+        <label class="consearch">
+          <i class="ico ico-sm ico-search"></i>
+          <input id="findInput" placeholder="Filter lines" autocomplete="off" spellcheck="false"
+                 aria-label="Filter console lines">
+          <span class="n" id="findCount" hidden></span>
+          <span class="chip chip-x" id="findClear" hidden title="Clear filter">&times;</span>
+        </label>
         <span class="chip" id="clearBtn"><i class="ico ico-sm ico-close"></i> Clear</span>
         <span class="chip" id="dlBtn"><i class="ico ico-sm ico-download"></i> Save log</span>
       </div>
@@ -549,6 +556,46 @@ class ConsoleController {
       e.preventDefault();
       this.setAutoscroll(!this.autoscroll);
       if (this.autoscroll) this.toBottom();
+    });
+
+    // Filtering hides lines rather than dropping them: the console is still
+    // streaming underneath, and clearing the box has to bring everything back.
+    this.filter = '';
+    const findInput = $('#findInput', root);
+    const findCount = $('#findCount', root);
+    const findClear = $('#findClear', root);
+
+    const applyFilter = () => {
+      this.filter = findInput.value.trim().toLowerCase();
+      let shown = 0, total = 0;
+      this.stream.querySelectorAll('.ln').forEach((ln) => {
+        total++;
+        const hit = !this.filter || (ln.dataset.q || '').includes(this.filter);
+        ln.hidden = !hit;
+        if (hit) shown++;
+      });
+      const on = !!this.filter;
+      findCount.hidden = !on;
+      findClear.hidden = !on;
+      findCount.textContent = on ? `${shown} / ${total}` : '';
+      this.stream.classList.toggle('is-filtered', on);
+      if (on) this.toBottom();
+    };
+
+    findInput.addEventListener('input', applyFilter);
+    findInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { findInput.value = ''; applyFilter(); findInput.blur(); }
+    });
+    findClear.addEventListener('click', () => { findInput.value = ''; applyFilter(); findInput.focus(); });
+
+    // cmd/ctrl+F inside the console filters it rather than opening the
+    // browser's find, which cannot see lines that scrolled out of the ring.
+    root.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        findInput.focus();
+        findInput.select();
+      }
     });
 
     $('#clearBtn', root).addEventListener('click', () => {
@@ -687,6 +734,12 @@ class ConsoleController {
     const el = h(`<div class="ln ${isTrace ? 'ln-trace' : srcCls || cls}">
         <span class="ts">${esc(l.ts)}</span><span class="lv">${lvl}</span><span>${tag}${esc(l.text)}</span>
       </div>`);
+
+    // Store the searchable text on the element so filtering does not have to
+    // re-derive it, and apply the current filter to a line arriving while a
+    // filter is active - otherwise new output ignores the filter.
+    el.dataset.q = (l.text + ' ' + (l.source || '')).toLowerCase();
+    if (this.filter && !el.dataset.q.includes(this.filter)) el.hidden = true;
 
     this.stream.appendChild(el);
     this.trim();
@@ -1177,6 +1230,41 @@ function viewTemplates() {
   </div>`);
 }
 
+// What the agent says it cannot do, rather than a list hand-maintained in the
+// UI. /api/capabilities exists precisely so a client can decide what to offer,
+// and the only client that ships was ignoring it - so this list could drift out
+// of step with the agent and nobody would notice.
+const CAP_LABELS = {
+  scheduled_backups: ['Scheduled backups', 'The scheduler can run <code>!backup</code> on a timer; there is no built-in schedule.'],
+  disk_quota: ['Disk quotas', 'Declared per template but enforced nowhere &mdash; needs XFS project quotas.'],
+  plugins: ['Plugin management', 'List, enable, disable, delete and install from a URL.'],
+  import: ['Import an existing server', 'Scan a directory and copy or adopt it.'],
+  files: ['File manager', 'Browse and edit files inside a server directory.'],
+  backups: ['Backups', 'Pause saves, flush, archive, resume.'],
+  metrics: ['Metrics', 'CPU, memory and player history.'],
+  audit: ['Audit log', 'Who did what.'],
+};
+
+function notBuiltRows() {
+  const caps = state.caps;
+  if (!caps) return '<div class="row muted">Asking the agent&hellip;</div>';
+
+  const off = Object.entries(caps)
+    .filter(([, on]) => !on)
+    .map(([k]) => CAP_LABELS[k] || [k, '']);
+
+  // Things the agent has no flag for, but which are still not built. Kept
+  // separate so it is obvious which list is authoritative.
+  const known = [
+    ['Plugin catalogue', 'Browse a plugin index &mdash; installing from a URL already works.'],
+    ['Clone', 'Copy an existing server &mdash; importing one already works.'],
+  ];
+
+  return [...off, ...known]
+    .map(([k, d]) => `<div class="row"><span class="k">${esc(k)}</span><span class="muted">${d}</span></div>`)
+    .join('') || '<div class="row muted">Everything the agent advertises is built.</div>';
+}
+
 function viewDashboard() {
   const host = state.host;
   const running = state.servers.filter((s) => s.status === 'running');
@@ -1242,9 +1330,7 @@ function viewDashboard() {
 
     <div class="panelbox">
       <h3>Not built yet</h3>
-      <div class="row"><span class="k">Plugin catalogue</span><span class="muted">Browse a plugin index &mdash; installing from a URL already works.</span></div>
-      <div class="row"><span class="k">Clone</span><span class="muted">Copy an existing server &mdash; importing one already works.</span></div>
-      <div class="row"><span class="k">Disk quotas</span><span class="muted">Declared but not enforced &mdash; needs XFS project quotas.</span></div>
+      ${notBuiltRows()}
     </div>
   </div>`);
 }
@@ -1365,6 +1451,14 @@ async function boot() {
   try {
     state.me = await api('/api/me');
   } catch { state.me = null; }
+
+  // Needs a session (RoleViewer), so this fails for an unauthenticated boot -
+  // which is fine, because the dashboard that renders it is behind sign-in too.
+  // Caught rather than awaited-and-thrown so a capabilities outage never blocks
+  // the panel loading.
+  try {
+    state.caps = (await api('/api/capabilities')).features;
+  } catch { state.caps = null; }
 
   // An unclaimed panel has exactly one thing to do. Show that instead of an
   // empty server list with the real task buried in Settings.
