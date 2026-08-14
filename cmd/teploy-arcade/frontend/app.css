@@ -176,13 +176,15 @@ kbd.hintkey { font: 500 10.5px var(--mono); color: var(--t-2); background: #333;
 
 .loginwrap {
   height: 100vh;
+  height: 100dvh;
   display: grid;
   place-items: center;
+  padding: 16px;
   background: var(--rail);
 }
 
 .loginbox {
-  width: 340px;
+  width: min(340px, 100%);
   padding: 24px;
   background: var(--card);
   border: 1px solid #3a3a3a;

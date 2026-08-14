@@ -1,0 +1,203 @@
+/* ======================================================== responsive layout */
+/* The panel was built at desktop width and had no media query at all: fixed
+   380/340/300/250px blocks, a four-column tile row and a three-column card
+   grid, all inside a shell whose first column is a 84px rail. Below roughly a
+   laptop the columns shrank to slivers and fixed-width rows were clipped.
+   The case for fixing it is narrow but real - the panel is what you open when
+   something breaks, and that is often from a phone. So the target is not a
+   redesign: it is that every surface stays reachable and nothing scrolls the
+   page sideways. Wide screens are untouched.
+
+   THIS FILE MUST LOAD LAST. A media query adds no specificity, so a rule here
+   ties with the one it overrides and the later stylesheet wins. Written into
+   styles.css first, every override of an app.css rule (.tiles, .panelbox .k,
+   .statrow) silently lost and the layout below 900px did not move. */
+
+/* Lifted out of an inline style on the element so a breakpoint can reach it:
+   inline width beats any stylesheet rule short of !important. */
+.wizgrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  min-height: 0;
+  flex: 1;
+}
+
+/* A seven-column table cannot be made narrow. It scrolls inside its panel
+   rather than pushing the page sideways. */
+.tablewrap { overflow-x: auto; }
+
+@media (max-width: 1180px) {
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tpl-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+  /* The wizard's Configure column and the players list are both a fixed
+     sidebar next to a flexible pane; below this width there is no room for
+     two columns, so each goes under its pane rather than off the edge. */
+  .wizgrid { grid-template-columns: minmax(0, 1fr); }
+  .wiz-side { border-left: 0; border-top: 1px solid var(--line); }
+
+  /* Eight section tabs plus two icons stop fitting here, and they were being
+     clipped rather than wrapped - Settings and the folder icon simply could
+     not be reached. Scrolling keeps the underline attached to the border,
+     which a second row of tabs would not. */
+  .tabs { overflow-x: auto; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab, .tabs-icon { flex: none; }
+
+  .split { flex-direction: column; }
+  .aside {
+    width: auto;
+    max-height: 38%;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  /* Settings rows are label, control and an explanatory line, all on one row.
+     The explanation is the part with no width of its own, so it is the part
+     that runs off the edge. It wraps here; the 190px label column survives to
+     the next breakpoint down. */
+  .panelbox .row { flex-wrap: wrap; row-gap: 8px; }
+
+  /* Four stats on one row become two and two. The divider is a left border,
+     which lands in the wrong place once they wrap. */
+  .statrow { flex-wrap: wrap; row-gap: 14px; }
+  .stat { flex: 1 1 210px; }
+  .stat + .stat { border-left: 0; padding-left: 0; }
+}
+
+@media (max-width: 640px) {
+  /* The rail becomes a top strip: 84px of a 390px screen is a fifth of the
+     width spent on navigation. It scrolls horizontally rather than wrapping,
+     so the four sections keep their labels. */
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+
+  .rail {
+    flex-direction: row;
+    align-items: center;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .rail::-webkit-scrollbar { display: none; }
+
+  .rail-brand {
+    flex: none;
+    flex-direction: row;
+    align-items: baseline;
+    gap: 5px;
+    padding: 0 11px 0 9px;
+  }
+
+  .rail-brand + .rail-item { margin-top: 0; }
+
+  .rail-item {
+    flex: none;
+    flex-direction: row;
+    gap: 7px;
+    padding: 12px 11px;
+    font-size: 12.5px;
+    white-space: nowrap;
+  }
+
+  .rail-item .ico { width: 17px; height: 17px; }
+
+  /* The active marker is a left bar in a vertical rail; horizontally it has to
+     be the underline, or it sits on the wrong edge. */
+  .rail-item.is-active::before {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    height: 2px;
+  }
+
+  /* Docker/Agent state and which panel this is stay visible - they are the
+     two things worth knowing before you touch anything. */
+  .rail-foot {
+    margin-top: 0;
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 8px;
+  }
+
+  .rail-ver { display: none; }
+  .rail-host { max-width: 90px; padding: 0 0 0 4px; }
+
+  /* The 22px page gutter is 11% of a phone's width on each side. */
+  .page-head, .settings-head, .plist-head, .addbar { padding-left: 13px; padding-right: 13px; }
+  .tiles, .cards { padding-left: 13px; padding-right: 13px; }
+  .panelbox, .statspanel { margin-left: 13px; margin-right: 13px; }
+  .srv-head { padding-left: 13px; padding-right: 13px; }
+  .statrow { padding-left: 13px; padding-right: 13px; }
+
+  .cards { grid-template-columns: minmax(0, 1fr); }
+  .tpl-grid { grid-template-columns: minmax(0, 1fr); }
+
+  /* The table scrolls inside its panel, so cells should keep their line
+     rather than stacking a server name one word per row. */
+  .tablewrap .dtable th, .tablewrap .dtable td { white-space: nowrap; }
+
+  .srv-name { font-size: 19px; }
+  .srv-id { flex-wrap: wrap; gap: 10px; }
+  .srv-meta { gap: 12px; }
+
+  .tab { padding-left: 12px; padding-right: 12px; }
+
+  /* The savebar is label, spacer and two buttons on one line; Save is the one
+     that goes off the edge, which is the one the row exists for. The players
+     header is the same shape - subtabs, spacer, a button. */
+  .savebar { flex-wrap: wrap; row-gap: 10px; }
+  .plist-head { flex-wrap: wrap; row-gap: 8px; }
+
+  /* Settings rows are label + control on one line at desktop width. The label
+     column is a fixed 190px, which leaves nothing for the control. */
+  /* Theme and background pickers are a single row of fixed-size swatches;
+     there are more of them than fit, so they wrap too. */
+  .swatches, .bgswatches { flex-wrap: wrap; }
+  .panelbox .k { width: auto; }
+  .setrow .ctl { max-width: none; }
+  .selects .field { width: 100%; flex: 1 1 100%; }
+
+  /* Several inputs and segmented controls carry an inline pixel width. Width
+     is inline and cannot be overridden; max-width clamps it anyway. */
+  .inp, .input, .seg2, .field input.inp, .field select.inp { max-width: 100%; }
+  .form-row { flex-wrap: wrap; }
+
+  /* Console: the connection strip and the command footer both run out of
+     room. The strip wraps; the command line takes the full width with its
+     checkboxes underneath, rather than squeezing to nothing beside them. */
+  .wsbar { height: auto; min-height: 30px; flex-wrap: wrap; row-gap: 5px; padding: 5px 11px; }
+  .consearch input { width: 92px; }
+  .cmd { flex-wrap: wrap; gap: 11px; padding: 9px 11px; }
+  .cmd-field { flex: 1 0 100%; }
+  .ln { padding: 0 11px; }
+
+  /* Every console line is timestamp, level, then the message. At this width
+     the timestamp costs about a fifth of the line and pushes the message into
+     a second and third row; the level tag stays because it is what you scan
+     for. The buffered log still carries them - Save log is unaffected. */
+  .ln .ts { display: none; }
+
+  /* A dialog with 26px of scrim around it wastes a screen this size. It takes
+     the full width and keeps the base max-height, so a short confirm stays
+     short and a tall one scrolls in its own body rather than growing past the
+     screen and taking its footer buttons with it. */
+  .scrim { padding: 0; }
+  .modal { width: 100%; border-radius: 0; border: 0; }
+  .modal-banner { padding: 12px 14px 13px; }
+  .modal-body { padding: 14px; }
+  .modal-foot { flex-wrap: wrap; row-gap: 8px; padding: 10px 14px; }
+
+  /* Toasts are 250-380px wide against a 390px viewport. */
+  .toasts { left: 10px; right: 10px; bottom: 10px; }
+  .toast { min-width: 0; max-width: none; }
+}

@@ -1048,7 +1048,7 @@ async function openCreate() {
         <div class="tab" id="tabClone">Clone Existing</div>
       </div>
       <div class="modal-body" style="padding:0;display:flex;flex-direction:column;min-height:0">
-        <div style="display:grid;grid-template-columns:minmax(0,1fr) 300px;min-height:0;flex:1">
+        <div class="wizgrid">
           <div style="padding:18px 20px;overflow:auto" id="catalog">
             ${groups.map((g) => `
               <div class="group-label">${esc(g)}</div>
@@ -1284,6 +1284,7 @@ function viewDashboard() {
 
     <div class="panelbox">
       <h3>Servers</h3>
+      <div class="tablewrap">
       <table class="dtable">
         <thead><tr>
           <th>Server</th><th>Actions</th><th>CPU</th><th>Memory</th>
@@ -1317,6 +1318,7 @@ function viewDashboard() {
         }).join('') || '<tr><td colspan="7" class="muted">No servers.</td></tr>'}
         </tbody>
       </table>
+      </div>
     </div>
 
     <div class="panelbox">

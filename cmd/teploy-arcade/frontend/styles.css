@@ -78,6 +78,10 @@ button { font: inherit; color: inherit; }
   display: grid;
   grid-template-columns: 84px 1fr;
   height: 100vh;
+  /* Mobile browsers count their own collapsing toolbars inside 100vh, so the
+     console footer sits under the address bar. dvh is the height actually
+     available; the vh above stays as the fallback. */
+  height: 100dvh;
   overflow: hidden;
 }
 

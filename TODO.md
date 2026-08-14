@@ -193,11 +193,24 @@ fixed; it is all recorded so it can be picked up deliberately.
 
 ### 8c. Responsive — currently none
 
-- [ ] **Zero media queries** across all four stylesheets. The layout has never
-      been considered below desktop width, and there are fixed pixel widths
-      (380px, 340px, 250px, 240px, 236px) that will overflow a narrow viewport.
-      A panel people check from a phone when something breaks is a reasonable
-      thing to want.
+- [x] ~~Zero media queries~~ — three breakpoints in a new `responsive.css`,
+      measured rather than eyeballed: a CDP script loaded every route at 360,
+      390, 768, 1024 and 1280 and reported any element sticking out past its
+      container, ignoring the strips that are meant to scroll. Below 1180 the
+      card and template grids halve; below 900 the wizard's Configure column,
+      the players list and the settings rows stack, and the four stat blocks
+      wrap; below 640 the 84px icon rail becomes a top strip, gutters drop to
+      13px, dialogs go full-bleed, and the command footer takes its own row.
+      Wide screens are provably untouched — every rule is inside a `max-width`
+      query, and 1280 measures identically to before.
+      Two things that cost time and are worth keeping: **a media query adds no
+      specificity**, so the first version of this — written into `styles.css` —
+      lost every override to `app.css`, which loads after it, and did nothing
+      at all while looking correct. `responsive.css` therefore loads last, and
+      `test/routing.test.js` now fails if it stops being last. And **inline
+      styles cannot be overridden**, so the wizard's two-column grid and the
+      dashboard table both had to move out of `style="..."` into a class
+      before a breakpoint could reach them.
 
 ### 8d. Styling consistency
 

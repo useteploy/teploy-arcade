@@ -134,9 +134,27 @@ for (const name of used) {
 }
 if (!wireFailed) console.log(`views: ${used.size} extraViews entry points are loaded before app.js`);
 
-if (failed || navFailed || wireFailed) {
+// responsive.css must be the LAST stylesheet. A media query carries no extra
+// specificity, so each rule in it ties with the rule it overrides and the later
+// sheet wins on order alone. Written into styles.css first, every override of
+// an app.css rule (.tiles, .panelbox .k, .statrow) lost silently — no error,
+// no failing test, the layout below 900px simply did not move.
+const sheets = [...html.matchAll(/<link rel="stylesheet" href="([^"]+\.css)">/g)].map(([, s]) => s);
+let cssFailed = 0;
+if (!sheets.includes('responsive.css')) {
+  console.error('FAIL index.html does not load responsive.css');
+  cssFailed++;
+} else if (sheets[sheets.length - 1] !== 'responsive.css') {
+  console.error(`FAIL responsive.css must be the last stylesheet; got ${sheets[sheets.length - 1]}` +
+    ' — its media queries will lose to the sheets after it');
+  cssFailed++;
+} else {
+  console.log(`stylesheets: ${sheets.length} loaded, responsive.css last`);
+}
+
+if (failed || navFailed || wireFailed || cssFailed) {
   console.error(`\n${failed}/${cases.length} routing cases failed, ${navFailed} rail items misconfigured,` +
-    ` ${wireFailed} view scripts unwired`);
+    ` ${wireFailed} view scripts unwired, ${cssFailed} stylesheet-order problems`);
   process.exit(1);
 }
 console.log(`routing: ${cases.length} cases pass`);
