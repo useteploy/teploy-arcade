@@ -19,7 +19,7 @@ has not been.
 | **Templates exercised** | velocity, paper, forge, fabric |
 | **Templates never run** | vanilla, spigot, purpur, bedrock, rust, valheim |
 | **Tests** | 175, race-clean |
-| **Repo** | `github.com/useteploy/teploy-arcade` (private). Forgejo not yet created. |
+| **Repo** | `Tyler/teploy-arcade` on Forgejo (`origin`) + `useteploy/teploy-arcade` on GitHub (`github`), both private |
 
 Proven end to end: import from another panel, container lifecycle, detached
 containers surviving a panel restart, console streaming, RCON commands,
@@ -149,3 +149,78 @@ Recorded so they are not rediscovered as oversights.
 - **L5's TOCTOU** is closed, not mitigated: file and plugin operations run
   against an `os.Root`, so confinement is enforced per path component by the
   syscall that performs the operation.
+
+---
+
+## 8. Audit findings (v0.6.2)
+
+A mechanical pass over the whole tree — cross-referencing what is defined
+against what is used, rather than reading for impressions. Nothing here is
+fixed; it is all recorded so it can be picked up deliberately.
+
+### 8a. Missing UI for features that exist
+
+- [ ] **MCP tokens have no UI at all.** `GET/POST/DELETE /api/mcp-tokens` are
+      implemented and admin-gated, and the MCP server is a headline feature —
+      but there is no way to mint or revoke a token from the panel. Today it
+      takes a `curl` with a session cookie, which nobody will do.
+- [ ] **`/api/capabilities` is never read by the panel's own client.** It exists
+      so a client can decide whether to offer a feature, and the one client
+      that ships ignores it. Either wire it up or the endpoint is decoration.
+- [ ] **Global `/api/metrics` is unused by the UI.** Per-server metrics are
+      consumed; the host-wide series is not.
+- [ ] **No console search or filter.** The console is the panel's hero surface
+      and there is no way to find anything in it. No copy-to-clipboard either.
+
+### 8b. Accessibility — currently none
+
+- [ ] **Zero `aria-` attributes** anywhere in the frontend.
+- [ ] **Zero `:focus-visible` rules** and only three `:focus` rules, so keyboard
+      navigation gives almost no visible indication of where you are. The panel
+      is effectively mouse-only.
+- [ ] **55 `<button>` elements with no `type`.** Inside a form a bare button
+      defaults to `submit`; the login form works by luck of its handler.
+
+### 8c. Responsive — currently none
+
+- [ ] **Zero media queries** across all four stylesheets. The layout has never
+      been considered below desktop width, and there are fixed pixel widths
+      (380px, 340px, 250px, 240px, 236px) that will overflow a narrow viewport.
+      A panel people check from a phone when something breaks is a reasonable
+      thing to want.
+
+### 8d. Styling consistency
+
+- [ ] **63 distinct `padding` declarations, on no scale.** 9px, 10px, 11px,
+      12px, 13px, 14px all appear, chosen ad hoc. A small spacing scale
+      (4/8/12/16) and tokens would collapse most of them and is the single
+      biggest source of the "not quite even" feel.
+- [ ] **119 distinct hex colours in CSS**, well beyond the token set at the top
+      of `styles.css`, plus **18 more hardcoded inline in JS**. Those inline
+      ones cannot follow a theme, which undercuts the theme switcher.
+- [ ] **175 inline `style="..."` attributes across the JS views.** They bypass
+      the stylesheet entirely, so they are invisible to theming and to any
+      future spacing scale.
+
+### 8e. Dead code
+
+- [ ] **14 dead CSS definitions**: `.ico-clone`, `.ico-collapse`, `.mock-note`,
+      `.kv`, `.ico-xl`, `.ico-wrap`, `.ico-left`, `.ico-right`, `.ico-shield`,
+      `.ico-signal`, `.ico-bolt`, `.ico-activity`, `.ico-globe`, `.ico-disk`.
+      `.ico-collapse` is left from a collapse control that was removed;
+      `.mock-note` is a leftover from the mockup phase; `.ico-clone` is for a
+      feature that was never built.
+- [ ] **`Template.DiskGB` is decoration.** It is stored, summed into the
+      "committed" figure and shown, but never enforced anywhere — the same gap
+      as the `disk_quota: false` capability, from the other end.
+
+### 8f. Not a problem, checked and clear
+
+Recorded so a future pass does not spend time re-deriving them:
+
+- Every endpoint the UI calls exists on the Go side; no drift in either
+  direction.
+- The `_ = c.Write(...)` results on the console socket are deliberately
+  discarded — best-effort writes to a socket that may already be gone.
+- The bare `catch {}` blocks in the frontend are all on paths where the
+  metrics feed re-renders a moment later, and each carries a comment saying so.
