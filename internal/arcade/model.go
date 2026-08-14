@@ -160,6 +160,11 @@ func (s *Server) Snapshot() map[string]any {
 		},
 		"memory": map[string]any{
 			"used_mb": s.memMB, "limit_mb": s.MemoryMB,
+			// The heap the JVM will actually be given. Reported rather than
+			// left for the UI to recompute: the reserve rule lives in one
+			// place, and a settings screen that showed a different number than
+			// the container gets would be worse than showing none.
+			"heap_mb": jvmHeapMB(s.MemoryMB),
 		},
 		"disk_gb":         s.DiskGB,
 		"address":         map[string]any{"host": hostAddr, "port": s.Port},

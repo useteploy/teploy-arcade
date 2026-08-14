@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -279,5 +280,43 @@ func TestReorderSurvivesAPanelRestart(t *testing.T) {
 			t.Fatalf("position %d after restart is %q (%s), want %q",
 				i, got[i].Name, got[i].ID, id)
 		}
+	}
+}
+
+// The settings screen shows the heap a server will actually get, so the number
+// has to come from the same function the container is started with. It used to
+// be recomputed in JavaScript, which is how the host tiles drifted.
+func TestSnapshotReportsTheHeapTheContainerWillGet(t *testing.T) {
+	_, mgr := newTestAgent(t)
+	s, err := mgr.Create("sized", "paper", "1.20.4", 0, 4096, 2, RuntimeSim)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	mem, ok := s.Snapshot()["memory"].(map[string]any)
+	if !ok {
+		t.Fatal("no memory block in the snapshot")
+	}
+	heap, ok := mem["heap_mb"].(int)
+	if !ok {
+		t.Fatalf("heap_mb missing or not an int: %#v", mem["heap_mb"])
+	}
+	if heap != jvmHeapMB(4096) {
+		t.Errorf("snapshot heap %d, but the runner uses %d", heap, jvmHeapMB(4096))
+	}
+
+	// And it must match what the container is actually told.
+	args := strings.Join(dockerRunArgs(s, "gamepanel-x", "/srv/data", "sec"), " ")
+	if !strings.Contains(args, fmt.Sprintf("MEMORY=%dM", heap)) {
+		t.Errorf("container is not given the heap the panel reports (%d MB):\n%s", heap, args)
+	}
+
+	// A change to the limit has to move the reported heap with it.
+	if _, err := mgr.SetResources(s, 8192, 0); err != nil {
+		t.Fatalf("resize: %v", err)
+	}
+	mem = s.Snapshot()["memory"].(map[string]any)
+	if mem["heap_mb"].(int) != jvmHeapMB(8192) {
+		t.Errorf("heap did not follow the new limit: %v", mem["heap_mb"])
 	}
 }

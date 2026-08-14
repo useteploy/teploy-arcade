@@ -844,6 +844,27 @@ async function viewSettings(id) {
         <div class="link-actions"><a data-raw>Edit server.properties manually</a></div>
       </div>
       <div style="padding:0 22px 26px;max-width:900px">
+        <div class="panelbox" id="resBox">
+          <h3>Resources</h3>
+          <div class="row">
+            <span class="k">Max memory</span>
+            <span class="spacer"></span>
+            <input class="inp mono" id="resMem" value="${s.memory.limit_mb}" style="width:110px">
+            <span class="muted">MB</span>
+            <span class="muted" style="font-size:12px;margin-left:10px">JVM heap gets ${s.memory.heap_mb} MB; the rest is headroom the JVM needs outside the heap.</span>
+          </div>
+          <div class="row">
+            <span class="k">CPU</span>
+            <span class="spacer"></span>
+            <input class="inp mono" id="resCpu" value="${s.cpu.limit_vcpu}" style="width:110px">
+            <span class="muted">vCPU</span>
+          </div>
+          <div class="row">
+            <span class="muted" style="font-size:12px">These are the container's own limits, applied on the next start. Changing them while the server runs does not resize it.</span>
+            <span class="spacer"></span>
+            <button class="btn btn-primary btn-sm" id="resSave">Save resources</button>
+          </div>
+        </div>
         ${groups}
         <div class="savebar" id="savebar" hidden>
           <span class="pill-warn"><i class="ico ico-sm ico-warning"></i> <span id="chCount">0 changes</span></span>
@@ -859,6 +880,27 @@ async function viewSettings(id) {
   wireHeaderActions(root, id);
   root.querySelector('[data-raw]').addEventListener('click', () =>
     window.extraViews.openEditor(id, 'server.properties', () => router(true)));
+
+  // Resource limits live on the server record, not in server.properties, so
+  // they save separately from the properties save bar below.
+  const resBtn = $('#resSave', root);
+  if (resBtn) resBtn.addEventListener('click', async () => {
+    const mem = parseInt($('#resMem', root).value, 10) || 0;
+    const cpu = parseFloat($('#resCpu', root).value) || 0;
+    resBtn.disabled = true;
+    try {
+      const res = await api(`/api/servers/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ memory_mb: mem, cpu }),
+      });
+      const pend = res && res.pending_restart;
+      toast(pend && pend.length
+        ? 'Saved - restart the server for the new limits to apply'
+        : 'Resources saved');
+      await refreshServers();
+    } catch (e) { toast(e.message, 'err'); }
+    resBtn.disabled = false;
+  });
 
   const meta = {};
   data.groups.forEach((g) => g.keys.forEach((k) => { meta[k.key] = k; }));

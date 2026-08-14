@@ -160,6 +160,9 @@ fixed; it is all recorded so it can be picked up deliberately.
 
 ### 8a. Missing UI for features that exist
 
+- [x] ~~Per-server memory and CPU had no UI~~ — a Resources panel on each
+      server's Settings page now edits both, showing the JVM heap the container
+      will actually be given (reported by the agent, not recomputed).
 - [ ] **MCP tokens have no UI at all.** `GET/POST/DELETE /api/mcp-tokens` are
       implemented and admin-gated, and the MCP server is a headline feature —
       but there is no way to mint or revoke a token from the panel. Today it
