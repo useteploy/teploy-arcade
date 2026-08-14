@@ -54,8 +54,9 @@ and it costs nothing sitting stopped.
       Caddy + `tls: internal` path for a LAN hostname.
 - [ ] **No off-LAN access.** Reaching the panel remotely means Tailscale on the
       container (needs an auth key) or a proxy in front.
-- [ ] **Reclaim the old panel's memory.** Its container still reserves 14 GB
-      while idle, on a host with 15.9 GB.
+- [x] ~~Reclaim the old panel's memory~~ — the container was decommissioned
+      (fresh `vzdump` taken first, verified, restorable). ~60 GB of disk and its
+      14 GB reservation released; arcade raised to 13 GB and its disk to 100 GB.
 - [ ] **No monitoring.** Nothing watches whether the panel or the servers are
       up. The panel restarts on failure (`Restart=always`); nothing tells you it
       did.
@@ -76,18 +77,17 @@ Each of these is understood; none is fixed.
       indistinguishable on screen. This cost a long debugging detour when a
       stray local panel on `localhost:3457` was mistaken for the real one.
       Show which host you are connected to.
-- [ ] **Version reads "unknown" for jars that do not carry one.** `paper.jar`
-      has no version in its filename, so imports record `unknown`. The exact
-      version is inside the jar at `version.json` — read it. Today the JRE is
-      picked correctly only because the untagged image happens to ship Java 25.
-- [ ] **`javaTagFor` only understands `1.x` versions.** Minecraft moved to
-      year-based versioning (`26.1.2`); anything not `1.x` falls through to the
-      untagged image. Correct today by luck, not by rule.
+- [x] ~~Version reads "unknown" for jars that do not carry one~~ — the scan
+      now reads `version.json` from inside the jar, which is where Paper,
+      Purpur, Spigot and vanilla all record the exact Minecraft version.
+- [x] ~~`javaTagFor` only understands `1.x` versions~~ — year-based releases
+      (major >= 20) now take the newest known JRE explicitly, rather than
+      falling through to whatever the untagged image happens to ship.
 - [ ] **Player avatars are gradient placeholders.** No head fetching.
 - [ ] **Global settings are shallow.** Agent, users, audit log. No auto-update,
       autostart, or per-tab display toggles.
-- [ ] **`spike/` is not gofmt-clean.** Three throwaway files from Phase 0 that
-      `gofmt -l .` reports at the repo root.
+- [x] ~~`spike/` is not gofmt-clean~~ — formatted; `gofmt -l .` is clean
+      repo-wide.
 
 ## 4. Not built
 
@@ -181,8 +181,8 @@ fixed; it is all recorded so it can be picked up deliberately.
 - [ ] **Zero `:focus-visible` rules** and only three `:focus` rules, so keyboard
       navigation gives almost no visible indication of where you are. The panel
       is effectively mouse-only.
-- [ ] **55 `<button>` elements with no `type`.** Inside a form a bare button
-      defaults to `submit`; the login form works by luck of its handler.
+- [x] ~~`<button>` elements with no `type`~~ — 56 given `type="button"`; the
+      login form's submit button kept `type="submit"` deliberately.
 
 ### 8c. Responsive — currently none
 
@@ -207,12 +207,7 @@ fixed; it is all recorded so it can be picked up deliberately.
 
 ### 8e. Dead code
 
-- [ ] **14 dead CSS definitions**: `.ico-clone`, `.ico-collapse`, `.mock-note`,
-      `.kv`, `.ico-xl`, `.ico-wrap`, `.ico-left`, `.ico-right`, `.ico-shield`,
-      `.ico-signal`, `.ico-bolt`, `.ico-activity`, `.ico-globe`, `.ico-disk`.
-      `.ico-collapse` is left from a collapse control that was removed;
-      `.mock-note` is a leftover from the mockup phase; `.ico-clone` is for a
-      feature that was never built.
+- [x] ~~14 dead CSS definitions~~ — all removed.
 - [ ] **`Template.DiskGB` is decoration.** It is stored, summed into the
       "committed" figure and shown, but never enforced anywhere — the same gap
       as the `disk_quota: false` capability, from the other end.

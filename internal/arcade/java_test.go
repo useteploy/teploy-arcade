@@ -274,3 +274,43 @@ func TestAnImportedProxyRunsItsOwnJar(t *testing.T) {
 		}
 	}
 }
+
+// Minecraft moved off the 1.x scheme to year-based releases (26.1.2). Those
+// fell through the whole table to the untagged image, which happens to ship
+// Java 25 today - correct by accident, and only until that tag moves.
+func TestYearBasedVersionsGetANewJRE(t *testing.T) {
+	for _, v := range []string{"26.1.2", "26.2", "27.0.1"} {
+		tag, ok := javaTagFor(v)
+		if !ok {
+			t.Errorf("javaTagFor(%q) could not resolve a tag", v)
+			continue
+		}
+		if tag != imageJava25 {
+			t.Errorf("javaTagFor(%q) = %q, want %q", v, tag, imageJava25)
+		}
+	}
+	// The 1.x boundaries must be untouched by this.
+	for _, c := range []struct{ v, want string }{
+		{"1.12.2", imageJava8}, {"1.20.4", imageJava17}, {"1.21.1", imageJava21},
+	} {
+		if got, _ := javaTagFor(c.v); got != c.want {
+			t.Errorf("javaTagFor(%q) = %q, want %q", c.v, got, c.want)
+		}
+	}
+	// And it must reach the image actually used.
+	if got := imageForVersion("itzg/minecraft-server", "26.1.2"); got != "itzg/minecraft-server:"+imageJava25 {
+		t.Errorf("image for 26.1.2 = %q", got)
+	}
+}
+
+// Versions between the two schemes are not releases this table understands.
+// Minecraft went 1.x straight to year-based; 2.x through 19.x never existed
+// (the 2.0 April Fools build is not a release), so they get no tag rather than
+// a guessed one.
+func TestVersionsBetweenSchemesGetNoTag(t *testing.T) {
+	for _, v := range []string{"2.0", "3.1", "19.4"} {
+		if tag, ok := javaTagFor(v); ok {
+			t.Errorf("javaTagFor(%q) = %q, want no tag", v, tag)
+		}
+	}
+}

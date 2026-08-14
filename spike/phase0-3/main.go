@@ -9,6 +9,7 @@
 // Run the demo:
 //
 //	go run .                 # serves http://localhost:8080
+//
 // Open http://localhost:8080 in a browser; the console streams fake lines.
 // Typing a command sends it to the agent (onCommand), which broadcasts
 // "executed: <cmd>" — it is NOT echoed to other viewers directly.
@@ -21,8 +22,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"

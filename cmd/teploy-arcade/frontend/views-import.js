@@ -37,7 +37,7 @@ async function viewImport() {
       <div class="row">
         <span class="k">Full path on this host</span>
         <input class="inp mono" id="impPath" style="width:420px" placeholder="/srv/minecraft/survival" autocomplete="off">
-        <button class="btn btn-primary btn-sm" id="impScan"><i class="ico ico-sm ico-search"></i> Scan</button>
+        <button type="button" class="btn btn-primary btn-sm" id="impScan"><i class="ico ico-sm ico-search"></i> Scan</button>
       </div>
       <div class="row">
         <span class="k"></span>
@@ -170,8 +170,8 @@ async function viewImport() {
         <div class="row">
           <span class="k">Runtime</span>
           <div class="seg2" style="width:260px" id="impRuntime">
-            <button data-rt="sim" class="on">Simulator</button>
-            <button data-rt="docker">Docker</button>
+            <button type="button" data-rt="sim" class="on">Simulator</button>
+            <button type="button" data-rt="docker">Docker</button>
           </div>
         </div>
         <div class="row">
@@ -181,7 +181,7 @@ async function viewImport() {
         <div class="row">
           <span class="k"></span>
           <span class="spacer"></span>
-          <button class="btn btn-primary" id="impGo"><i class="ico ico-sm ico-import"></i> Import</button>
+          <button type="button" class="btn btn-primary" id="impGo"><i class="ico ico-sm ico-import"></i> Import</button>
         </div>
       </div>
 

@@ -22,9 +22,9 @@ import (
 
 // User is a slice of the v1 data model (PLAN.md §5).
 type User struct {
-	ID           int64     `json:"id" db:"id"`
-	Email        string    `json:"email" db:"email"`
-	PasswordHash string    `json:"-" db:"password_hash"`
+	ID           int64  `json:"id" db:"id"`
+	Email        string `json:"email" db:"email"`
+	PasswordHash string `json:"-" db:"password_hash"`
 	Role         string `json:"role" db:"role"`
 	CreatedAt    string `json:"created_at" db:"created_at"`
 }

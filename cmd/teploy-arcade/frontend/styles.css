@@ -912,11 +912,6 @@ button { font: inherit; color: inherit; }
 /* POLISH: consequences of the pick, before committing to it */
 .wiz-side { border-left: 1px solid var(--line); background: #262626; padding: 15px 16px; overflow: auto; }
 .wiz-side h4 { margin: 0 0 11px; font-size: 12px; color: var(--t-2); font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; }
-.kv { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid #333; font-size: 12.5px; }
-.kv:last-of-type { border-bottom: 0; }
-.kv .k { color: var(--t-2); display: flex; align-items: center; gap: 7px; }
-.kv .v { margin-left: auto; font-variant-numeric: tabular-nums; }
-.kv .v.edit { border-bottom: 1px dashed #555; cursor: pointer; }
 
 .bar { height: 5px; background: #383838; border-radius: 3px; overflow: hidden; }
 .bar > i { display: block; height: 100%; background: var(--lime); }
@@ -1044,23 +1039,7 @@ button { font: inherit; color: inherit; }
 .num { font-variant-numeric: tabular-nums; }
 
 /* Mockup annotation. Not product chrome. */
-.mock-note {
-  position: fixed;
-  right: 14px;
-  bottom: 62px;
-  width: 236px;
-  padding: 10px 12px;
-  background: rgba(24, 24, 24, 0.96);
-  border: 1px solid #4a4a4a;
-  border-left: 2px solid var(--lime);
-  border-radius: 4px;
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: var(--t-1);
-  z-index: 60;
-}
 
-.mock-note b { color: var(--t-0); display: block; margin-bottom: 3px; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; }
 
 
 /* ======================================================== dashboard table */

@@ -237,11 +237,11 @@ function serverHeader(s, tab) {
   const busy = s.status === 'starting' || s.status === 'stopping';
 
   const actions = running || busy
-    ? `<button class="btn btn-stop" data-act="stop" ${busy ? 'disabled' : ''}><i class="ico ico-sm ico-stop"></i> Stop</button>
-       <button class="btn btn-kill" data-act="kill"><i class="ico ico-sm ico-power"></i> Kill</button>
-       <button class="btn btn-restart" data-act="restart" ${busy ? 'disabled' : ''}><i class="ico ico-sm ico-restart"></i> Restart</button>`
-    : `<button class="btn btn-start" data-act="start"><i class="ico ico-sm ico-play"></i> Start</button>
-       <button class="btn btn-quiet" data-act="delete"><i class="ico ico-sm ico-trash"></i> Delete</button>`;
+    ? `<button type="button" class="btn btn-stop" data-act="stop" ${busy ? 'disabled' : ''}><i class="ico ico-sm ico-stop"></i> Stop</button>
+       <button type="button" class="btn btn-kill" data-act="kill"><i class="ico ico-sm ico-power"></i> Kill</button>
+       <button type="button" class="btn btn-restart" data-act="restart" ${busy ? 'disabled' : ''}><i class="ico ico-sm ico-restart"></i> Restart</button>`
+    : `<button type="button" class="btn btn-start" data-act="start"><i class="ico ico-sm ico-play"></i> Start</button>
+       <button type="button" class="btn btn-quiet" data-act="delete"><i class="ico ico-sm ico-trash"></i> Delete</button>`;
 
   const meta = [
     `<span><i class="ico ico-sm ico-network"></i> <span class="mono val">${esc(s.address.host)}:${s.address.port}</span></span>`,
@@ -355,7 +355,7 @@ function viewServers() {
       <div>
         <div class="big">No servers yet</div>
         <div>Create one from a template - it takes a few seconds on the simulator runtime.</div>
-        <button class="btn btn-primary" data-open-create><i class="ico ico-sm ico-plus"></i> Create new Server</button>
+        <button type="button" class="btn btn-primary" data-open-create><i class="ico ico-sm ico-plus"></i> Create new Server</button>
       </div>
     </div>`;
 
@@ -433,11 +433,11 @@ function serverCard(s) {
   ].filter(Boolean).join('');
 
   const actions = running || busy
-    ? `<button class="btn btn-sm" data-act="console"><i class="ico ico-sm ico-terminal"></i> Console</button>
-       <button class="btn btn-sm btn-stop" data-act="stop" ${busy ? 'disabled' : ''}><i class="ico ico-sm ico-stop"></i> Stop</button>
-       <button class="btn btn-sm btn-restart btn-icon" data-act="restart" title="Restart" ${busy ? 'disabled' : ''}><i class="ico ico-sm ico-restart"></i></button>`
-    : `<button class="btn btn-sm" data-act="console"><i class="ico ico-sm ico-terminal"></i> Console</button>
-       <button class="btn btn-sm btn-start" data-act="start"><i class="ico ico-sm ico-play"></i> Start</button>`;
+    ? `<button type="button" class="btn btn-sm" data-act="console"><i class="ico ico-sm ico-terminal"></i> Console</button>
+       <button type="button" class="btn btn-sm btn-stop" data-act="stop" ${busy ? 'disabled' : ''}><i class="ico ico-sm ico-stop"></i> Stop</button>
+       <button type="button" class="btn btn-sm btn-restart btn-icon" data-act="restart" title="Restart" ${busy ? 'disabled' : ''}><i class="ico ico-sm ico-restart"></i></button>`
+    : `<button type="button" class="btn btn-sm" data-act="console"><i class="ico ico-sm ico-terminal"></i> Console</button>
+       <button type="button" class="btn btn-sm btn-start" data-act="start"><i class="ico ico-sm ico-play"></i> Start</button>`;
 
   const statusExtra = s.status === 'failed'
     ? `<div class="st off" style="display:flex;align-items:center;gap:6px"><i class="ico ico-sm ico-warning"></i> Failed</div>`
@@ -746,7 +746,7 @@ class ConsoleController {
         <span class="skin" style="background:linear-gradient(150deg,hsl(${hue} 32% 46%),hsl(${hue} 32% 28%))"></span>
         <span><div class="pn">${esc(p.name)}</div><div class="pm">${p.ping_ms} ms</div></span>
         <span class="pa">
-          <button class="btn btn-ghost btn-sm btn-icon" title="Kick" data-kick="${esc(p.name)}"><i class="ico ico-sm ico-close"></i></button>
+          <button type="button" class="btn btn-ghost btn-sm btn-icon" title="Kick" data-kick="${esc(p.name)}"><i class="ico ico-sm ico-close"></i></button>
         </span>
       </div>`;
     }).join('');
@@ -862,7 +862,7 @@ async function viewSettings(id) {
           <div class="row">
             <span class="muted" style="font-size:12px">These are the container's own limits, applied on the next start. Changing them while the server runs does not resize it.</span>
             <span class="spacer"></span>
-            <button class="btn btn-primary btn-sm" id="resSave">Save resources</button>
+            <button type="button" class="btn btn-primary btn-sm" id="resSave">Save resources</button>
           </div>
         </div>
         ${groups}
@@ -870,9 +870,9 @@ async function viewSettings(id) {
           <span class="pill-warn"><i class="ico ico-sm ico-warning"></i> <span id="chCount">0 changes</span></span>
           <span class="n" id="chNote"></span>
           <span class="spacer"></span>
-          <button class="btn btn-quiet" id="discardBtn">Discard</button>
-          <button class="btn" id="saveBtn">Save</button>
-          <button class="btn btn-primary" id="saveRestartBtn"><i class="ico ico-sm ico-restart"></i> Save and restart</button>
+          <button type="button" class="btn btn-quiet" id="discardBtn">Discard</button>
+          <button type="button" class="btn" id="saveBtn">Save</button>
+          <button type="button" class="btn btn-primary" id="saveRestartBtn"><i class="ico ico-sm ico-restart"></i> Save and restart</button>
         </div>
       </div>
     </div>`;
@@ -1030,8 +1030,8 @@ async function openCreate() {
 
             <h4>Runtime</h4>
             <div class="seg2" style="margin-bottom:8px">
-              <button id="rtSim" class="on">Simulator</button>
-              <button id="rtDocker" ${data.docker ? '' : 'disabled'}>Docker</button>
+              <button type="button" id="rtSim" class="on">Simulator</button>
+              <button type="button" id="rtDocker" ${data.docker ? '' : 'disabled'}>Docker</button>
             </div>
             <div class="muted" style="font-size:11.5px;line-height:1.5" id="rtNote">
               Runs in-process. Starts instantly, no image to pull - use it to drive the panel.
@@ -1046,8 +1046,8 @@ async function openCreate() {
         <span class="note">Nothing is created until you press Create.</span>
         <div class="spacer"></div>
         <label class="cbx is-on" id="startNow"><span class="box"><i class="ico ico-check"></i></span> Start immediately</label>
-        <button class="btn btn-quiet" id="cancelBtn">Cancel</button>
-        <button class="btn btn-primary" id="createBtn"><i class="ico ico-sm ico-plus"></i> Create</button>
+        <button type="button" class="btn btn-quiet" id="cancelBtn">Cancel</button>
+        <button type="button" class="btn btn-primary" id="createBtn"><i class="ico ico-sm ico-plus"></i> Create</button>
       </div>
     </div>
   </div>`);
@@ -1202,9 +1202,9 @@ function viewDashboard() {
                 <div class="muted mono" style="font-size:11px">:${s.address.port}</div></td>
             <td class="dact">
               ${up
-                ? `<button class="btn btn-ghost btn-sm btn-icon" data-dact="stop" data-sid="${esc(s.id)}" title="Stop"><i class="ico ico-sm ico-stop"></i></button>
-                   <button class="btn btn-ghost btn-sm btn-icon" data-dact="restart" data-sid="${esc(s.id)}" title="Restart"><i class="ico ico-sm ico-restart"></i></button>`
-                : `<button class="btn btn-ghost btn-sm btn-icon" data-dact="start" data-sid="${esc(s.id)}" title="Start"><i class="ico ico-sm ico-play"></i></button>`}
+                ? `<button type="button" class="btn btn-ghost btn-sm btn-icon" data-dact="stop" data-sid="${esc(s.id)}" title="Stop"><i class="ico ico-sm ico-stop"></i></button>
+                   <button type="button" class="btn btn-ghost btn-sm btn-icon" data-dact="restart" data-sid="${esc(s.id)}" title="Restart"><i class="ico ico-sm ico-restart"></i></button>`
+                : `<button type="button" class="btn btn-ghost btn-sm btn-icon" data-dact="start" data-sid="${esc(s.id)}" title="Start"><i class="ico ico-sm ico-play"></i></button>`}
             </td>
             <td><div class="bar bar-sm"><i style="width:${Math.min(100, cpu)}%"></i></div>
                 <span class="muted">${up ? cpu + '%' : '—'}</span></td>

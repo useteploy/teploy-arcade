@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"archive/zip"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -834,5 +835,74 @@ func TestVersionIsRecoveredFromTheVanillaJar(t *testing.T) {
 	// And the whole point: that version must select a JRE the pack can run on.
 	if got := imageForVersion("itzg/minecraft-server", sc.Version); got != "itzg/minecraft-server:"+imageJava8 {
 		t.Errorf("image = %q; a 1.16.5 pack needs Java 8", got)
+	}
+}
+
+// "paper.jar" carries no version in its name, which is the common case for a
+// server that updates in place - so imports recorded "unknown" and the JRE was
+// chosen by whatever the untagged image happened to ship. The jar itself knows:
+// version.json in the archive root names the exact version.
+func TestVersionIsReadFromInsideTheJar(t *testing.T) {
+	_, mgr := newImportAgent(t)
+	dir := t.TempDir()
+
+	// A jar is a zip; build one carrying version.json, as Paper does.
+	jar := filepath.Join(dir, "paper.jar")
+	f, err := os.Create(jar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	w, err := zw.Create("version.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(`{"id":"26.1.2","name":"26.1.2","world_version":4790}`)); err != nil {
+		t.Fatal(err)
+	}
+	zw.Close()
+	f.Close()
+
+	if err := os.WriteFile(filepath.Join(dir, "server.properties"), []byte("server-port=25566\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "world"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "world", "level.dat"), []byte("lvl"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sc, err := mgr.ScanImport(dir)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if sc.Version != "26.1.2" {
+		t.Errorf("version = %q, want 26.1.2 read from the jar", sc.Version)
+	}
+	// And that version must now select a JRE rather than falling through.
+	if _, ok := javaTagFor(sc.Version); !ok {
+		t.Errorf("version %q still does not resolve a JRE", sc.Version)
+	}
+}
+
+// A jar with no version.json, or one that is not a zip at all, must not break
+// the scan - it falls back to the filename and the vanilla-jar hint.
+func TestAJarWithoutVersionJsonStillScans(t *testing.T) {
+	_, mgr := newImportAgent(t)
+	dir := mkTree(t, "noversion", map[string]string{
+		"paper.jar":         "not a zip at all",
+		"server.properties": "server-port=25567\n",
+		"world/level.dat":   "lvl",
+	})
+	sc, err := mgr.ScanImport(dir)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if sc.Template != "paper" {
+		t.Errorf("template = %q, want paper", sc.Template)
+	}
+	if sc.Version != "" {
+		t.Errorf("version = %q, want empty for an unreadable jar", sc.Version)
 	}
 }

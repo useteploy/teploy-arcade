@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -419,6 +420,16 @@ func (m *Manager) identify(sc *ImportScan) {
 		sc.Version = v
 	}
 	if sc.Version == "" {
+		// The jar itself knows. Paper, Purpur, Spigot and vanilla all ship a
+		// version.json in the archive root naming the exact Minecraft version,
+		// which is more reliable than any filename convention - "paper.jar"
+		// carries nothing at all, and that is the common case for a server that
+		// auto-updates in place.
+		if v := versionFromJar(filepath.Join(sc.Path, sc.Jar)); v != "" {
+			sc.Version = v
+		}
+	}
+	if sc.Version == "" {
 		// A loader jar often carries no version - Forge installers frequently
 		// leave plain "forge.jar" - but the vanilla server it runs on is named
 		// for the exact Minecraft version, and it is sitting right there. This
@@ -521,6 +532,50 @@ func (m *Manager) crossCheck(sc *ImportScan) {
 		sc.Warnings = append(sc.Warnings, fmt.Sprintf(
 			"copying needs %s and only %s is free on the panel's disk", humanSize(sc.SizeBytes+importFreeMargin), humanSize(sc.FreeBytes)))
 	}
+}
+
+// versionFromJar reads the Minecraft version out of a server jar.
+//
+// version.json sits in the archive root and carries {"id": "26.1.2", ...}. This
+// matters beyond cosmetics: the version selects the JRE, and a server recorded
+// as "unknown" gets whatever the untagged image happens to ship.
+//
+// Deliberately tolerant - a jar that is not a zip, has no version.json, or has
+// one that does not parse simply yields nothing and the caller falls back.
+func versionFromJar(path string) string {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return ""
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		if f.Name != "version.json" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return ""
+		}
+		// Bounded: this is an attacker-influenced archive, and the file we
+		// want is a few hundred bytes.
+		b, err := io.ReadAll(io.LimitReader(rc, 64<<10))
+		rc.Close()
+		if err != nil {
+			return ""
+		}
+		var v struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(b, &v) != nil {
+			return ""
+		}
+		if v.ID != "" {
+			return v.ID
+		}
+		return v.Name
+	}
+	return ""
 }
 
 // serverNameFrom recovers the name the previous panel gave this server, so an

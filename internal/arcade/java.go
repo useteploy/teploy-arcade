@@ -27,6 +27,7 @@ const (
 	imageJava8  = "java8"
 	imageJava17 = "java17"
 	imageJava21 = "java21"
+	imageJava25 = "java25"
 )
 
 // parseMCVersion pulls the numeric parts out of a Minecraft version string.
@@ -66,7 +67,23 @@ func parseMCVersion(v string) (major, minor, patch int, ok bool) {
 // whether a tag could be determined at all.
 func javaTagFor(version string) (string, bool) {
 	major, minor, patch, ok := parseMCVersion(version)
-	if !ok || major != 1 {
+	if !ok {
+		return "", false
+	}
+	// Minecraft left the 1.x scheme behind: releases are now year-based
+	// (26.1.2). Those are newer than every boundary below, so they take the
+	// newest JRE we know of. Without this the whole table fell through to the
+	// untagged image, which happens to ship Java 25 today - the right answer by
+	// accident, and only until that tag moves.
+	//
+	// Floored at 20 rather than "anything not 1.x": there will never be a
+	// Minecraft 2.x through 19.x, so a version in that range is not a release
+	// this table understands (1.RV and the 2.0 April Fools build both land
+	// there) and gets no tag rather than a guessed one.
+	if major >= 20 {
+		return imageJava25, true
+	}
+	if major != 1 {
 		return "", false
 	}
 	switch {

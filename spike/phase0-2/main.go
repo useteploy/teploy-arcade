@@ -34,7 +34,7 @@ func makePayload(n int) []byte {
 }
 
 type viewer struct {
-	conn     *neutronrealtime.Conn
+	conn      *neutronrealtime.Conn
 	delivered atomic.Int64
 }
 

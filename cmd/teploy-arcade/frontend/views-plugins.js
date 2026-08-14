@@ -41,7 +41,7 @@ async function viewPlugins(id) {
     <div class="addbar" id="plBar" style="display:none">
       <span class="sigil"><i class="ico ico-sm ico-download"></i></span>
       <input class="inp" id="plURL" placeholder="https://example.com/plugin.jar" autocomplete="off">
-      <button class="btn btn-primary" id="plInstall">Install</button>
+      <button type="button" class="btn btn-primary" id="plInstall">Install</button>
     </div>
   </div>`);
 
@@ -92,8 +92,8 @@ async function viewPlugins(id) {
         <span class="muted" style="font-size:11.5px;width:160px;text-align:right;white-space:nowrap">
           ${new Date(e.mod * 1000).toLocaleDateString()} ${new Date(e.mod * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
         </span>
-        <button class="btn btn-quiet btn-sm" data-toggle>${e.enabled ? 'Disable' : 'Enable'}</button>
-        <button class="btn btn-ghost btn-sm btn-icon" data-rm title="Delete">
+        <button type="button" class="btn btn-quiet btn-sm" data-toggle>${e.enabled ? 'Disable' : 'Enable'}</button>
+        <button type="button" class="btn btn-ghost btn-sm btn-icon" data-rm title="Delete">
           <i class="ico ico-sm ico-trash" style="color:var(--offline)"></i></button>
       </div>`).join('');
 

@@ -58,8 +58,8 @@ async function viewFiles(id) {
           <p class="sect-sub" id="crumbs">/</p>
         </div>
         <div class="spacer"></div>
-        <button class="btn btn-quiet btn-sm" id="newFolder"><i class="ico ico-sm ico-plus"></i> New folder</button>
-        <button class="btn btn-quiet btn-sm" id="upDir" style="margin-left:8px"><i class="ico ico-sm ico-up"></i> Up</button>
+        <button type="button" class="btn btn-quiet btn-sm" id="newFolder"><i class="ico ico-sm ico-plus"></i> New folder</button>
+        <button type="button" class="btn btn-quiet btn-sm" id="upDir" style="margin-left:8px"><i class="ico ico-sm ico-up"></i> Up</button>
       </div>
       <div style="padding:0 22px 26px">
         <div class="panelbox" style="margin:0"><div id="fileList"></div></div>
@@ -89,8 +89,8 @@ async function viewFiles(id) {
           <span class="muted num" style="font-size:11.5px">${e.dir ? '' : humanBytes(e.size)}</span>
           <span class="muted nowrap" style="font-size:11.5px;width:160px;text-align:right">${new Date(e.mod * 1000).toLocaleDateString()} ${new Date(e.mod * 1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</span>
           <span class="rowacts">
-            ${e.dir ? '' : `<button class="btn btn-ghost btn-sm btn-icon" data-dl title="Download"><i class="ico ico-sm ico-download"></i></button>`}
-            <button class="btn btn-ghost btn-sm btn-icon" data-rm title="Delete"><i class="ico ico-sm ico-trash"></i></button>
+            ${e.dir ? '' : `<button type="button" class="btn btn-ghost btn-sm btn-icon" data-dl title="Download"><i class="ico ico-sm ico-download"></i></button>`}
+            <button type="button" class="btn btn-ghost btn-sm btn-icon" data-rm title="Delete"><i class="ico ico-sm ico-trash"></i></button>
           </span>
         </div>`).join('');
 
@@ -161,8 +161,8 @@ async function openEditor(id, path, onSaved) {
       <div class="modal-foot">
         <span class="note" id="edNote">${data.content.split('\n').length} lines</span>
         <div class="spacer"></div>
-        <button class="btn btn-quiet" id="cancel">Cancel</button>
-        <button class="btn btn-primary" id="save"><i class="ico ico-sm ico-check"></i> Save</button>
+        <button type="button" class="btn btn-quiet" id="cancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="save"><i class="ico ico-sm ico-check"></i> Save</button>
       </div>
     </div>
   </div>`);
@@ -204,7 +204,7 @@ async function viewBackups(id) {
           <p class="sect-sub">Saves are paused and flushed before the archive is taken, and file writes are blocked for the window.</p>
         </div>
         <div class="spacer"></div>
-        <button class="btn btn-primary btn-sm" id="mkBackup"><i class="ico ico-sm ico-download"></i> Back up now</button>
+        <button type="button" class="btn btn-primary btn-sm" id="mkBackup"><i class="ico ico-sm ico-download"></i> Back up now</button>
       </div>
       <div style="padding:0 22px 26px">
         <div class="panelbox" style="margin:0"><div id="bkList"></div></div>
@@ -231,8 +231,8 @@ async function viewBackups(id) {
           <span class="spacer"></span>
           <span class="muted num" style="font-size:11.5px">${humanBytes(b.size)}</span>
           <span class="muted" style="font-size:11.5px">${new Date(b.created * 1000).toLocaleString()}</span>
-          <button class="btn btn-quiet btn-sm" data-restore>Restore</button>
-          <button class="btn btn-ghost btn-sm btn-icon" data-del title="Delete"><i class="ico ico-sm ico-trash"></i></button>
+          <button type="button" class="btn btn-quiet btn-sm" data-restore>Restore</button>
+          <button type="button" class="btn btn-ghost btn-sm btn-icon" data-del title="Delete"><i class="ico ico-sm ico-trash"></i></button>
         </div>`).join('');
 
       list.querySelectorAll('.row[data-bid]').forEach((row) => {
@@ -336,9 +336,9 @@ async function viewAdmin() {
       <div class="row">
         <span class="k">Surface</span>
         <div class="seg2" style="width:300px" id="contrastSeg">
-          <button data-contrast="dim">Dim</button>
-          <button data-contrast="">Default</button>
-          <button data-contrast="high">High contrast</button>
+          <button type="button" data-contrast="dim">Dim</button>
+          <button type="button" data-contrast="">Default</button>
+          <button type="button" data-contrast="high">High contrast</button>
         </div>
       </div>
     </div>
@@ -360,14 +360,14 @@ async function viewAdmin() {
           <span class="spacer"></span>
           <input class="inp" id="suName" placeholder="username" style="width:150px">
           <input class="inp" id="suPass" type="password" placeholder="password (8+)" style="width:170px">
-          <button class="btn btn-primary btn-sm" id="suBtn">Create</button>
+          <button type="button" class="btn btn-primary btn-sm" id="suBtn">Create</button>
         </div>` : `
         <div class="row"><span class="k">Status</span><span>Sign-in required.</span></div>
         ${users.map((u) => `<div class="row">
             <span class="k">${esc(u.name)}</span>
             <span class="badge-mute">${esc(u.role)}</span>
             <span class="spacer"></span>
-            ${isAdmin ? `<button class="btn btn-ghost btn-sm btn-icon" data-deluser="${esc(u.name)}"><i class="ico ico-sm ico-trash"></i></button>` : ''}
+            ${isAdmin ? `<button type="button" class="btn btn-ghost btn-sm btn-icon" data-deluser="${esc(u.name)}"><i class="ico ico-sm ico-trash"></i></button>` : ''}
           </div>`).join('')}
         ${isAdmin ? `<div class="row">
           <span class="k">Add user</span>
@@ -379,10 +379,10 @@ async function viewAdmin() {
             <option value="operator">operator</option>
             <option value="admin">admin</option>
           </select>
-          <button class="btn btn-sm" id="nuBtn">Add</button>
+          <button type="button" class="btn btn-sm" id="nuBtn">Add</button>
         </div>` : ''}
         <div class="row"><span class="k"></span><span class="spacer"></span>
-          <button class="btn btn-quiet btn-sm" id="logoutBtn">Sign out</button></div>`}
+          <button type="button" class="btn btn-quiet btn-sm" id="logoutBtn">Sign out</button></div>`}
     </div>
 
     <div class="panelbox">
@@ -508,7 +508,7 @@ function viewLogin() {
         <label style="display:block;font-size:12px;color:var(--t-1);margin-bottom:6px">Password</label>
         <input class="inp" id="lgPass" type="password" autocomplete="current-password">
       </div>
-      <button class="btn btn-primary" id="lgBtn" style="width:100%;justify-content:center">Sign in</button>
+      <button type="submit" class="btn btn-primary" id="lgBtn" style="width:100%;justify-content:center">Sign in</button>
       <div id="lgErr" style="color:var(--offline);font-size:12px;margin-top:12px"></div>
     </form>
   </div>`);

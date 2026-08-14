@@ -172,7 +172,7 @@ async function viewPlayers(id) {
         </span>
         <span class="spacer"></span>
         <span class="muted" id="liveNote"></span>
-        <button class="btn btn-quiet btn-sm" id="editRaw"><i class="ico ico-sm ico-terminal"></i> Switch to File Editor</button>
+        <button type="button" class="btn btn-quiet btn-sm" id="editRaw"><i class="ico ico-sm ico-terminal"></i> Switch to File Editor</button>
       </div>
       <div style="padding:0 22px 20px">
         <div class="panelbox" style="margin:0"><div id="plist"></div></div>
@@ -182,7 +182,7 @@ async function viewPlayers(id) {
       <span class="sigil"><i class="ico ico-sm ico-plus"></i></span>
       <input class="inp" id="addName" placeholder="Add username or UUID" autocomplete="off">
       <input class="inp" id="addReason" placeholder="Reason (bans only)" style="max-width:220px;display:none">
-      <button class="btn btn-primary" id="addBtn">Add</button>
+      <button type="button" class="btn btn-primary" id="addBtn">Add</button>
     </div>
   </div>`);
 
@@ -226,7 +226,7 @@ async function viewPlayers(id) {
         <span class="pn" title="${esc(e.reason || '')}">${esc(who)}</span>
         ${e.level ? `<span class="badge-mute">lvl ${e.level}</span>` : ''}
         <span class="spacer"></span>
-        <button class="btn btn-ghost btn-sm btn-icon" data-rm="${esc(who)}" title="Remove">
+        <button type="button" class="btn btn-ghost btn-sm btn-icon" data-rm="${esc(who)}" title="Remove">
           <i class="ico ico-sm ico-trash" style="color:var(--offline)"></i></button>
       </div>`;
     }).join('')}</div>`;
@@ -296,7 +296,7 @@ async function viewScheduler(id) {
           <p class="sect-sub">Tasks run at a 24-hour clock time on the host. Steps are separated by <span class="mono">;</span></p>
         </div>
         <div class="spacer"></div>
-        <button class="btn btn-primary btn-sm" id="newTask"><i class="ico ico-sm ico-plus"></i> Create Task</button>
+        <button type="button" class="btn btn-primary btn-sm" id="newTask"><i class="ico ico-sm ico-plus"></i> Create Task</button>
       </div>
       <div style="padding:0 22px 26px">
         <div class="panelbox" style="margin:0 0 16px"><div id="tasks"></div></div>
@@ -335,9 +335,9 @@ async function viewScheduler(id) {
             ${t.enabled && t.next_run ? 'next ' + new Date(t.next_run * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '&mdash;'}
           </span>
           <span class="muted" style="font-size:11.5px;width:60px;text-align:right">${t.runs} run${t.runs === 1 ? '' : 's'}</span>
-          <button class="btn btn-quiet btn-sm" data-run>Run now</button>
-          <button class="btn btn-ghost btn-sm btn-icon" data-edit title="Edit"><i class="ico ico-sm ico-sliders"></i></button>
-          <button class="btn btn-ghost btn-sm btn-icon" data-del title="Delete"><i class="ico ico-sm ico-trash"></i></button>
+          <button type="button" class="btn btn-quiet btn-sm" data-run>Run now</button>
+          <button type="button" class="btn btn-ghost btn-sm btn-icon" data-edit title="Edit"><i class="ico ico-sm ico-sliders"></i></button>
+          <button type="button" class="btn btn-ghost btn-sm btn-icon" data-del title="Delete"><i class="ico ico-sm ico-trash"></i></button>
         </div>
         ${t.last_err ? `<div class="row" style="padding-top:0;border-top:0;color:var(--offline);font-size:11.5px">
           <span class="k"></span><span>last run failed: ${esc(t.last_err)}</span></div>` : ''}
@@ -419,8 +419,8 @@ function taskDialog(serverId, task, onSaved) {
       </div>
       <div class="modal-foot">
         <div class="spacer"></div>
-        <button class="btn btn-quiet" id="back">Back</button>
-        <button class="btn btn-primary" id="save">Save</button>
+        <button type="button" class="btn btn-quiet" id="back">Back</button>
+        <button type="button" class="btn btn-primary" id="save">Save</button>
       </div>
     </div>
   </div>`);
