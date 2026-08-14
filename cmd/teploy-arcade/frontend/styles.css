@@ -183,13 +183,20 @@ button { font: inherit; color: inherit; }
      reads as a foreign element dropped into a dark panel. */
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: none;              /* Firefox: hide, we draw our own */
-  -ms-overflow-style: none;
   position: relative;
+
+  /* The bar sits in a gutter BELOW the tabs rather than over them, and stays
+     visible rather than appearing on hover. An auto-hiding bar means the only
+     signal that the strip scrolls is discovered by accident; a permanent one
+     costs 5px and always tells you where you are. */
+  height: 41px;
+  padding-bottom: 5px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .22) transparent;
 }
 
 .tabstrip::-webkit-scrollbar {
-  height: 0;                          /* no reserved track */
+  height: 5px;
   background: transparent;
 }
 
@@ -198,6 +205,7 @@ button { font: inherit; color: inherit; }
 .tabstrip-wrap {
   position: relative;
   flex: none;
+  background: var(--rail);
 }
 
 .tabstrip-wrap::after {
@@ -213,15 +221,17 @@ button { font: inherit; color: inherit; }
 
 .tabstrip-wrap.has-overflow::after { opacity: 1; }
 
-/* A slim bar that appears while scrolling or hovering, over the tabs. */
-.tabstrip:hover { scrollbar-width: thin; }
-.tabstrip:hover::-webkit-scrollbar { height: 4px; }
+/* Floating: a rounded thumb on no track, so it reads as an indicator rather
+   than a platform chrome element dropped into a dark panel. */
 .tabstrip::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, .16);
+  background: rgba(255, 255, 255, .22);
   border-radius: 99px;
 }
-.tabstrip:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .28); }
+.tabstrip:hover::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .36); }
 .tabstrip::-webkit-scrollbar-track { background: transparent; }
+
+/* Tabs keep their own height; the gutter is the strip's padding, not theirs. */
+.tabstrip .stab { height: 36px; }
 
 /* Tabs must not shrink to nothing as the count grows - a strip of illegible
    slivers is worse than scrolling. */
