@@ -62,12 +62,8 @@ func TestConsoleRevalidatesTheSessionOnEveryCommand(t *testing.T) {
 	s := startServer(t, mgr)
 
 	// A second admin, so deleting the operator is not "the last admin".
-	if _, err := mgr.auth.CreateUser("boss", "correct-horse-battery", RoleAdmin); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mgr.auth.CreateUser("op", "correct-horse-battery", RoleOperator); err != nil {
-		t.Fatal(err)
-	}
+	newAccount(t, mgr.auth, "boss", "correct-horse-battery", RoleAdmin)
+	newAccount(t, mgr.auth, "op", "correct-horse-battery", RoleOperator)
 	sess, err := mgr.auth.Login("op", "correct-horse-battery")
 	if err != nil {
 		t.Fatal(err)
@@ -117,9 +113,7 @@ func TestPostedCommandIsAttributedToTheSession(t *testing.T) {
 	defer srv.Close()
 	s := startServer(t, mgr)
 
-	if _, err := mgr.auth.CreateUser("boss", "correct-horse-battery", RoleAdmin); err != nil {
-		t.Fatal(err)
-	}
+	newAccount(t, mgr.auth, "boss", "correct-horse-battery", RoleAdmin)
 	sess, err := mgr.auth.Login("boss", "correct-horse-battery")
 	if err != nil {
 		t.Fatal(err)
@@ -164,9 +158,7 @@ func TestSaltAndTokenFailClosedWithoutEntropy(t *testing.T) {
 	_, mgr := newTestAgent(t)
 	a := mgr.auth
 
-	if _, err := a.CreateUser("admin", "correct-horse-battery", RoleAdmin); err != nil {
-		t.Fatal(err)
-	}
+	newAccount(t, a, "admin", "correct-horse-battery", RoleAdmin)
 
 	orig := randRead
 	randRead = func([]byte) (int, error) { return 0, errors.New("entropy source unavailable") }

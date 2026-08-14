@@ -57,6 +57,9 @@ func (a *API) RoutesExt(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/users", auth.require(RoleAdmin, a.listUsers))
 	mux.HandleFunc("POST /api/users", auth.require(RoleAdmin, a.createUser))
 	mux.HandleFunc("DELETE /api/users/{name}", auth.require(RoleAdmin, a.deleteUser))
+	// Viewer, not admin: this is the route a viewer uses to change their own
+	// password. Who may change WHOSE password is decided inside the handler.
+	mux.HandleFunc("POST /api/users/{name}/password", auth.requireEvenLockedOut(RoleViewer, a.setPassword))
 	mux.HandleFunc("GET /api/audit", auth.require(RoleViewer, a.getAudit))
 
 	a.mcpRoutes(mux)
@@ -292,6 +295,9 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 	}
 	if s != nil {
 		resp["user"] = map[string]any{"name": s.User, "role": s.Role}
+		// The panel puts a change-password screen in front of everything else
+		// while this is set, and the API refuses the rest regardless.
+		resp["must_change"] = auth.MustChangePassword(s.User)
 	} else if unclaimed {
 		// No account, no session - so no user. This used to answer with an
 		// invented {name: "local", role: "admin"}, which the settings screen
@@ -412,6 +418,53 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mgr.audit(actorOf(r), "user.create", u.Name, u.Role)
 	writeJSON(w, 201, map[string]any{"name": u.Name, "role": u.Role})
+}
+
+// setPassword serves both "change my own" and "an admin resets someone
+// else's". A user may always change their own with the current password; only
+// an admin may set another account's, and doing so marks it must-change.
+func (a *API) setPassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Current string `json:"current"`
+		New     string `json:"new"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+
+	target := r.PathValue("name")
+	auth := a.mgr.auth
+	s := sessionFrom(r)
+
+	// With auth off there is no session and no "self" to be; treat it as the
+	// admin path so a local run can still repair an account.
+	self, byAdmin, actor := false, true, "local"
+	if s != nil {
+		self = strings.EqualFold(s.User, target)
+		byAdmin = !self
+		actor = s.User
+		if byAdmin && roleRank[s.Role] < roleRank[RoleAdmin] {
+			writeJSON(w, 403, map[string]string{
+				"error": "only an admin can set another user's password"})
+			return
+		}
+	}
+
+	token := ""
+	if c, err := r.Cookie("gss_session"); err == nil {
+		token = c.Value
+	}
+	if err := auth.SetPassword(target, body.Current, body.New, token, byAdmin); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	action := "user.password.set"
+	if self {
+		action = "user.password.change"
+	}
+	a.mgr.audit(actor, action, target, "")
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
 func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {

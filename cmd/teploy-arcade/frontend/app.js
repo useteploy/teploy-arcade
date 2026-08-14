@@ -1470,6 +1470,14 @@ async function boot() {
     return;
   }
 
+  // An account still on a password an admin chose is refused every other
+  // route by the API, so there is nothing else to show it.
+  if (state.me && state.me.must_change && state.me.user) {
+    document.querySelector('.app').style.display = 'none';
+    document.body.appendChild(window.extraViews.viewForcePassword(state.me.user.name));
+    return;
+  }
+
   try {
     const data = await api('/api/servers');
     state.servers = data.servers;

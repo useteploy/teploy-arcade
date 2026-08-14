@@ -367,6 +367,7 @@ async function viewAdmin() {
         ${users.map((u) => `<div class="row">
             <span class="k">${esc(u.name)}</span>
             <span class="badge-mute">${esc(u.role)}</span>
+            ${u.must_change ? '<span class="pill-warn"><i class="ico ico-sm ico-warning"></i> must set own password</span>' : ''}
             <span class="spacer"></span>
             ${isAdmin ? `<button type="button" class="btn btn-ghost btn-sm btn-icon" data-deluser="${esc(u.name)}"><i class="ico ico-sm ico-trash"></i></button>` : ''}
           </div>`).join('')}
@@ -381,7 +382,26 @@ async function viewAdmin() {
             <option value="admin">admin</option>
           </select>
           <button type="button" class="btn btn-sm" id="nuBtn">Add</button>
+        </div>
+        <div class="row">
+          <span class="k">Reset a password</span>
+          <span class="spacer"></span>
+          <select class="inp" id="rpUser" style="width:140px">
+            ${users.map((u) => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('')}
+          </select>
+          <input class="inp" id="rpPass" type="password" placeholder="new (8+)" style="width:150px" autocomplete="new-password">
+          <button type="button" class="btn btn-sm" id="rpBtn">Set</button>
+        </div>
+        <div class="row"><span class="k"></span>
+          <span class="muted" style="font-size:12px">A password you set for someone else is one you know. They are refused
+          the panel until they replace it.</span>
         </div>` : ''}
+        <div class="row"><span class="k">Your password</span>
+          <span class="spacer"></span>
+          <input class="inp" id="pwCur" type="password" placeholder="current" style="width:150px" autocomplete="current-password">
+          <input class="inp" id="pwNew" type="password" placeholder="new (8+)" style="width:150px" autocomplete="new-password">
+          <button type="button" class="btn btn-sm" id="pwBtn">Change</button>
+        </div>
         <div class="row"><span class="k"></span><span class="spacer"></span>
           <button type="button" class="btn btn-quiet btn-sm" id="logoutBtn">Sign out</button></div>`}
     </div>
@@ -546,6 +566,35 @@ async function viewAdmin() {
       catch (e) { toast(e.message, 'err'); }
     }));
 
+  const pw = $('#pwBtn', root);
+  if (pw) pw.addEventListener('click', async () => {
+    const me = state.me && state.me.user;
+    if (!me) return;
+    try {
+      await api(`/api/users/${encodeURIComponent(me.name)}/password`, {
+        method: 'POST',
+        body: JSON.stringify({ current: $('#pwCur', root).value, new: $('#pwNew', root).value }),
+      });
+      // Every other session for this account was just dropped; this one was
+      // deliberately kept, so there is nothing to sign back in to.
+      toast('Password changed. Any other sessions were signed out.');
+      $('#pwCur', root).value = '';
+      $('#pwNew', root).value = '';
+    } catch (e) { toast(e.message, 'err'); }
+  });
+
+  const rp = $('#rpBtn', root);
+  if (rp) rp.addEventListener('click', async () => {
+    const name = $('#rpUser', root).value;
+    try {
+      await api(`/api/users/${encodeURIComponent(name)}/password`, {
+        method: 'POST', body: JSON.stringify({ new: $('#rpPass', root).value }),
+      });
+      toast(`Password set for ${name}. They must replace it before using the panel.`);
+      router(true);
+    } catch (e) { toast(e.message, 'err'); }
+  });
+
   const lo = $('#logoutBtn', root);
   if (lo) lo.addEventListener('click', async () => {
     await api('/api/logout', { method: 'POST' });
@@ -667,4 +716,57 @@ function viewLogin() {
   return root;
 }
 
-window.extraViews = { viewFiles, viewBackups, viewAdmin, viewLogin, viewSetup, openEditor };
+
+// An account still holding the password an admin chose for it. The API refuses
+// every other route, so there is nothing else worth drawing: same takeover
+// treatment as first-run, for the same reason - the one thing that has to
+// happen is the only thing on screen.
+function viewForcePassword(name) {
+  const root = h(`<div class="loginwrap">
+    <form class="loginbox">
+      <div class="row-flex" style="gap:11px;margin-bottom:6px">
+        <span class="gm gm-purpur"></span>
+        <div><div style="font-size:16px;font-weight:600">Set your password</div>
+        <div class="muted" style="font-size:12px">Signed in as ${esc(name)}</div></div>
+      </div>
+
+      <p class="muted" style="font-size:12.5px;line-height:1.55;margin:10px 0 16px">
+        This account is using a password an admin chose, so two people know it.
+        The panel is closed to you until you replace it.
+      </p>
+
+      <div class="field" style="margin-bottom:12px">
+        <label style="display:block;font-size:12px;color:var(--t-1);margin-bottom:6px">Current password</label>
+        <input class="inp" id="fpCur" type="password" autocomplete="current-password">
+      </div>
+      <div class="field" style="margin-bottom:16px">
+        <label style="display:block;font-size:12px;color:var(--t-1);margin-bottom:6px">New password</label>
+        <input class="inp" id="fpNew" type="password" placeholder="8 characters or more" autocomplete="new-password">
+      </div>
+
+      <button type="submit" class="btn btn-primary" id="fpBtn" style="width:100%;justify-content:center">Set password</button>
+      <div id="fpErr" style="color:var(--offline);font-size:12px;margin-top:12px"></div>
+    </form>
+  </div>`);
+
+  const submit = async (ev) => {
+    ev.preventDefault();
+    const btn = $('#fpBtn', root);
+    btn.disabled = true;
+    try {
+      await api(`/api/users/${encodeURIComponent(name)}/password`, {
+        method: 'POST',
+        body: JSON.stringify({ current: $('#fpCur', root).value, new: $('#fpNew', root).value }),
+      });
+      location.reload();
+    } catch (e) {
+      $('#fpErr', root).textContent = e.message;
+      btn.disabled = false;
+    }
+  };
+
+  $('form', root).addEventListener('submit', submit);
+  return root;
+}
+
+window.extraViews = { viewFiles, viewBackups, viewAdmin, viewLogin, viewSetup, viewForcePassword, openEditor };

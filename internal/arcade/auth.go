@@ -43,6 +43,12 @@ type User struct {
 	Salt      string `json:"salt"`
 	Hash      string `json:"hash"`
 	CreatedAt int64  `json:"created_at"`
+	// An admin who creates an account chooses its first password, and so knows
+	// it. Until the owner replaces it, the account has a credential two people
+	// hold. MustChange is what makes that temporary: every route except the
+	// change itself is refused while it is set. Not set on the first admin,
+	// who chose their own.
+	MustChange bool `json:"must_change,omitempty"`
 }
 
 type Session struct {
@@ -313,7 +319,7 @@ func (a *Auth) CreateUser(name, password, role string) (*User, error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.createLocked(name, password, role)
+	return a.createLocked(name, password, role, false)
 }
 
 // CreateFirstUser creates the first admin and refuses once anyone exists. The
@@ -330,11 +336,11 @@ func (a *Auth) CreateFirstUser(name, password string) (*User, error) {
 	if len(a.users) > 0 {
 		return nil, fmt.Errorf("this panel already has users; sign in instead")
 	}
-	return a.createLocked(name, password, RoleAdmin)
+	return a.createLocked(name, password, RoleAdmin, true)
 }
 
 // createLocked must be called with a.mu held.
-func (a *Auth) createLocked(name, password, role string) (*User, error) {
+func (a *Auth) createLocked(name, password, role string, first bool) (*User, error) {
 	key := strings.ToLower(name)
 	if _, exists := a.users[key]; exists {
 		return nil, fmt.Errorf("user %q already exists", name)
@@ -344,7 +350,10 @@ func (a *Auth) createLocked(name, password, role string) (*User, error) {
 		return nil, err
 	}
 	u := &User{Name: name, Role: role, Salt: salt,
-		Hash: hashPassword(password, salt), CreatedAt: time.Now().Unix()}
+		Hash: hashPassword(password, salt), CreatedAt: time.Now().Unix(),
+		// The first admin picks their own password at setup and so is exempt;
+		// createLocked's other caller is an admin creating someone else.
+		MustChange: !first}
 	a.users[key] = u
 	if !a.forced {
 		a.enabled = true
@@ -417,9 +426,67 @@ func (a *Auth) Users() []map[string]any {
 	for _, u := range a.users {
 		out = append(out, map[string]any{
 			"name": u.Name, "role": u.Role, "created_at": u.CreatedAt,
+			"must_change": u.MustChange,
 		})
 	}
 	return out
+}
+
+// SetPassword replaces a password.
+//
+// Two callers, one route. A user changing their own must present the current
+// one - a stolen session should not be enough to lock the owner out of their
+// own account - and clears MustChange by doing so. An admin resetting someone
+// else's does not need it, and the reset sets MustChange, because the admin
+// now knows a password they should not keep working with.
+//
+// keepToken is the caller's own session; every other session for that user is
+// dropped. Changing a password is the move you make when you think someone
+// else has it, and it means nothing if their session keeps working.
+func (a *Auth) SetPassword(name, current, next, keepToken string, byAdmin bool) error {
+	if len(next) < 8 {
+		return fmt.Errorf("password must be at least 8 characters")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	u, ok := a.users[strings.ToLower(name)]
+	if !ok {
+		return fmt.Errorf("no such user")
+	}
+	if !byAdmin {
+		want, got := []byte(u.Hash), []byte(hashPassword(current, u.Salt))
+		if subtle.ConstantTimeCompare(want, got) != 1 {
+			return fmt.Errorf("current password is incorrect")
+		}
+		if current == next {
+			return fmt.Errorf("the new password is the same as the old one")
+		}
+	}
+
+	salt, err := randomHex(16)
+	if err != nil {
+		return err
+	}
+	u.Salt = salt
+	u.Hash = hashPassword(next, salt)
+	u.MustChange = byAdmin
+
+	for tok, s := range a.sessions {
+		if strings.EqualFold(s.User, u.Name) && tok != keepToken {
+			delete(a.sessions, tok)
+		}
+	}
+	return a.saveUsers()
+}
+
+// MustChangePassword reports whether this account is holding a password
+// somebody else chose for it.
+func (a *Auth) MustChangePassword(name string) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	u, ok := a.users[strings.ToLower(name)]
+	return ok && u.MustChange
 }
 
 func (a *Auth) DeleteUser(name string) error {
@@ -513,6 +580,18 @@ func actorOf(r *http.Request) string {
 // the agent is single-user on loopback and everything is permitted; the moment
 // a user exists, it is enforced.
 func (a *Auth) require(role string, next http.HandlerFunc) http.HandlerFunc {
+	return a.gate(role, true, next)
+}
+
+// requireEvenLockedOut is require() without the must-change lockout, for the
+// one route a locked-out account has to be able to reach: the password change
+// that clears the lock. Gating that too would leave the account unable to fix
+// the condition that gates it.
+func (a *Auth) requireEvenLockedOut(role string, next http.HandlerFunc) http.HandlerFunc {
+	return a.gate(role, false, next)
+}
+
+func (a *Auth) gate(role string, lockout bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !a.Enabled() {
 			next(w, r)
@@ -526,6 +605,16 @@ func (a *Auth) require(role string, next http.HandlerFunc) http.HandlerFunc {
 		if roleRank[s.Role] < roleRank[role] {
 			writeJSON(w, 403, map[string]string{
 				"error": fmt.Sprintf("this needs the %s role; you are %s", role, s.Role)})
+			return
+		}
+		// An account still holding the password an admin chose for it is
+		// refused everything until it sets its own. Enforced here rather than
+		// in the UI: the point is that the admin's copy of the password stops
+		// being usable, and a screen the client draws does not achieve that.
+		if lockout && a.MustChangePassword(s.User) {
+			writeJSON(w, 403, map[string]any{
+				"error":       "set your own password before using the panel",
+				"must_change": true})
 			return
 		}
 		next(w, r)

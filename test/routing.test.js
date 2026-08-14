@@ -152,9 +152,31 @@ if (!sheets.includes('responsive.css')) {
   console.log(`stylesheets: ${sheets.length} loaded, responsive.css last`);
 }
 
-if (failed || navFailed || wireFailed || cssFailed) {
+// Every ico-* class a view asks for has to exist in icons.css. A name that
+// does not resolve renders as an empty box of the right size: no error, no
+// console warning, and it looks enough like a loading state to be missed.
+// Caught one on the way in - `ico-alert` for what icons.css calls `ico-warning`.
+const iconsCSS = fs.readFileSync(
+  path.join(__dirname, '..', 'cmd', 'teploy-arcade', 'frontend', 'icons.css'), 'utf8');
+const defined = new Set([...iconsCSS.matchAll(/\.(ico-[a-z0-9-]+)/g)].map(([, n]) => n));
+const usedIcons = new Set();
+for (const f of [...scripts, 'index.html']) {
+  const s = fs.readFileSync(path.join(__dirname, '..', 'cmd', 'teploy-arcade', 'frontend', f), 'utf8');
+  for (const [n] of s.matchAll(/ico-[a-z0-9-]+/g)) usedIcons.add(n);
+}
+let iconFailed = 0;
+for (const n of usedIcons) {
+  if (!defined.has(n)) {
+    console.error(`FAIL ${n} is used but icons.css does not define it; it renders as an empty box`);
+    iconFailed++;
+  }
+}
+if (!iconFailed) console.log(`icons: ${usedIcons.size} classes used, all defined`);
+
+if (failed || navFailed || wireFailed || cssFailed || iconFailed) {
   console.error(`\n${failed}/${cases.length} routing cases failed, ${navFailed} rail items misconfigured,` +
-    ` ${wireFailed} view scripts unwired, ${cssFailed} stylesheet-order problems`);
+    ` ${wireFailed} view scripts unwired, ${cssFailed} stylesheet-order problems,
+    ${iconFailed} missing icons`);
   process.exit(1);
 }
 console.log(`routing: ${cases.length} cases pass`);

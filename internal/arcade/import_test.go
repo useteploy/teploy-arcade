@@ -674,9 +674,7 @@ func TestImportRoutesRequireAnAdminSession(t *testing.T) {
 	srv, mgr := newImportAgent(t)
 	defer srv.Close()
 
-	if _, err := mgr.auth.CreateUser("admin", "correct-horse-battery", RoleAdmin); err != nil {
-		t.Fatal(err)
-	}
+	newAccount(t, mgr.auth, "admin", "correct-horse-battery", RoleAdmin)
 	for _, r := range []struct{ method, path string }{
 		{"POST", "/api/import/scan"},
 		{"POST", "/api/import"},
@@ -698,9 +696,7 @@ func TestImportRoutesRequireAnAdminSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mgr.auth.CreateUser("op", "correct-horse-battery", RoleOperator); err != nil {
-		t.Fatal(err)
-	}
+	newAccount(t, mgr.auth, "op", "correct-horse-battery", RoleOperator)
 	opSess, err := mgr.auth.Login("op", "correct-horse-battery")
 	if err != nil {
 		t.Fatal(err)

@@ -119,10 +119,16 @@ func (m *Manager) Load() error {
 		m.seed()
 		return m.Save()
 	}
+	// What the file says was running is the only record of intent that
+	// survives a reboot, and Load is about to overwrite it. Captured here so
+	// resume() can put back what the host took down. See resume().
+	wasUp := map[string]bool{}
+
 	m.mu.Lock()
 	for _, s := range list {
 		// Nothing is running after a panel restart; don't claim otherwise.
 		if s.Status == StatusRunning || s.Status == StatusStarting || s.Status == StatusStopping {
+			wasUp[s.ID] = s.Status != StatusStopping
 			s.Status = StatusStopped
 		}
 		if s.Props == nil {
@@ -134,8 +140,65 @@ func (m *Manager) Load() error {
 	m.mu.Unlock()
 
 	m.reconcile()
+	m.resume(wasUp)
 	return nil
 }
+
+// resume restarts servers that were running when the panel last saw them and
+// whose containers are gone.
+//
+// Containers run with --rm and no restart policy, so a host reboot takes every
+// server down and reconcile() finds nothing to re-adopt: the panel came back
+// up with eight servers all stopped and no indication anything was wrong. On
+// the deployed host that is exactly what happened - the box had been up 23
+// hours and the containers 19, because someone had to notice and press Start.
+//
+// Deliberately restoring the previous state rather than a per-server autostart
+// flag. A flag has to answer "is this a boot or an upgrade?", and gets it wrong
+// in one direction or the other: it either resurrects a server you stopped on
+// purpose an hour ago, or leaves one down after a reboot because nobody set it.
+// The last saved status already carries the answer. A server that crash-loops
+// saves itself as stopped and so is not tried again on the next boot.
+func (m *Manager) resume(wasUp map[string]bool) {
+	if len(wasUp) == 0 {
+		return
+	}
+	var pending []*Server
+	for _, s := range m.List() {
+		// Docker only. Simulator servers are a development fixture; bringing
+		// five of them back on every `go run` is noise, not recovery.
+		if !wasUp[s.ID] || s.Runtime != RuntimeDocker || s.State() != StatusStopped {
+			continue
+		}
+		pending = append(pending, s)
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	// Off the boot path, and staggered: these are JVMs, and starting five at
+	// once on a 4-vCPU host means all five take the hit of each other's world
+	// load. The panel answers requests while they come up.
+	go func() {
+		for i, s := range pending {
+			if i > 0 {
+				time.Sleep(resumeStagger)
+			}
+			log.Printf("resuming %s, which was running before the panel stopped", s.Name)
+			m.panelLine(s, "info", "Resuming - this server was running before the panel restarted.")
+			if err := m.Start(s.ID); err != nil {
+				log.Printf("could not resume %s: %v", s.Name, err)
+				m.panelLine(s, "error", "Could not resume automatically: "+err.Error())
+				continue
+			}
+			m.audit("panel", "server.resume", s.ID, s.Name)
+		}
+	}()
+}
+
+// Long enough that two Minecraft worlds are not loading at the same instant,
+// short enough that a network of eight is back inside a couple of minutes.
+var resumeStagger = 15 * time.Second
 
 // reconcile re-adopts containers that outlived the panel. Load() optimistically
 // marks everything stopped, which is right for the in-process simulator and

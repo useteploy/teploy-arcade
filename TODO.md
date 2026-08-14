@@ -13,12 +13,12 @@ has not been.
 
 | | |
 |---|---|
-| **Panel** | v0.6.2, systemd unit on a Debian 13 container, 12 GB / 4 vCPU / 50 GB |
+| **Panel** | v0.12.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
 | **Reachable** | `192.168.1.85:3457`, plain HTTP on the LAN, auth enforced |
 | **Servers** | 8 migrated, 5 running: Velocity proxy + 4 Paper backends; 3 modpacks stopped |
 | **Templates exercised** | velocity, paper, forge, fabric |
 | **Templates never run** | vanilla, spigot, purpur, bedrock, rust, valheim |
-| **Tests** | 175, race-clean |
+| **Tests** | 186 Go + a frontend guard, race-clean |
 | **Repo** | `Tyler/teploy-arcade` on Forgejo (`origin`) + `useteploy/teploy-arcade` on GitHub (`github`), both private |
 
 Proven end to end: import from another panel, container lifecycle, detached
@@ -57,6 +57,26 @@ and it costs nothing sitting stopped.
 - [x] ~~Reclaim the old panel's memory~~ — the container was decommissioned
       (fresh `vzdump` taken first, verified, restorable). ~60 GB of disk and its
       14 GB reservation released; arcade raised to 13 GB and its disk to 100 GB.
+- [x] ~~Servers did not come back after a host reboot~~ — not previously
+      recorded, and worse than most of what was. Containers run with `--rm` and
+      no restart policy, so a reboot takes every server down; `reconcile()` only
+      re-adopts containers that are *still running*, and found none. The panel
+      came back reporting eight stopped servers and no reason why. The evidence
+      was on the deployed host the whole time: 23 hours of uptime against 19
+      hours of container uptime, the gap being how long it took a human to
+      notice. `Manager.resume()` now restarts what the host took down, staggered
+      15s apart, and deliberately restores the *previous state* rather than
+      reading a per-server autostart flag - the last saved status already knows
+      whether you stopped that server on purpose.
+
+- [ ] **The host is over-committed on memory, and is at its ceiling now.** The
+      five running servers carry limits summing to 17.5 GB on a 13 GB LXC, and
+      actual usage sits at ~11.9 GB — 92%. Limits are caps rather than
+      reservations, which is why the panel deliberately reports usage instead of
+      commitment (`manager.go`), so this is an operations decision, not a panel
+      bug: either raise the container, or lower the four 4 GB caps. It is the
+      reason no sixth server was started on this box during testing.
+
 - [ ] **No monitoring.** Nothing watches whether the panel or the servers are
       up. The panel restarts on failure (`Restart=always`); nothing tells you it
       did.
@@ -95,10 +115,18 @@ Each of these is understood; none is fixed.
       (Modrinth, Spigot) is a network dependency and a licensing question.
 - [ ] **Disk quotas.** Declared per template, enforced nowhere. Needs XFS
       project quotas, and the `DiskGB` field is currently decoration.
-- [ ] **Forced password change for admin-created users.** An admin sets, and
-      therefore knows, another user's initial password. Needs a `must_change`
-      flag, a change-password endpoint, a gate and UI. (Not needed for the first
-      admin, who chooses their own.)
+- [x] ~~Forced password change for admin-created users~~ — and the larger gap
+      behind it: there was no way to change a password **at all**. No route, no
+      field, no UI. Nobody could rotate their own, an admin who created an
+      account knew its password for the life of the install, and the first
+      admin's was fixed unless someone hand-edited `users.json`.
+      `POST /api/users/{name}/password` now serves both cases: your own needs
+      the current password, an admin setting someone else's does not and arms
+      `must_change`. A flagged account is refused every route except that one -
+      enforced in `require()`, not in the UI, since the point is that the
+      admin's copy stops working. Changing a password drops that account's
+      other sessions and keeps the caller's. Existing accounts are unflagged, so
+      the upgrade locks nobody out; verified against the live panel.
 - [ ] **Postgres.** `PLAN.md` §3 named it the v1 default; state is still JSON
       files. Fine for one host; the accessory block in `teploy.yml` is the
       sketch of the swap.
