@@ -186,6 +186,11 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 			return
 		}
 
+		// The copy was made by root; the source's own ownership is the answer
+		// to who should hold it, since that is what the game has been running
+		// as. Without this a clone starts once and dies on server.properties.
+		chownTreeLike(dst, srcDir)
+
 		m.mu.Lock()
 		m.servers[s.ID] = s
 		m.order = append(m.order, s.ID)

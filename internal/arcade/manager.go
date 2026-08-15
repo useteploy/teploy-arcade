@@ -269,7 +269,16 @@ func (m *Manager) seed() {
 		// seedServerFiles now reports a genuinely failed write instead of a
 		// stat race, and a demo server with no eula.txt looks fine in the panel
 		// until the operator tries to start it. Say so at boot.
-		if err := m.seedServerFiles(s); err != nil {
+		// Seeded by a process running as root, into a directory it just made, so
+	// every file in it is root's - and the container runs as uid 1000 and
+	// cannot write a single one of them. Handed over before anything starts.
+	defer func() {
+		if s.Runtime == RuntimeDocker {
+			chownTree(filepath.Join(m.dataDir, "servers", s.ID), containerRunUID, containerRunGID)
+		}
+	}()
+
+	if err := m.seedServerFiles(s); err != nil {
 			log.Printf("could not seed files for %q: %v", sp.name, err)
 		}
 	}

@@ -202,11 +202,54 @@ func writeAtomicIn(r *os.Root, name string, data []byte, perm os.FileMode) error
 		cleanup()
 		return err
 	}
+	// Same handover as writeFileAtomic, and this is the path that actually
+	// writes server.properties: saving one setting from the panel replaced the
+	// file with a root-owned inode, and the container - uid 1000 - then died on
+	// AccessDeniedException before the world loaded. Done through the Root so
+	// the confinement still holds; a chown by absolute path would step outside
+	// the sandbox this function exists to keep.
+	preserveOwnerIn(r, tmp, name)
+
 	if err := r.Rename(tmp, name); err != nil {
 		cleanup()
 		return err
 	}
 	return nil
+}
+
+// Seam, so the handover is testable without being root.
+var rootChown = func(r *os.Root, name string, uid, gid int) error { return r.Chown(name, uid, gid) }
+
+// preserveOwnerIn is preserveOwner for a Root-confined write: the file being
+// replaced decides, and a file that does not exist yet inherits its directory.
+func preserveOwnerIn(r *os.Root, tmp, name string) {
+	if geteuid() != 0 {
+		return
+	}
+	uid, gid, ok := rootOwner(r, name)
+	if !ok {
+		dir := path.Dir(name)
+		if dir == "." {
+			dir = "."
+		}
+		uid, gid, ok = rootOwner(r, dir)
+	}
+	if !ok || (uid == 0 && gid == 0) {
+		return
+	}
+	_ = rootChown(r, tmp, uid, gid)
+}
+
+func rootOwner(r *os.Root, name string) (int, int, bool) {
+	fi, err := r.Stat(name)
+	if err != nil {
+		return 0, 0, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return int(st.Uid), int(st.Gid), true
 }
 
 type FileEntry struct {

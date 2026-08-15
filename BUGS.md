@@ -1,5 +1,43 @@
 # BUGS.md — teploy-arcade audit findings
 
+## 2026-08-15 — saving a setting made a server unstartable
+
+Reported live: memory changed on Lobby, restart pressed, and the container died
+before the world loaded.
+
+    java.nio.file.AccessDeniedException: /data/server.properties
+    [init] [ERROR] Failed to update server.properties
+    panel Server exited 1 (exited).
+
+The panel runs as root; the game runs as uid 1000. An atomic write replaces a
+file with a **new inode owned by whoever wrote it**, so one settings save handed
+root ownership of `server.properties` to a file the container has to write. The
+write itself succeeded, so nothing in the panel noticed. On the deployed host it
+was visible only as one file out of eight owned by `0:0`, timestamped at the
+minute the setting was saved.
+
+Fixed by handing the replacement back to the owner it is replacing - the file
+being replaced decides, and a file that does not exist yet inherits its
+directory. The panel's own state (`servers.json`, `users.json`, `audit.json`)
+lives in a root-owned directory and so is left alone by the same rule.
+
+Two things this taught, both worth keeping:
+
+1. **The first fix changed nothing, and the test passed.** `writeFileAtomic` was
+   the obvious place and it is not the path `server.properties` takes: writeProps
+   goes through `writeAtomicIn`, which writes inside an `os.Root` for
+   confinement. The unit test exercised the helper I had fixed rather than the
+   route the panel actually takes, so it went green while the deployed binary
+   still produced a root-owned file. Re-running the real reproduction on the host
+   is what caught it - `before: 1000:1000 / after: 0:0`.
+2. **The same defect was waiting in every path that writes a whole tree.**
+   Creating a server seeds it as root into a root-owned directory, so a new
+   docker server would have failed exactly the same way on its first start; and
+   clone, copy-import and restore all produce trees owned by root. Those now hand
+   the tree over too - to the source's owner where one exists, and to the image's
+   uid otherwise.
+
+
 **Date:** 2026-08-13
 **Scope:** `internal/arcade/*.go`, `internal/mcp/*.go`, `cmd/teploy-arcade/main.go`
 **Status (2026-08-13, fifth pass):** all 44 findings closed. L5 was the last one

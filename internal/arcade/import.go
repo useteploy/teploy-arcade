@@ -762,6 +762,10 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 			job.fail(friendlyFSError(err, "the imported server"))
 			return
 		}
+		// Copied by root, so the imported tree is root's however the operator's
+		// own directory was owned. Match the source: it is the ownership the
+		// game was running with before the panel touched it.
+		chownTreeLike(dst, sc.Path)
 		m.finishImport(job, s, sc, actor)
 	}()
 

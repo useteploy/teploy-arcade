@@ -282,6 +282,12 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		}
 	}
 
+	// Extracted by root into staging and moved in, so every restored file is
+	// root's while the game runs as uid 1000 - a restore would hand back a
+	// world the server cannot write. The directory itself was never replaced,
+	// so it still carries the ownership everything under it should have.
+	chownTreeLike(dir, dir)
+
 	// The archive carries its own server.properties; adopt it.
 	if content, err := os.ReadFile(filepath.Join(dir, "server.properties")); err == nil {
 		m.reloadProps(s, string(content))

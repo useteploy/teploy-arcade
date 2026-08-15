@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -73,11 +74,102 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	// The panel runs as root; the game runs as uid 1000. An atomic write
+	// replaces the file with a brand new inode owned by whoever wrote it, so
+	// saving a setting from the panel silently handed root ownership of
+	// server.properties to a file the container has to write - and the next
+	// start died on AccessDeniedException before the server ever came up.
+	// Nothing in the panel noticed, because the write itself succeeded.
+	preserveOwner(tmp, path)
+
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
 	return nil
+}
+
+// Seams, so the ownership logic is testable without being root.
+var (
+	chownFile = os.Chown
+	geteuid   = os.Geteuid
+)
+
+// preserveOwner gives tmp the ownership the file at target should have.
+//
+// The file it is replacing knows best; a file that does not exist yet inherits
+// from the directory it is landing in. Deliberately scoped that way rather than
+// chowning to a fixed uid: the panel's own state files (servers.json,
+// users.json, audit.json) live in a root-owned directory and must stay
+// root-owned, and they go through this same helper.
+func preserveOwner(tmp, target string) {
+	if geteuid() != 0 {
+		return // only root can give a file away
+	}
+	uid, gid, ok := fileOwner(target)
+	if !ok {
+		uid, gid, ok = fileOwner(filepath.Dir(target))
+	}
+	if !ok || (uid == 0 && gid == 0) {
+		return
+	}
+	_ = chownFile(tmp, uid, gid)
+}
+
+// The uid the game images run as. itzg/minecraft-server and itzg/bungeecord
+// both drop to 1000 and stay there - the container's own log says "Running as
+// uid=1000 gid=1000" - and the panel passes no --user, so this is what has to
+// own a server's files for the game to write them.
+//
+// A constant rather than a lookup because there is nothing to look it up from
+// before the image has ever run. A template pointing at an image with a
+// different runtime user would want this per template; no template does yet.
+const (
+	containerRunUID = 1000
+	containerRunGID = 1000
+)
+
+// chownTree gives every entry under root to uid:gid.
+//
+// For the paths that write a whole tree at once - creating a server, cloning
+// one, a copy import, a backup restore - where root ownership is not one file
+// the game cannot write but all of them.
+func chownTree(root string, uid, gid int) {
+	if geteuid() != 0 || (uid == 0 && gid == 0) {
+		return
+	}
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // one unreadable entry is not a reason to abandon the rest
+		}
+		_ = chownFile(p, uid, gid)
+		return nil
+	})
+}
+
+// chownTreeLike gives every entry under root the ownership that model has, for
+// the cases where an existing tree already answers the question.
+func chownTreeLike(root, model string) {
+	if geteuid() != 0 {
+		return
+	}
+	uid, gid, ok := fileOwner(model)
+	if !ok {
+		return
+	}
+	chownTree(root, uid, gid)
+}
+
+func fileOwner(path string) (int, int, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return int(st.Uid), int(st.Gid), true
 }
 
 // sweepTempFiles removes temp files stranded by a crash mid-write.
