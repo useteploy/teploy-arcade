@@ -351,6 +351,9 @@ var templates = []Template{
 		Maturity: "preview", Image: "itzg/minecraft-bedrock-server", Versions: []string{"LATEST"},
 		MemoryMB: 2048, CPU: 2, DiskGB: 10, MaxPlayers: 10, PortHint: 19132,
 		Protocols: []string{"udp"}, ReadyLog: "Server started.",
+		// Verified on the deployed host: this is the line, and this env is the
+		// difference between booting and exiting. See dockerRunArgs.
+		Env: map[string]string{"SERVER_PORT_V6": "${PORT_PLUS_1}"},
 	},
 	{
 		Slug: "terraria", Name: "Terraria", Game: "terraria", Group: "Other",

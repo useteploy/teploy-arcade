@@ -1,11 +1,13 @@
 package arcade
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -901,11 +903,7 @@ func (m *Manager) Start(id string) error {
 			return fmt.Errorf("docker is not reachable")
 		}
 		if !dockerImageLocal(s.Image) {
-			m.panelLine(s, "warn", fmt.Sprintf(
-				"Image %s is not present locally. Pulling it now - this can take several minutes.", s.Image))
-			go func() {
-				_ = runCmd("docker", "pull", s.Image)
-			}()
+			m.pullImage(s)
 		}
 	}
 
@@ -1618,4 +1616,64 @@ func (m *Manager) audit(actor, action, target, detail string) {
 
 func runCmd(name string, args ...string) error {
 	return execCommand(name, args...)
+}
+
+// pullImage fetches an image the host does not have, reporting progress into
+// the server's own console.
+//
+// It used to background a `docker pull` and immediately run `docker run`, which
+// pulls the same image itself when it is missing. Two pulls of the same image
+// at once, neither of them visible: the console said "Pulling it now - this can
+// take several minutes" and then printed nothing at all until the game booted.
+// On a small image that is a few seconds; on CS2, which downloads its game
+// through SteamCMD, it is long enough that the only honest reading of the panel
+// is that it has hung. The first thing a new operator does is create a server,
+// so this silence is the product's first impression.
+//
+// Synchronous and streamed. It is not slower - `docker run` was already waiting
+// for exactly this - it is the same wait with the progress shown. Failures are
+// logged rather than returned: docker run makes its own attempt, and its error
+// is the one worth surfacing because it knows whether the container started.
+func (m *Manager) pullImage(s *Server) {
+	m.panelLine(s, "warn", fmt.Sprintf(
+		"Image %s is not on this host yet. Downloading it now - a large game image can take a while, "+
+			"and progress appears below.", s.Image))
+
+	cmd := exec.Command("docker", "pull", s.Image)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("pull %s: %v", s.Image, err)
+		return
+	}
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		log.Printf("pull %s: %v", s.Image, err)
+		return
+	}
+
+	// Docker reports each layer on its own line, rewriting them as they
+	// progress. Only the milestones are forwarded: the per-layer percentage
+	// churn would be hundreds of lines a second into a 500-line ring buffer,
+	// which would push the operator's actual server log out of it.
+	sc := bufio.NewScanner(out)
+	sc.Buffer(make([]byte, 0, 8*1024), 256*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		switch {
+		case line == "",
+			strings.Contains(line, "Downloading"),
+			strings.Contains(line, "Extracting"),
+			strings.Contains(line, "Waiting"),
+			strings.Contains(line, "Verifying"):
+			continue
+		}
+		m.panelLine(s, "info", "docker pull: "+line)
+	}
+	if err := cmd.Wait(); err != nil {
+		log.Printf("pull %s: %v", s.Image, err)
+		m.panelLine(s, "warn", "The image download did not complete cleanly; starting anyway, "+
+			"which will retry it.")
+		return
+	}
+	m.panelLine(s, "info", "Image downloaded. Starting the server.")
 }

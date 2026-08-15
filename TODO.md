@@ -13,10 +13,10 @@ has not been.
 
 | | |
 |---|---|
-| **Panel** | v0.27.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
+| **Panel** | v0.28.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
 | **Reachable** | `192.168.1.85:3457`, plain HTTP on the LAN, auth enforced |
 | **Servers** | 8 migrated, 5 running: Velocity proxy + 4 Paper backends; 3 modpacks stopped |
-| **Templates exercised** | velocity, paper, forge, fabric, vanilla, spigot, purpur, terraria |
+| **Templates exercised** | velocity, paper, forge, fabric, vanilla, spigot, purpur, terraria, bedrock |
 | **Templates never run** | bedrock, rust, valheim — all three now publish UDP and know their own ready banner, none has been booted since |
 | **Templates** | 14 |
 | **Tests** | 222 Go + a frontend guard, race-clean |
@@ -274,13 +274,19 @@ and it costs nothing sitting stopped.
 
 ## 6. Testing gaps
 
+- [x] ~~Bedrock has never been run~~ — booted on the host 2026-08-15. Two
+      results: `Server started.` is confirmed as its ready line, and it found a
+      real defect. The panel sets SERVER_PORT while the image's IPv6 listener
+      defaults to 19133 regardless, so the *second* Bedrock server on a host -
+      which NextFreePort puts on 19133 - collided with itself inside the
+      container and exited with "Port [19133] may be in use by another process".
+      Fixed by letting a template add env on the itzg path too.
 - [ ] **CS2's ready line is a guess.** Every other `ready_log` in this repo was
       copied from a real boot; CS2's was not, because booting it downloads about
       30 GB. If it is wrong the server runs correctly and the panel shows
       "starting" forever - annoying rather than dangerous, and a one-line fix
       the first time anybody boots one.
-- [ ] **Five templates have never been run**: bedrock, rust, valheim, palworld,
-      cs2. Palworld cannot be, on this host - it asks for 16 GB and the panel
+- [ ] **Four templates have never been run**: rust, valheim, palworld, cs2. Palworld cannot be, on this host - it asks for 16 GB and the panel
       correctly refuses it on 13. Rust and Valheim can now, the host is x86_64. Vanilla,
       spigot and purpur now pass end to end. The other three were exercised far
       enough to prove the panel could not have run them: Bedrock's only offered

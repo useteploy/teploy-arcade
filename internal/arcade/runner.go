@@ -592,6 +592,9 @@ func usesItzgConventions(image string) bool { return strings.HasPrefix(image, "i
 func expandVars(s *Server, in string) string {
 	r := strings.NewReplacer(
 		"${PORT}", itoa(s.Port),
+		// Bedrock is why this exists: its IPv6 listener needs a port of its own,
+		// and the only sensible one to give it is the next.
+		"${PORT_PLUS_1}", itoa(s.Port+1),
 		"${MEMORY_MB}", itoa(s.MemoryMB),
 		"${MAX_PLAYERS}", itoa(s.MaxPlayers),
 		"${MOTD}", s.MOTD(),
@@ -884,9 +887,20 @@ func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 		// bind the panel's own directory, so the file manager and backups
 		// see exactly what the container sees
 		"-v", fmt.Sprintf("%s:%s", mountPath, serverDataPath(s)),
-		s.Image,
 	)
 
+	// A template may add to the standard block, or override part of it - later
+	// -e wins in docker. Bedrock needs this: the panel sets SERVER_PORT, and the
+	// image's IPv6 listener defaults to 19133 regardless, so the moment a
+	// Bedrock server lands on 19133 - which is exactly where NextFreePort puts
+	// the second one - the two collide inside the container and the game exits
+	// with "Port [19133] may be in use by another process". Proven on the host:
+	// SERVER_PORT=19133 alone exits; adding SERVER_PORT_V6=19134 boots and
+	// reports "IPv4 supported, port: 19133 / IPv6 supported, port: 19134".
+	env, _ := templateLaunchArgs(s)
+	args = append(args, env...)
+
+	args = append(args, s.Image)
 	return args
 }
 
@@ -1016,6 +1030,10 @@ func (r *dockerRunner) attach(s *Server, emit func(Line), adopted bool) error {
 		r.watchExit(ctx, s, name)
 	}()
 
+	if !adopted {
+		go r.watchReady(ctx, s, name)
+	}
+
 	if adopted {
 		r.mgr.setStatus(s, StatusRunning, 0, "")
 		r.mgr.panelLine(s, "info",
@@ -1039,6 +1057,60 @@ func (r *dockerRunner) attach(s *Server, emit func(Line), adopted bool) error {
 		}()
 	}
 	return nil
+}
+
+// readyFallbackFor is how long a container may run without ever printing the
+// line its template says means "ready" before the panel stops believing the
+// template. A var rather than a const so a test does not have to wait it out.
+var readyFallbackFor = 4 * time.Minute
+
+// watchReady stops a wrong ready marker from stranding a working server in
+// "starting" forever.
+//
+// Ready detection is a substring match against one line a template names, and
+// that line is a guess until somebody boots the game and reads its log. Five of
+// the templates here have never been booted, and an operator can add their own -
+// so "the template's ready_log is wrong" is a permanent condition of the design,
+// not a bug to be fixed once.
+//
+// Its failure mode was the worst available: the container runs, the game is
+// listening, players can connect, and the panel says "starting" indefinitely.
+// Every action keyed off status then misbehaves, and the operator has no way to
+// tell this apart from a genuine hang.
+//
+// So after a grace period long enough for a slow first boot - a world being
+// generated, a modpack loading, a Steam download finishing - a container that is
+// still running is called running, and the panel says plainly that it never saw
+// the line it was told to expect. That names the template as the thing to fix
+// rather than leaving the server looking broken.
+func (r *dockerRunner) watchReady(ctx context.Context, s *Server, name string) {
+	defer recoverPanic("ready watchdog for " + s.ID)
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(readyFallbackFor):
+	}
+	if s.State() != StatusStarting {
+		return
+	}
+	// Only for a container that is genuinely up. One that died is the exit
+	// watcher's business, and calling it running would be a different lie.
+	if !containerRunning(s.ID) {
+		return
+	}
+	s.mu.Lock()
+	want := s.ReadyLog
+	s.mu.Unlock()
+	if want == "" {
+		want = `the default Minecraft banner (For help, type "help")`
+	} else {
+		want = fmt.Sprintf("%q", want)
+	}
+	r.mgr.panelLine(s, "warn", fmt.Sprintf(
+		"Still running after %s and this server never printed %s, which is the line its template says means ready. "+
+			"Treating it as running. If it is in fact up, that template's ready_log is wrong - the correct line is in the console above.",
+		readyFallbackFor, want))
+	r.mgr.setStatus(s, StatusRunning, 0, "")
 }
 
 // watchExit reports the container stopping. `docker logs -f` exiting is not a

@@ -708,3 +708,42 @@ func TestGroupsSplitMinecraftFromOtherGames(t *testing.T) {
 		t.Errorf("the old group name is still in use: %v", byGroup["Playable Server"])
 	}
 }
+
+// Booting Bedrock on the deployed host found this: the panel sets SERVER_PORT,
+// the image's IPv6 listener defaults to 19133 regardless, and the two collide
+// the moment a Bedrock server lands on 19133 - which is exactly where
+// NextFreePort puts the second one. The game exits with "Port [19133] may be in
+// use by another process" and the panel reports a server that failed for no
+// visible reason.
+func TestBedrockGivesItsIPv6ListenerItsOwnPort(t *testing.T) {
+	tpl := templateBySlug("bedrock")
+	if tpl == nil {
+		t.Fatal("the bedrock template is missing")
+	}
+	// The second Bedrock server on a host: NextFreePort walks up from 19132.
+	s := &Server{
+		ID: "s2", Template: "bedrock", Image: tpl.Image, Port: 19133,
+		MemoryMB: tpl.MemoryMB, CPU: tpl.CPU, MaxPlayers: tpl.MaxPlayers,
+		Protocols: tpl.Protocols, ReadyLog: tpl.ReadyLog, Env: tpl.Env,
+		Props: map[string]string{},
+	}
+	got := strings.Join(dockerRunArgs(s, "gamepanel-s2", "/srv/bedrock", "secret"), " ")
+
+	if !strings.Contains(got, "SERVER_PORT=19133") {
+		t.Errorf("the game port is not set: %s", got)
+	}
+	if !strings.Contains(got, "SERVER_PORT_V6=19134") {
+		t.Errorf("the IPv6 listener was left on its default and will collide: %s", got)
+	}
+	// The template's env must come after the standard block, because docker
+	// takes the last -e for a given name and overriding is the point.
+	if strings.Index(got, "SERVER_PORT_V6=") < strings.Index(got, "SERVER_PORT=") {
+		t.Error("template env was placed before the standard block, so it cannot override it")
+	}
+	// A Minecraft Java server has no such env and must be untouched.
+	java := &Server{ID: "s3", Template: "paper", Image: "itzg/minecraft-server", Port: 25565,
+		MemoryMB: 2048, CPU: 2, MaxPlayers: 20, Props: map[string]string{}}
+	if j := strings.Join(dockerRunArgs(java, "n", "/srv", "x"), " "); strings.Contains(j, "SERVER_PORT_V6") {
+		t.Errorf("a Java server was given Bedrock's IPv6 env: %s", j)
+	}
+}
