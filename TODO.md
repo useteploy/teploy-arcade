@@ -131,8 +131,6 @@ Each of these is understood; none is fixed.
       copy is not read mid-write. The clone inherits the source's image and
       launch jar rather than re-matching by version, which is what stops a
       cloned modpack landing on a loader its mods were not built against.
-- [ ] **Plugin catalogue.** Installing from a URL works. Browsing an index
-      (Modrinth, Spigot) is a network dependency and a licensing question.
 - [x] ~~Disk quotas~~ — as far as this host allows, and no further. The stated
       fix was XFS project quotas; the box is **ext4 inside an LXC**, where they
       do not exist, so that route was never available. What the panel can
@@ -159,11 +157,6 @@ Each of these is understood; none is fixed.
       admin's copy stops working. Changing a password drops that account's
       other sessions and keeps the caller's. Existing accounts are unflagged, so
       the upgrade locks nobody out; verified against the live panel.
-- [ ] **Postgres.** `PLAN.md` §3 named it the v1 default; state is still JSON
-      files. Fine for one host; the accessory block in `teploy.yml` is the
-      sketch of the swap.
-- [ ] **Neutron-TS panel.** `PLAN.md` records the vanilla-JS panel as a
-      deliberate deviation, and the port as still owed.
 
 ## 5. Blocked on another product
 
@@ -196,6 +189,23 @@ Recorded so they are not rediscovered as oversights.
 
 - **Multi-node.** Single-host is the product's wedge. Multi-node is where the
   heavier panels already live.
+
+- **Postgres as the store.** `PLAN.md` §3 named it the v1 default. JSON files
+  are the right answer for a single host: no accessory to run, no migration to
+  get wrong, and the whole state is greppable when something goes strange. The
+  accessory block in `teploy.yml` stays as the sketch if that ever changes.
+
+- **Porting the panel to Neutron-TS.** Checked against the siblings rather than
+  assumed: **dash** is vanilla JS + Alpine embedded in its Go binary, the same
+  shape as this; **observe** and **ship** are Neutron apps embedded as `dist`.
+  So arcade is not the odd one out, and its selling point — one static binary,
+  no build step, one Go dependency — is bought with exactly this decision. The
+  trigger that should reverse it: a shared Teploy UI kit landing in Neutron
+  that dash and observe both consume. Then arcade follows, once, with them.
+
+- **Plugin catalogue.** Installing from a URL already works. Browsing an index
+  adds a network dependency and a licensing question for a step that is one
+  copy-paste today.
 - **`kill` over MCP.** SIGKILL loses unsaved chunks; it stays a human decision.
 - **Access-changing console commands over MCP** (`op`, `ban`, `whitelist`,
   `stop`). Console output is written by players and plugins, so a chat line
