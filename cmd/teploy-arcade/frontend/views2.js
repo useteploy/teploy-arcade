@@ -101,9 +101,8 @@ async function viewServerDashboard(id) {
     $('#dashCount', root).textContent = cur.players ? `${cur.players.online} / ${cur.players.max}` : '-';
     $('#dashPlayers', root).innerHTML = players.length
       ? players.map((p) => {
-          const hue = [...p.name].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
           return `<div class="player">
-            <span class="skin" style="background:linear-gradient(150deg,hsl(${hue} 32% 46%),hsl(${hue} 32% 28%))"></span>
+            ${skinMarkup(p.name)}
             <span><div class="pn">${esc(p.name)}</div><div class="pm">${p.ping_ms} ms</div></span>
           </div>`;
         }).join('')
@@ -220,9 +219,11 @@ async function viewPlayers(id) {
     // A multi-column grid of avatar + name + delete.
     list.innerHTML = `<div class="pgrid">${entries.map((e) => {
       const who = e.ip || e.name || '(unknown)';
-      const hue = [...who].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+      // e.ip is an address, not a player - no head exists for it, and it must
+      // not be handed to an external service as if it were a name.
+      const head = e.ip ? skinPlaceholder(who, 'skin') : skinMarkup(who, 'skin');
       return `<div class="pcell">
-        <span class="skin" style="background:linear-gradient(150deg,hsl(${hue} 32% 46%),hsl(${hue} 32% 28%))"></span>
+        ${head}
         <span class="pn" title="${esc(e.reason || '')}">${esc(who)}</span>
         ${e.level ? `<span class="badge-mute">lvl ${e.level}</span>` : ''}
         <span class="spacer"></span>

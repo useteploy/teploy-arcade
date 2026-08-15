@@ -534,6 +534,59 @@ func (m *Manager) crossCheck(sc *ImportScan) {
 	}
 }
 
+// jarImplVersion reads Implementation-Version out of a jar's manifest.
+//
+// The fallback for software that is not a Minecraft build and so ships no
+// version.json. A proxy is the case: Velocity's jar carries
+//
+//	Implementation-Version: 3.5.0-SNAPSHOT (git-a7581821-b605)
+//	Implementation-Title: Velocity
+//
+// and the proxy is precisely where knowing the build matters - a plugin that
+// refuses to load against a newer Velocity ("Your Velocity build version (#20)
+// is not supported") is a real failure this fleet has already had, and the
+// panel showing "velocity unknown" is no help at all when diagnosing it.
+//
+// The git detail after the version is dropped: it is a build identifier, not a
+// version, and the header has one line.
+func jarImplVersion(path string) string {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return ""
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		if f.Name != "META-INF/MANIFEST.MF" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return ""
+		}
+		b, err := io.ReadAll(io.LimitReader(rc, 64<<10))
+		rc.Close()
+		if err != nil {
+			return ""
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Implementation-Version:")
+			if !ok {
+				continue
+			}
+			v := strings.TrimSpace(rest)
+			if i := strings.Index(v, " ("); i > 0 {
+				v = v[:i]
+			}
+			if len(v) > 32 {
+				return ""
+			}
+			return v
+		}
+		return ""
+	}
+	return ""
+}
+
 // versionFromJar reads the Minecraft version out of a server jar.
 //
 // version.json sits in the archive root and carries {"id": "26.1.2", ...}. This

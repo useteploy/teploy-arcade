@@ -24,6 +24,59 @@ function fmtUptime(sec) {
 
 function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB'; }
 
+// ------------------------------------------------------------ player heads
+
+// Avatars were gradient placeholders derived from the name. The gradient is
+// kept and is still what you see first: it is the background the head is drawn
+// on, so a head that never arrives leaves the panel exactly as it was rather
+// than a broken-image icon in every row.
+//
+// Heads come from an external service, which is why this is a switch and why
+// the switch says so. The panel itself never makes the request - the browser
+// does - so a panel with no route to the internet is unaffected, and no player
+// name leaves the LAN unless an operator turns this on.
+//
+// By name, not by UUID, deliberately: the panel mints an offline UUID for
+// tracked players, so a UUID lookup would return the default skin for
+// everybody. A name that has no premium account still returns a default head,
+// which is the correct answer rather than a failure.
+const HEADS_KEY = 'arcade.heads';
+const HEADS_URL = 'https://mc-heads.net/avatar';
+
+function headsEnabled() { return localStorage.getItem(HEADS_KEY) !== 'off'; }
+
+function skinHue(name) {
+  return [...name].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+}
+
+// skinPlaceholder is the gradient on its own, for a row that is not a player -
+// a banned IP has no head and must never be sent to the head service as if it
+// were a name.
+function skinPlaceholder(seed, cls) {
+  const hue = skinHue(seed);
+  return `<span class="${cls || 'skin'}" style="background:linear-gradient(150deg,hsl(${hue} 32% 46%),hsl(${hue} 32% 28%))"></span>`;
+}
+
+function skinMarkup(name, cls) {
+  const hue = skinHue(name);
+  const bg = `background:linear-gradient(150deg,hsl(${hue} 32% 46%),hsl(${hue} 32% 28%))`;
+  const span = `<span class="${cls || 'skin'}" style="${bg}">`;
+  if (!headsEnabled()) return `${span}</span>`;
+  // onerror removes the img rather than swapping a placeholder in: the gradient
+  // underneath is already the placeholder.
+  return `${span}<img src="${HEADS_URL}/${encodeURIComponent(name)}/32" alt="" loading="lazy" onerror="this.remove()"></span>`;
+}
+
+// "paper unknown" was the header on four deployed servers. The word is a
+// non-answer printed where a fact goes, and it reads as a broken server rather
+// than as a version the panel could not determine. The software name alone is
+// true and complete; the version is added when there is one.
+function softwareLabel(s) {
+  const v = (s.version || '').trim();
+  if (!v || v.toLowerCase() === 'unknown') return esc(s.template);
+  return `${esc(s.template)} ${esc(v)}`;
+}
+
 const STATUS_LABEL = {
   running: 'Online', stopped: 'Offline', starting: 'Starting…',
   stopping: 'Stopping…', failed: 'Failed',
@@ -257,7 +310,7 @@ function serverHeader(s, tab) {
 
   const meta = [
     `<span><i class="ico ico-sm ico-network"></i> <span class="mono val">${esc(s.address.host)}:${s.address.port}</span></span>`,
-    `<span><i class="ico ico-sm ico-flask"></i> ${esc(s.template)} ${esc(s.version)}</span>`,
+    `<span><i class="ico ico-sm ico-flask"></i> ${softwareLabel(s)}</span>`,
     s.players ? `<span><i class="ico ico-sm ico-users"></i> <span class="val">${s.players.online}/${s.players.max}</span> players</span>` : '',
     running ? `<span><i class="ico ico-sm ico-clock"></i> up <span class="val">${fmtUptime(s.uptime)}</span></span>` : '',
     running ? `<span><i class="ico ico-sm ico-cpu"></i> <span class="val">${s.cpu.percent}%</span> of ${s.cpu.limit_vcpu} vCPU</span>` : '',
@@ -438,7 +491,7 @@ function serverCard(s) {
   const { cpuLine, memArea } = sparkline(s);
 
   const sub = [
-    `<span><i class="ico ico-flask"></i> ${esc(s.template)} ${esc(s.version)}</span>`,
+    `<span><i class="ico ico-flask"></i> ${softwareLabel(s)}</span>`,
     s.players ? `<span><i class="ico ico-users"></i> <span class="num">${s.players.online} / ${s.players.max}</span></span>` : `<span><i class="ico ico-port"></i> ${s.address.port}</span>`,
     running ? `<span><i class="ico ico-clock"></i> ${fmtUptime(s.uptime)}</span>` : '',
     s.last_exit ? `<span style="color:var(--offline)">exit ${s.last_exit.code} &middot; ${esc(s.last_exit.reason)}</span>` : '',
@@ -806,9 +859,8 @@ class ConsoleController {
       return;
     }
     list.innerHTML = players.map((p) => {
-      const hue = [...p.name].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
       return `<div class="player">
-        <span class="skin" style="background:linear-gradient(150deg,hsl(${hue} 32% 46%),hsl(${hue} 32% 28%))"></span>
+        ${skinMarkup(p.name)}
         <span><div class="pn">${esc(p.name)}</div><div class="pm">${p.ping_ms} ms</div></span>
         <span class="pa">
           <button type="button" class="btn btn-ghost btn-sm btn-icon" title="Kick" data-kick="${esc(p.name)}"><i class="ico ico-sm ico-close"></i></button>

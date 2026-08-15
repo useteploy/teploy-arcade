@@ -13,12 +13,12 @@ has not been.
 
 | | |
 |---|---|
-| **Panel** | v0.18.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
+| **Panel** | v0.19.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
 | **Reachable** | `192.168.1.85:3457`, plain HTTP on the LAN, auth enforced |
 | **Servers** | 8 migrated, 5 running: Velocity proxy + 4 Paper backends; 3 modpacks stopped |
 | **Templates exercised** | velocity, paper, forge, fabric, vanilla, spigot, purpur |
 | **Templates never run** | bedrock, rust, valheim — all three now publish UDP and know their own ready banner, none has been booted since |
-| **Tests** | 219 Go + a frontend guard, race-clean |
+| **Tests** | 221 Go + a frontend guard, race-clean |
 | **Repo** | `Tyler/teploy-arcade` on Forgejo (`origin`) + `useteploy/teploy-arcade` on GitHub (`github`), both private |
 
 Proven end to end: import from another panel, container lifecycle, detached
@@ -177,10 +177,22 @@ and it costs nothing sitting stopped.
 - [x] ~~Version reads "unknown" for jars that do not carry one~~ — the scan
       now reads `version.json` from inside the jar, which is where Paper,
       Purpur, Spigot and vanilla all record the exact Minecraft version.
+- [x] ~~...and every server imported before that reader existed kept its
+      "unknown" forever~~ — detection ran at import time and only at import
+      time, so four deployed Paper servers read "paper unknown" in their own
+      header while `version.json` sat in a jar on disk saying 26.1.2. Filled in
+      on load now, blanks only. A proxy ships no version.json, so its manifest's
+      `Implementation-Version` answers instead — which is the build a plugin
+      refuses to load against, so it is the one worth showing.
 - [x] ~~`javaTagFor` only understands `1.x` versions~~ — year-based releases
       (major >= 20) now take the newest known JRE explicitly, rather than
       falling through to whatever the untagged image happens to ship.
-- [ ] **Player avatars are gradient placeholders.** No head fetching.
+- [x] ~~Player avatars are gradient placeholders~~ — heads now load from
+      mc-heads.net, drawn on top of the gradient so a head that never arrives
+      leaves the panel as it was. By name rather than UUID, because the panel
+      mints an offline UUID for tracked players and a UUID lookup would return
+      the default skin for everybody. Off-switch in Panel settings → Appearance,
+      and a banned *IP* row is never sent to the service as if it were a name.
 - [ ] **Global settings are shallow.** Agent, users, audit log. No auto-update,
       autostart, or per-tab display toggles.
 - [x] ~~`spike/` is not gofmt-clean~~ — formatted; `gofmt -l .` is clean

@@ -374,6 +374,16 @@ async function viewAdmin() {
           <button type="button" data-contrast="high">High contrast</button>
         </div>
       </div>
+      <div class="row">
+        <span class="k">Player heads</span>
+        <div class="seg2" style="width:200px" id="headsSeg">
+          <button type="button" data-heads="on">Show</button>
+          <button type="button" data-heads="off">Gradients</button>
+        </div>
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:11.5px">Heads load from mc-heads.net in your browser, by player name. A name with no
+          premium account gets the default skin. Stored in this browser.</span>
+      </div>
     </div>
 
     <div class="panelbox">
@@ -507,6 +517,12 @@ async function viewAdmin() {
       s.classList.toggle('on', s.dataset.bg === (bg || 'plain')));
   };
 
+  const applyHeads = (v) => {
+    try { localStorage.setItem(HEADS_KEY, v === 'off' ? 'off' : 'on'); } catch {}
+    root.querySelectorAll('#headsSeg button').forEach((b) =>
+      b.classList.toggle('on', b.dataset.heads === (v === 'off' ? 'off' : 'on')));
+  };
+
   let curTheme = '', curContrast = '', curBg = 'plain';
   try {
     curTheme = localStorage.getItem('arcade-theme') || '';
@@ -516,6 +532,7 @@ async function viewAdmin() {
   applyTheme(curTheme);
   applyContrast(curContrast);
   applyBg(curBg);
+  applyHeads(headsEnabled() ? 'on' : 'off');
 
   root.querySelectorAll('#themeSwatches .swatch').forEach((s) =>
     s.addEventListener('click', () => applyTheme(s.dataset.theme)));
@@ -523,6 +540,16 @@ async function viewAdmin() {
     b.addEventListener('click', () => applyContrast(b.dataset.contrast)));
   root.querySelectorAll('#bgSwatches .bgswatch').forEach((s) =>
     s.addEventListener('click', () => applyBg(s.dataset.bg)));
+  root.querySelectorAll('#headsSeg button').forEach((b) =>
+    b.addEventListener('click', () => {
+      applyHeads(b.dataset.heads);
+      // Avatars are drawn when a view renders, so the change is only visible
+      // once something re-renders. Say so rather than leaving the operator
+      // clicking a toggle that appears to do nothing.
+      toast(b.dataset.heads === 'off'
+        ? 'Gradients - reopen a server to see it'
+        : 'Player heads on - reopen a server to see it');
+    }));
 
   const su = $('#suBtn', root);
   if (su) su.addEventListener('click', async () => {

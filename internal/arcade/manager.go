@@ -142,8 +142,56 @@ func (m *Manager) Load() error {
 	}
 	m.mu.Unlock()
 
+	m.backfillVersions()
 	m.recoverAfterBoot(wasUp)
 	return nil
+}
+
+// backfillVersions fills in a version for servers recorded as "unknown".
+//
+// Detection reads version.json out of the jar, which is where Paper, Purpur,
+// Spigot and vanilla record the exact Minecraft version - `paper.jar` carries
+// nothing in its name, and that is the normal case for a server that updates in
+// place. But detection runs at import time and only at import time, so every
+// server imported before that reader existed kept the "unknown" it was written
+// with, forever, while the answer sat inside a jar on disk the whole time. The
+// deployed fleet is four Paper servers reading "paper unknown" in their own
+// header for exactly this reason.
+//
+// Only ever fills a blank. A version already recorded is the operator's or the
+// importer's, and is not second-guessed by a jar that may since have been
+// replaced. Nothing recomputes the image from this - Image is fixed when the
+// server is created - so a backfill cannot move a running server onto a
+// different JRE.
+func (m *Manager) backfillVersions() {
+	filled := 0
+	for _, s := range m.List() {
+		s.mu.Lock()
+		unknown := s.Version == "" || strings.EqualFold(s.Version, "unknown")
+		jar := s.LaunchJar
+		s.mu.Unlock()
+		if !unknown || jar == "" {
+			continue
+		}
+		path := filepath.Join(m.serverDir(s), jar)
+		v := versionFromJar(path)
+		if v == "" {
+			// A proxy is not a Minecraft build and ships no version.json, so
+			// its own manifest is the honest source for what it is running.
+			v = jarImplVersion(path)
+		}
+		if v == "" {
+			continue
+		}
+		s.mu.Lock()
+		s.Version = v
+		s.mu.Unlock()
+		log.Printf("%s: version was unknown, read %s from %s", s.Name, v, jar)
+		filled++
+	}
+	if filled > 0 {
+		_ = m.Save()
+	}
 }
 
 // How long to keep waiting for the Docker daemon at startup, and how often to

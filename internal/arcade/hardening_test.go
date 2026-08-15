@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"archive/zip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,6 +226,95 @@ func TestConsoleToolPerImage(t *testing.T) {
 	// question and believe the silence.
 	if hasRCON("itzg/minecraft-bedrock-server") {
 		t.Error("the panel thinks it can query a Bedrock server for its player list")
+	}
+}
+
+// Version detection reads version.json out of the jar, and always has - but it
+// ran at import time and only at import time. Four Paper servers imported
+// before that reader existed kept the "unknown" they were written with, and
+// read "paper unknown" in their own header while the answer sat in a jar on
+// disk.
+func TestVersionBackfillFillsOnlyBlanks(t *testing.T) {
+	mgr := NewManager(t.TempDir(), NewHub())
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	stale := mgr.List()[0]
+	kept := mgr.List()[1]
+	for _, s := range []*Server{stale, kept} {
+		if _, err := mgr.ensureServerDir(s); err != nil {
+			t.Fatalf("server dir: %v", err)
+		}
+	}
+
+	writeJar(t, filepath.Join(mgr.serverDir(stale), "paper.jar"),
+		map[string]string{"version.json": `{"id":"26.1.2","name":"26.1.2"}`})
+	writeJar(t, filepath.Join(mgr.serverDir(kept), "paper.jar"),
+		map[string]string{"version.json": `{"id":"26.1.2"}`})
+
+	stale.Version, stale.LaunchJar = "unknown", "paper.jar"
+	kept.Version, kept.LaunchJar = "1.20.4", "paper.jar"
+
+	mgr.backfillVersions()
+
+	if stale.Version != "26.1.2" {
+		t.Errorf("an unknown version was not filled in: %q", stale.Version)
+	}
+	// A recorded version is the operator's or the importer's answer, and a jar
+	// that may since have been swapped does not get to overrule it.
+	if kept.Version != "1.20.4" {
+		t.Errorf("a known version was overwritten with %q", kept.Version)
+	}
+}
+
+// A proxy is not a Minecraft build and ships no version.json, so the manifest
+// is the honest source - and the proxy is where knowing the build matters, since
+// a plugin refusing to load against a newer Velocity is a failure this fleet has
+// already had.
+func TestProxyVersionComesFromTheManifest(t *testing.T) {
+	dir := t.TempDir()
+	jar := filepath.Join(dir, "velocity.jar")
+	writeJar(t, jar, map[string]string{
+		"META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\n" +
+			"Implementation-Version: 3.5.0-SNAPSHOT (git-a7581821-b605)\r\n" +
+			"Implementation-Title: Velocity\r\n",
+	})
+	if v := versionFromJar(jar); v != "" {
+		t.Errorf("a proxy jar reported a Minecraft version of %q", v)
+	}
+	// The git build identifier is not part of the version and does not belong
+	// in a header.
+	if v := jarImplVersion(jar); v != "3.5.0-SNAPSHOT" {
+		t.Errorf("proxy version is %q, want 3.5.0-SNAPSHOT", v)
+	}
+	// A jar with neither is not an error, just no answer.
+	plain := filepath.Join(dir, "plain.jar")
+	writeJar(t, plain, map[string]string{"a.txt": "hello"})
+	if v := jarImplVersion(plain); v != "" {
+		t.Errorf("a jar with no manifest reported %q", v)
+	}
+}
+
+func writeJar(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create jar: %v", err)
+	}
+	defer f.Close()
+	zw := zip.NewWriter(f)
+	for name, body := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("zip entry: %v", err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatalf("zip write: %v", err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
 	}
 }
 
