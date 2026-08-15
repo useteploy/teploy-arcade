@@ -13,12 +13,12 @@ has not been.
 
 | | |
 |---|---|
-| **Panel** | v0.12.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
+| **Panel** | v0.18.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
 | **Reachable** | `192.168.1.85:3457`, plain HTTP on the LAN, auth enforced |
 | **Servers** | 8 migrated, 5 running: Velocity proxy + 4 Paper backends; 3 modpacks stopped |
-| **Templates exercised** | velocity, paper, forge, fabric |
-| **Templates never run** | vanilla, spigot, purpur, bedrock, rust, valheim |
-| **Tests** | 186 Go + a frontend guard, race-clean |
+| **Templates exercised** | velocity, paper, forge, fabric, vanilla, spigot, purpur |
+| **Templates never run** | bedrock, rust, valheim — all three now publish UDP and know their own ready banner, none has been booted since |
+| **Tests** | 219 Go + a frontend guard, race-clean |
 | **Repo** | `Tyler/teploy-arcade` on Forgejo (`origin`) + `useteploy/teploy-arcade` on GitHub (`github`), both private |
 
 Proven end to end: import from another panel, container lifecycle, detached
@@ -120,7 +120,51 @@ and it costs nothing sitting stopped.
       with a guess, which is also what happens on the proxy: Velocity has no
       RCON at all.
 
-Each of these is understood; none is fixed.
+- [x] ~~A backend's Players sidebar was empty for a player standing in its
+      world~~ — reported live and root-caused on the deployed host. Two defects
+      hiding each other: Lobby cancels the `joined the game` broadcast (a plugin
+      can), so the only join evidence was `logged in with entity id`, which the
+      panel did not read; and the RCON fallback refused EssentialsX's two-line
+      answer, so it was dead for every case with anyone in it. Both fixed, plus
+      a 60s reconcile so a missed announcement self-corrects instead of lasting
+      the session. See BUGS.md.
+
+- [x] ~~Backups had no free-space check~~ — the one path writing gigabytes with
+      nothing checking there was room, on a filesystem it shares with every live
+      world by design. It now refuses against the worst case the way create,
+      clone and import already did, and restore estimates from the gzip trailer.
+
+- [x] ~~Backups had no retention~~ — a scheduled backup grew unbounded: 9.2 GB
+      per full round on a 100 GB disk is about ten rounds. Per-server "keep last
+      N" on the Backups screen, default 0 (keep everything) so an upgrade
+      deletes nobody's archives, and the prune runs only after a new backup has
+      actually landed.
+
+- [x] ~~Settings could give a server more memory than the host has~~ —
+      `SetResources` validated against absolutes (512 MB to 1 TB) and nothing
+      else, so the request succeeded, reported success, and was resolved by the
+      OOM killer at the next restart. This is the path that broke Lobby.
+
+- [x] ~~Server IDs came from a counter that reset each restart~~ — and named the
+      container, the directory and the backups. The counter is atomic now and
+      the candidate is checked against the map and the filesystem before it is
+      handed out.
+
+- [x] ~~Deleting a server orphaned its scheduled tasks~~ — they stayed in
+      `tasks.json` and kept firing at a server that no longer exists, invisibly,
+      because every task screen is reached through a server.
+
+- [x] ~~`Create` bypassed the port reservation import and clone use~~ — two
+      creates could both pass the check, and an in-flight import's reservation
+      was invisible to both. `NextFreePort` now honours reservations too.
+
+- [x] ~~The frontend was role-blind outside settings~~ — a viewer saw Start,
+      Stop, Kill, Delete and the console input, and every one returned 403. Not
+      insecure, dishonest.
+
+- [x] ~~Login held the auth mutex through 120,000 PBKDF2 rounds~~ — the same
+      mutex `Session()` takes on every authenticated request, so one sign-in
+      stalled every request in flight.
 
 - [x] ~~No first-run screen~~ — an unclaimed panel now takes over the page:
       it says it has no account, explains why the token exists and where to get
@@ -198,10 +242,13 @@ Each of these is understood; none is fixed.
 
 ## 6. Testing gaps
 
-- [ ] **Six templates have never been run**: vanilla, spigot, purpur, bedrock,
-      rust, valheim. Bedrock and Rust in particular use different images, ports
-      and protocols, and the proxy/`/data` mount-path bug proved that per-image
-      assumptions are exactly where this breaks.
+- [ ] **Three templates have never been run**: bedrock, rust, valheim. Vanilla,
+      spigot and purpur now pass end to end. The other three were exercised far
+      enough to prove the panel could not have run them: Bedrock's only offered
+      version 404s on Mojang's CDN, no template published UDP at all, and
+      `rcon-cli` was hardcoded but does not exist in the Bedrock image. All
+      three are fixed and none has been booted since — Rust and Valheim cannot
+      be, on this host: both images are amd64-only.
 - [ ] **Never tested with more than one panel user.** Roles exist and are
       enforced per route; no session has ever overlapped another.
 - [ ] **No load test.** Four Paper servers idle. Nothing is known about the

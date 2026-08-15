@@ -472,7 +472,33 @@ func classify(text string) string {
 	return "info"
 }
 
+// replaySettle is how long the adopt path waits for the 200-line tail to finish
+// replaying before asking the game who is really on.
+const replaySettle = 3 * time.Second
+
 var joinRe = regexp.MustCompile(`(\w{3,16}) (joined|left) the game`)
+
+// "X joined the game" is a chat broadcast, and a plugin can cancel it.
+//
+// The deployed Lobby does exactly that. Its log carries the arrival:
+//
+//	[03:17:58 INFO]: UUID of player Steve_Example is 00000000-...
+//	[03:18:06 INFO]: Steve_Example[/192.168.1.160:46714] logged in with entity id 9 at (...)
+//
+// and then, on the way out, "Steve_Example left the game" - so the panel could
+// only ever see people leave. A player standing in that world was invisible to
+// the sidebar from the moment they arrived until the moment they quit, and the
+// removal for someone never added is a silent no-op, so nothing looked wrong.
+//
+// These two lines are written by the server itself rather than broadcast to
+// chat, so no plugin suppresses them and no resource pack translates them. They
+// are matched in addition to the broadcast, never instead of it: trackPlayer
+// dedupes an arrival by name and a removal for an absent player does nothing,
+// so a server that prints both is counted once.
+var (
+	loginRe    = regexp.MustCompile(`(\w{3,16})\[/[^\]]*\] logged in with entity id`)
+	lostConnRe = regexp.MustCompile(`(\w{3,16}) lost connection:`)
+)
 
 // A proxy does not say "joined the game" - it never runs a world, so nobody
 // joins one. Velocity says this instead:
@@ -532,6 +558,59 @@ func containerDataPath(image string) string {
 	return "/data"
 }
 
+// publishArgs builds the -p flags for a server.
+//
+// This was one hardcoded `-p port:port`, which is TCP, which is correct for
+// every Java-edition server and the proxy and for nothing else the panel ships.
+// Bedrock, Rust and Valheim all speak UDP: they installed, booted, went
+// "healthy", and no client could reach them - the panel was publishing a TCP
+// port nothing was listening on. Nothing looked wrong from the panel side,
+// which is why it survived a template audit.
+//
+// Protocols and span come off the server, which copied them from its template,
+// so adding a game with a different transport stays a data change.
+func publishArgs(s *Server) []string {
+	protos := s.Protocols
+	if len(protos) == 0 {
+		protos = []string{"tcp"}
+	}
+	span := s.PortSpan
+	if span < 1 {
+		span = 1
+	}
+	// A span bounded so a bad template cannot ask the daemon for ten thousand
+	// port bindings.
+	if span > 16 {
+		span = 16
+	}
+	out := make([]string, 0, len(protos)*span*2)
+	for i := 0; i < span; i++ {
+		p := s.Port + i
+		for _, proto := range protos {
+			out = append(out, "-p", fmt.Sprintf("%d:%d/%s", p, p, proto))
+		}
+	}
+	return out
+}
+
+// isReady reports whether a console line says this server is accepting players.
+//
+// Three banners, in the order they were needed. The Java one has always been
+// here; the proxy prints "Done (1.43s)!" with no help suffix, so a Velocity that
+// was up and listening showed "starting" forever until that was added. A
+// template can now name its own, which is what every non-Java game needs -
+// they are judged by Java's banner otherwise, never print it, and stay
+// "starting" for their whole uptime.
+func isReady(s *Server, text string) bool {
+	if s.ReadyLog != "" && strings.Contains(text, s.ReadyLog) {
+		return true
+	}
+	if s.Game == "proxy" && strings.Contains(text, "Done (") && strings.Contains(text, ")!") {
+		return true
+	}
+	return strings.Contains(text, `For help, type "help"`)
+}
+
 func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 	args := []string{
 		// Detached, and deliberately NOT -i.
@@ -545,7 +624,9 @@ func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 		// Detached means the daemon owns the container's lifetime. Console
 		// input then goes over RCON, which is why it is forced on below.
 		"run", "-d", "--rm", "--name", name,
-		"-p", fmt.Sprintf("%d:%d", s.Port, s.Port),
+	}
+	args = append(args, publishArgs(s)...)
+	args = append(args,
 		"-e", "EULA=TRUE",
 		// Forced on rather than left to the image default, because an imported
 		// server brings its own server.properties: a directory adopted from
@@ -556,8 +637,8 @@ func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 		// `docker exec`, so it is not exposed to the network at all, and the
 		// password never has to leave the container.
 		"-e", "ENABLE_RCON=true",
-		"-e", "RCON_PASSWORD=" + rconSecret,
-	}
+		"-e", "RCON_PASSWORD="+rconSecret,
+	)
 
 	// An imported server runs the jar it arrived with. TYPE/VERSION tells the
 	// image to fetch its own, which for a modpack means a loader build its mods
@@ -748,7 +829,15 @@ func (r *dockerRunner) attach(s *Server, emit func(Line), adopted bool) error {
 		// one whose join replayed but whose departure scrolled past appears
 		// though they left. Ask the game instead. Backgrounded: it shells into
 		// the container, and adoption should not wait on it.
-		go r.mgr.reconcilePlayers(s)
+		//
+		// After a settle, not immediately: the tail replay is running in
+		// another goroutine and re-adds whoever it sees, so a reconcile that
+		// wins the race gets overwritten by history it was there to correct.
+		// The game's answer has to be the last word, not the first.
+		go func() {
+			time.Sleep(replaySettle)
+			r.mgr.reconcilePlayers(s)
+		}()
 	}
 	return nil
 }
@@ -846,16 +935,14 @@ func (r *dockerRunner) stream(s *Server, stdout io.Reader, emit func(Line), alre
 		} else if m := proxyJoinRe.FindStringSubmatch(text); m != nil {
 			src = "player"
 			r.mgr.trackPlayer(s, m[1], m[2] == "connected")
+		} else if m := loginRe.FindStringSubmatch(text); m != nil {
+			src = "player"
+			r.mgr.trackPlayer(s, m[1], true)
+		} else if m := lostConnRe.FindStringSubmatch(text); m != nil {
+			src = "player"
+			r.mgr.trackPlayer(s, m[1], false)
 		}
-		// A proxy prints "Done (1.43s)!" with no help suffix, so the Minecraft
-		// line never arrives and the panel reported "starting" forever - for a
-		// server that was up and listening. Narrowed to proxies so the stricter
-		// Minecraft match keeps its meaning everywhere else.
-		if !ready && s.Game == "proxy" && strings.Contains(text, "Done (") && strings.Contains(text, ")!") {
-			ready = true
-			r.mgr.setStatus(s, StatusRunning, 0, "")
-		}
-		if !ready && strings.Contains(text, `For help, type "help"`) {
+		if !ready && isReady(s, text) {
 			ready = true
 			r.mgr.setStatus(s, StatusRunning, 0, "")
 		}
@@ -903,17 +990,39 @@ func (r *dockerRunner) Send(s *Server, cmd string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Always RCON. Containers are started detached so that a panel restart does
-	// not stop them, which means the panel never holds their stdin - there is no
-	// longer a "normal" path and an "adopted" path, only this one.
+	// Containers are started detached so that a panel restart does not stop
+	// them, which means the panel never holds their stdin - every command goes
+	// in through the image's own console tool.
 	name := containerPrefix + "-" + s.ID
-	out, err := exec.Command("docker", "exec", name, "rcon-cli", cmd).CombinedOutput()
+	out, err := exec.Command("docker", "exec", name, consoleTool(s.Image), cmd).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("the command could not be delivered over RCON: %s",
+		return fmt.Errorf("the command could not be delivered to the server console: %s",
 			strings.TrimSpace(string(out)))
 	}
 	return nil
 }
+
+// consoleTool names the binary inside an image that takes a console command.
+//
+// `rcon-cli` was hardcoded, and it is not universal: the Bedrock image has no
+// such binary, because Bedrock's server speaks no RCON at all. Its image ships
+// `send-command`, which writes to the server process's stdin through a named
+// pipe. So every console command sent to a Bedrock server failed with "not
+// found in $PATH" - the console was decoration on that template.
+//
+// Matched on the image rather than the template slug because an imported server
+// keeps the image it arrived on and can carry any slug the importer guessed.
+func consoleTool(image string) string {
+	if strings.HasPrefix(image, "itzg/minecraft-bedrock-server") {
+		return "send-command"
+	}
+	return "rcon-cli"
+}
+
+// hasRCON reports whether this image can answer a question, not just take an
+// order. send-command writes to stdin and returns nothing, so a caller that
+// needs the game's reply - reconcilePlayers is the only one - must not use it.
+func hasRCON(image string) bool { return consoleTool(image) == "rcon-cli" }
 
 // query runs an RCON command and returns what the game said, for the callers
 // that need the answer rather than the delivery. Send discards it: a console
@@ -930,7 +1039,7 @@ func (r *dockerRunner) query(s *Server, cmd string) (string, error) {
 	defer p.mu.Unlock()
 
 	name := containerPrefix + "-" + s.ID
-	out, err := exec.Command("docker", "exec", name, "rcon-cli", cmd).CombinedOutput()
+	out, err := exec.Command("docker", "exec", name, consoleTool(s.Image), cmd).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 	}

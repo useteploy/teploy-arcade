@@ -554,3 +554,10 @@ kbd.hintkey { font: 500 10.5px var(--mono); color: var(--t-2); background: #333;
     linear-gradient(180deg, #1c1c1c, #262626);
   background-size: 8px 8px, 100% 100%;
 }
+
+/* A control a viewer is not allowed to use. Dimmed rather than removed: the
+   panel showing what exists and who may use it is more useful than a layout
+   that silently differs per account, and an operator reading over a viewer's
+   shoulder can tell the difference between "missing" and "not yours". */
+.is-denied { opacity: .4; cursor: not-allowed; }
+input.is-denied { pointer-events: none; }

@@ -361,16 +361,40 @@ func (a *Auth) createLocked(name, password, role string, first bool) (*User, err
 	return u, a.saveUsers()
 }
 
+// Login verifies a password and issues a session.
+//
+// The hashing happens with no lock held, which is the whole shape of this
+// function. 120,000 PBKDF2 rounds take a deliberate ~100 ms, and this used to
+// run them inside a.mu held for writing - the same mutex Session() takes on
+// every authenticated request. One login stalled every request in flight; a
+// dozen concurrent login attempts, which any bot that finds an exposed panel
+// will produce, stalled it for over a second at a time. The cost is meant to
+// slow down an attacker guessing passwords, not the operator watching a
+// console.
+//
+// So: read the record under a read lock, release, hash, then take the write
+// lock only to insert the session - three short critical sections instead of
+// one long one.
 func (a *Auth) Login(name, password string) (*Session, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	// Copied, not borrowed. The map holds *User and SetPassword writes Salt and
+	// Hash in place under the write lock, so carrying the pointer out of the
+	// critical section and reading it while hashing is a real data race, not a
+	// theoretical one. Four fields is a cheap copy.
+	a.mu.RLock()
 	u, ok := a.users[strings.ToLower(name)]
+	var uname, role, salt, hash string
+	if ok {
+		uname, role, salt, hash = u.Name, u.Role, u.Salt, u.Hash
+	}
+	a.mu.RUnlock()
+
 	if !ok {
 		// Spend the same work on an unknown user so timing doesn't enumerate.
 		hashPassword(password, "decoy")
 		return nil, fmt.Errorf("invalid credentials")
 	}
-	want, got := []byte(u.Hash), []byte(hashPassword(password, u.Salt))
+
+	want, got := []byte(hash), []byte(hashPassword(password, salt))
 	if subtle.ConstantTimeCompare(want, got) != 1 {
 		return nil, fmt.Errorf("invalid credentials")
 	}
@@ -378,9 +402,12 @@ func (a *Auth) Login(name, password string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{Token: tok, User: u.Name, Role: u.Role,
+	s := &Session{Token: tok, User: uname, Role: role,
 		Expires: time.Now().Add(sessionTTL)}
+
+	a.mu.Lock()
 	a.sessions[s.Token] = s
+	a.mu.Unlock()
 	return s, nil
 }
 

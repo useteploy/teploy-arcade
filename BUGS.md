@@ -1,5 +1,52 @@
 # BUGS.md — teploy-arcade audit findings
 
+## 2026-08-15 — the Players sidebar was empty for a player who was standing in the world
+
+Reported live: a player connects and never appears in the sidebar. Root-caused
+against the deployed fleet rather than reasoned about, and it was two separate
+defects that happened to hide each other.
+
+**The join line the panel waits for is one a plugin can cancel, and Lobby's
+does.** `X joined the game` is a chat broadcast. Lobby's own log carries the
+arrival as
+
+    [03:17:58 INFO]: UUID of player Steve_Example is 00000000-...
+    [03:18:06 INFO]: Steve_Example[/192.168.1.160:46714] logged in with entity id 9 at (...)
+
+and never prints the broadcast — but it *does* print `Steve_Example left the
+game` on the way out. So the panel could only ever see people leave a world it
+had never seen them enter, and removing a player who was never added is a silent
+no-op. Nothing looked wrong from either side. Fixed by also matching the two
+lines the server writes itself — `logged in with entity id` and
+`lost connection:` — which no plugin suppresses and no resource pack translates.
+
+**The fallback that should have caught it refused every answer that had anyone
+in it.** `reconcilePlayers` asks the game over RCON and parses the reply.
+EssentialsX, which this fleet runs, answers on two lines:
+
+    There are 1 out of maximum 20 players online.
+    default: Steve_Example
+
+and the parser confined names to the count's own line — a deliberate choice, to
+stop `Error: There's no one online in this group!` yielding a player called
+"There's". It worked, and it also meant the reconcile was dead for every case
+that mattered. It now reads the whole reply and uses the count as the check:
+names are accepted only when there are exactly as many as the server said, so a
+stray word refuses the answer rather than corrupting the list.
+
+Two more things came out of chasing it, both now fixed:
+
+- **The reconcile only ran on adopt, racing the log replay it was meant to
+  correct.** It is on a 60s ticker now, and the adopt call waits for the tail to
+  finish first. An announcement can always be missed — a cancelled broadcast, a
+  shed line, a 200-line replay window — so the game itself gets the last word on
+  a timer rather than once.
+- **The proxy was being asked a question it can never answer.** Velocity speaks
+  no RCON, so `rcon-cli` in the bungeecord image returns "authentication failed"
+  every time. That was one `docker exec` per tick, forever, for nothing. Proxies
+  are excluded now; their list comes from their own console, which is the one
+  place a connect is always announced.
+
 ## 2026-08-15 — saving a setting made a server unstartable
 
 Reported live: memory changed on Lobby, restart pressed, and the container died

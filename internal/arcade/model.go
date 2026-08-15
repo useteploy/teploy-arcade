@@ -43,12 +43,25 @@ type Server struct {
 	// installs whatever it considers current for 1.12.2 and the pack stops
 	// loading. The operator imported a server that worked, and it has to keep
 	// working.
-	LaunchJar  string            `json:"launch_jar,omitempty"`
-	Port       int               `json:"port"`
-	MemoryMB   int               `json:"memory_mb"`
-	CPU        float64           `json:"cpu"`
-	DiskGB     int               `json:"disk_gb"`
-	MaxPlayers int               `json:"max_players"`
+	LaunchJar string `json:"launch_jar,omitempty"`
+	Port      int    `json:"port"`
+	// Copied from the template at create time rather than looked up on every
+	// start: a template can be edited, and a running server's published ports
+	// have to keep matching the container that is actually up. Empty means the
+	// Java default - one TCP port - which is what every server created before
+	// these fields existed gets, and is correct for all of them.
+	Protocols  []string `json:"protocols,omitempty"`
+	PortSpan   int      `json:"port_span,omitempty"`
+	ReadyLog   string   `json:"ready_log,omitempty"`
+	MemoryMB   int      `json:"memory_mb"`
+	CPU        float64  `json:"cpu"`
+	DiskGB     int      `json:"disk_gb"`
+	MaxPlayers int      `json:"max_players"`
+	// BackupKeep is how many archives to keep for this server; 0 keeps every
+	// one. Zero is the default deliberately: a panel upgrade must not delete an
+	// operator's backups because a new field arrived with an opinion. Retention
+	// is something you turn on, having decided how many rounds you want.
+	BackupKeep int               `json:"backup_keep"`
 	Props      map[string]string `json:"props"`
 	CreatedAt  time.Time         `json:"created_at"`
 
@@ -196,6 +209,24 @@ type Template struct {
 	DiskGB      int      `json:"disk_gb"`
 	MaxPlayers  int      `json:"max_players"`
 	PortHint    int      `json:"port_hint"`
+
+	// Protocols the game listens on, and how many consecutive ports it needs.
+	//
+	// Empty means {"tcp"} and one port, which is every Java-edition server and
+	// the proxy. They are fields on the template rather than a switch in the
+	// runner because that is the whole claim templates.go makes: a new game is
+	// data, not code. Publishing was hardcoded to a single TCP port, so Bedrock,
+	// Rust and Valheim - all UDP - installed, booted, reported healthy and could
+	// not be connected to by anybody. Nothing in the panel could show that,
+	// because from the panel's side nothing was wrong.
+	Protocols []string `json:"protocols,omitempty"`
+	PortSpan  int      `json:"port_span,omitempty"`
+
+	// ReadyLog is a substring of the line this game prints when it is accepting
+	// players. Empty falls back to the Java and proxy banners, which is what
+	// every non-Java template was being judged by - so a Bedrock server that had
+	// been up for ten minutes still showed "starting".
+	ReadyLog string `json:"ready_log,omitempty"`
 }
 
 var templates = []Template{
@@ -250,20 +281,34 @@ var templates = []Template{
 	{
 		Slug: "bedrock", Name: "Bedrock", Game: "minecraft-bedrock", Group: "Other",
 		Mark: "bedrock", Description: "Multiplatform version of Minecraft from Mojang.",
-		Maturity: "preview", Image: "itzg/minecraft-bedrock-server", Versions: []string{"1.20.71"},
+		// LATEST, not a pin. The only version this template ever offered was
+		// 1.20.71, and Mojang's CDN now 404s it - the template's single option
+		// was a download that no longer exists, so every Bedrock server created
+		// from it failed on first start. Proven version-specific: LATEST boots
+		// on the same image. A pinned Bedrock version is a dead template on the
+		// day Mojang prunes it, and Mojang prunes.
+		Maturity: "preview", Image: "itzg/minecraft-bedrock-server", Versions: []string{"LATEST"},
 		MemoryMB: 2048, CPU: 2, DiskGB: 10, MaxPlayers: 10, PortHint: 19132,
+		Protocols: []string{"udp"}, ReadyLog: "Server started.",
 	},
 	{
 		Slug: "rust", Name: "Rust", Game: "rust", Group: "Other",
 		Mark: "rust", Description: "Wipes on a schedule - the backup job matters here more than anywhere else.",
 		Maturity: "preview", Image: "didstopia/rust-server", Versions: []string{"latest"},
 		MemoryMB: 8192, CPU: 4, DiskGB: 30, MaxPlayers: 100, PortHint: 28015,
+		// Game traffic is UDP; the +1 port is RCON, which this image publishes
+		// on TCP and is how its console is reached at all.
+		Protocols: []string{"udp", "tcp"}, PortSpan: 2, ReadyLog: "Server startup complete",
 	},
 	{
 		Slug: "valheim", Name: "Valheim", Game: "valheim", Group: "Other",
 		Mark: "valheim", Description: "Dedicated server. Small player counts, heavy world saves.",
 		Maturity: "preview", Image: "lloesche/valheim-server", Versions: []string{"latest"},
 		MemoryMB: 4096, CPU: 2, DiskGB: 15, MaxPlayers: 10, PortHint: 2456,
+		// Valheim wants three consecutive UDP ports, not one: 2456 is the game,
+		// 2457 the query port Steam's server browser answers on. Publishing only
+		// the first makes the server unlistable even when it is running.
+		Protocols: []string{"udp"}, PortSpan: 3, ReadyLog: "Game server connected",
 	},
 }
 

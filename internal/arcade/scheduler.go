@@ -191,6 +191,44 @@ func (sc *Scheduler) Delete(id string) error {
 	return fmt.Errorf("no such task")
 }
 
+// DropServer removes every task belonging to a server, and reports how many.
+//
+// Deleting a server used to leave its tasks in tasks.json forever. They were
+// not merely untidy: the scheduler kept firing them on their schedule, each one
+// reaching Run, failing "no such server" and recording that failure on a task
+// nothing in the UI can show - because every task screen is reached through a
+// server, and that server is gone. So the panel accumulated invisible work that
+// ran and failed on a timer, and the only way to see it was to read the file.
+//
+// Worse on a busy panel: server IDs are minted from a clock, and a future
+// server can be handed the ID a deleted one had. The orphaned task then finds a
+// server again - a different server - and runs "stop; backup" against it on the
+// old one's schedule.
+func (sc *Scheduler) DropServer(serverID string) int {
+	if serverID == "" {
+		return 0
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	kept := sc.tasks[:0]
+	dropped := 0
+	for _, t := range sc.tasks {
+		if t.ServerID == serverID {
+			dropped++
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if dropped == 0 {
+		return 0
+	}
+	sc.tasks = kept
+	if err := sc.save(); err != nil {
+		log.Printf("dropped %d task(s) for deleted server %s but could not save: %v", dropped, serverID, err)
+	}
+	return dropped
+}
+
 func (sc *Scheduler) Get(id string) *Task {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()

@@ -207,6 +207,21 @@ async function viewBackups(id) {
         <button type="button" class="btn btn-primary btn-sm" id="mkBackup"><i class="ico ico-sm ico-download"></i> Back up now</button>
       </div>
       <div style="padding:0 22px 26px">
+        <div class="panelbox" style="margin:0 0 14px">
+          <div class="row">
+            <span class="k">Disk free</span>
+            <span id="bkFree" class="mono">-</span>
+            <span class="spacer"></span>
+            <span class="muted" style="font-size:11.5px">Backups and every live world share this disk.</span>
+          </div>
+          <div class="row">
+            <span class="k">Keep last</span>
+            <input class="inp mono" id="bkKeep" value="0" style="width:70px">
+            <button type="button" class="btn btn-sm" id="bkKeepSave" data-need="admin">Save</button>
+            <span class="spacer"></span>
+            <span class="muted" style="font-size:11.5px">0 keeps every backup. Older archives are removed only after a new one succeeds.</span>
+          </div>
+        </div>
         <div class="panelbox" style="margin:0"><div id="bkList"></div></div>
       </div>
     </div>
@@ -219,6 +234,8 @@ async function viewBackups(id) {
     list.innerHTML = `<div class="row"><span class="spin"></span></div>`;
     try {
       const data = await api(`/api/servers/${id}/backups`);
+      $('#bkFree', root).textContent = data.free_bytes ? humanBytes(data.free_bytes) : 'unknown';
+      $('#bkKeep', root).value = data.keep || 0;
       if (!data.backups.length) {
         list.innerHTML = `<div class="row muted">No backups yet.</div>`;
         return;
@@ -252,6 +269,15 @@ async function viewBackups(id) {
       list.innerHTML = `<div class="row" style="color:var(--offline)">${esc(e.message)}</div>`;
     }
   };
+
+  $('#bkKeepSave', root).addEventListener('click', async () => {
+    const keep = parseInt($('#bkKeep', root).value, 10);
+    if (!Number.isFinite(keep) || keep < 0) { toast('Keep must be 0 or more', 'err'); return; }
+    try {
+      await api(`/api/servers/${id}/backups/retention`, { method: 'PUT', body: JSON.stringify({ keep }) });
+      toast(keep === 0 ? 'Keeping every backup' : `Keeping the newest ${keep}`);
+    } catch (e) { toast(e.message, 'err'); }
+  });
 
   $('#mkBackup', root).addEventListener('click', async () => {
     const note = prompt('Note for this backup (optional)') || '';

@@ -36,6 +36,7 @@ func (a *API) RoutesExt(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/servers/{id}/backups", auth.require(RoleOperator, a.createBackup))
 	mux.HandleFunc("POST /api/servers/{id}/backups/{bid}/restore", auth.require(RoleAdmin, a.restoreBackup))
 	mux.HandleFunc("DELETE /api/servers/{id}/backups/{bid}", auth.require(RoleAdmin, a.deleteBackup))
+	mux.HandleFunc("PUT /api/servers/{id}/backups/retention", auth.require(RoleAdmin, a.setBackupRetention))
 
 	// ---- players: whitelist / operators / bans
 	mux.HandleFunc("GET /api/servers/{id}/players", auth.require(RoleViewer, a.getPlayers))
@@ -225,10 +226,41 @@ func (a *API) listBackups(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err)
 		return
 	}
+	// Free space rides along with the list because this is the screen where an
+	// operator decides whether to take another backup, and the disk these
+	// archives share with every live world is the fact that decision turns on.
+	free := int64(0)
+	if f, err := diskFree(a.mgr.dataDir); err == nil {
+		free = f
+	}
+	s.mu.Lock()
+	keep := s.BackupKeep
+	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{
-		"backups": list,
-		"locked":  a.mgr.backupLocked(s.ID),
+		"backups":    list,
+		"locked":     a.mgr.backupLocked(s.ID),
+		"keep":       keep,
+		"free_bytes": free,
 	})
+}
+
+func (a *API) setBackupRetention(w http.ResponseWriter, r *http.Request) {
+	s := a.server(w, r)
+	if s == nil {
+		return
+	}
+	var body struct {
+		Keep int `json:"keep"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, fmt.Errorf("keep must be a number"))
+		return
+	}
+	if err := a.mgr.SetBackupKeep(s, body.Keep, actorOf(r)); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"keep": body.Keep})
 }
 
 func (a *API) createBackup(w http.ResponseWriter, r *http.Request) {

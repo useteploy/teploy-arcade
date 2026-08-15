@@ -377,49 +377,72 @@ func parsePlayerList(out string) ([]string, bool) {
 	}
 	count := atoi(clean[loc[2]:loc[3]])
 
-	// Names, when the reply carries them, follow a colon on the SAME line.
-	// Confined to that line deliberately: a plugin can print anything
-	// afterwards, and this fleet's does - EssentialsX adds "Error: There's no
-	// one online in this group!", whose colon otherwise yields a player called
-	// "There's".
-	tail := clean[loc[1]:]
-	if j := strings.IndexAny(tail, "\r\n"); j >= 0 {
-		tail = tail[:j]
-	}
-	rest := ""
-	if i := strings.Index(tail, ":"); i >= 0 {
-		rest = strings.TrimSpace(tail[i+1:])
+	// "0 players online." is a complete answer on its own: nobody is on, and
+	// whatever a plugin prints after it cannot change that.
+	if count == 0 {
+		return []string{}, true
 	}
 
-	if rest == "" {
-		// "0 players online." is a complete answer: nobody is on. Any other
-		// count without names is not - the panel would know how many but not
-		// who, and the sidebar lists people.
-		if count == 0 {
-			return []string{}, true
-		}
-		return nil, false
-	}
-
+	// Names follow a colon - but not necessarily on the count's own line.
+	// Vanilla answers on one line:
+	//
+	//	There are 2 of a max of 20 players online: Alice, Bob
+	//
+	// EssentialsX, which this fleet runs, answers the count and then one line
+	// per permission group:
+	//
+	//	There are 1 out of maximum 20 players online.
+	//	default: Steve_Example
+	//
+	// The first version confined the search to the count's line, to stop
+	// EssentialsX's "Error: There's no one online in this group!" from yielding
+	// a player called "There's". It worked - and it also refused every answer
+	// that had anybody in it, on the one fleet it was written for. So the
+	// reconcile did nothing whenever there was something to do.
+	//
+	// The count is what makes reading further lines safe. Names are collected
+	// from the whole reply and accepted only when there are exactly as many as
+	// the server itself said were online. A stray word from a decoration line
+	// changes the total, and the whole answer is refused - which leaves the
+	// console's own tracking in place. Never a wrong list, only ever no list.
 	var names []string
-	for _, part := range strings.Split(rest, ",") {
-		// Plugins decorate names constantly (prefixes, colours, "(afk)"), so
-		// take the first bare word and keep it only if it could be a name.
-		name := strings.TrimSpace(part)
-		if k := strings.IndexAny(name, " \t"); k > 0 {
-			name = name[:k]
+	for _, line := range strings.Split(clean[loc[1]:], "\n") {
+		i := strings.Index(line, ":")
+		if i < 0 {
+			continue
 		}
-		name = strings.TrimFunc(name, func(r rune) bool {
-			return !(r == '_' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z')
-		})
-		if len(name) >= 3 && len(name) <= 16 {
-			names = append(names, name)
+		// "Error:" is a message about the answer, not part of it.
+		if strings.EqualFold(strings.TrimSpace(line[:i]), "error") {
+			continue
+		}
+		for _, part := range strings.Split(line[i+1:], ",") {
+			if name := playerName(part); name != "" {
+				names = append(names, name)
+			}
 		}
 	}
-	if len(names) == 0 {
+	if len(names) != count {
 		return nil, false
 	}
 	return names, true
+}
+
+// playerName pulls a bare account name out of one decorated list entry.
+//
+// Plugins decorate names constantly - prefixes, colours, "(afk)" - so take the
+// first bare word and keep it only if it could be a Minecraft name.
+func playerName(part string) string {
+	name := strings.TrimSpace(part)
+	if k := strings.IndexAny(name, " \t"); k > 0 {
+		name = name[:k]
+	}
+	name = strings.TrimFunc(name, func(r rune) bool {
+		return !(r == '_' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z')
+	})
+	if len(name) < 3 || len(name) > 16 {
+		return ""
+	}
+	return name
 }
 
 var (
@@ -430,14 +453,14 @@ var (
 // reconcilePlayers replaces the in-memory player list with the game's own.
 //
 // Only meaningful for a runtime that can be asked. A failure is silent on
-// purpose: the common case is a proxy or an image without rcon-cli, where the
-// panel simply keeps what the console told it.
+// purpose: the common case is an image without rcon-cli, where the panel simply
+// keeps what the console told it.
 func (m *Manager) reconcilePlayers(s *Server) {
 	defer recoverPanic("reconcile players for " + s.ID)
-	dr, ok := m.runnerFor(s).(*dockerRunner)
-	if !ok {
+	if !m.canAskWhoIsOnline(s) {
 		return
 	}
+	dr, _ := m.runnerFor(s).(*dockerRunner)
 	out, err := dr.query(s, "list")
 	if err != nil {
 		return
@@ -453,6 +476,7 @@ func (m *Manager) reconcilePlayers(s *Server) {
 		prev[p.Name] = p
 	}
 	next := make([]Player, 0, len(names))
+	changed := len(names) != len(s.players)
 	for _, n := range names {
 		// Keep the join time for anyone the console already knew about, so a
 		// reconcile does not reset every session clock to the panel's restart.
@@ -460,9 +484,11 @@ func (m *Manager) reconcilePlayers(s *Server) {
 			next = append(next, p)
 			continue
 		}
+		// Same count, different people is still a change - a swap during the
+		// window the panel was not watching would otherwise go unlogged.
+		changed = true
 		next = append(next, Player{Name: n, UUID: fakeUUID(n), PingMS: 30, JoinedAt: time.Now().Unix()})
 	}
-	changed := len(next) != len(s.players)
 	s.players = next
 	s.mu.Unlock()
 
@@ -470,4 +496,48 @@ func (m *Manager) reconcilePlayers(s *Server) {
 		log.Printf("%s: %d player(s) online according to the server itself", s.Name, len(next))
 	}
 	m.pushPlayers(s)
+}
+
+// canAskWhoIsOnline reports whether `list` over RCON is worth attempting.
+//
+// A proxy is excluded rather than left to fail: Velocity speaks no RCON at all,
+// so the itzg/bungeecord image's rcon-cli answers every query with
+// "authentication failed" - a `docker exec` per server per tick, forever, for
+// an answer that can never arrive. The proxy's list comes from its own console
+// instead, which is the one place a connect is always announced.
+func (m *Manager) canAskWhoIsOnline(s *Server) bool {
+	if _, ok := m.runnerFor(s).(*dockerRunner); !ok {
+		return false
+	}
+	s.mu.Lock()
+	game, status, image := s.Game, s.Status, s.Image
+	s.mu.Unlock()
+	return game != "proxy" && status == StatusRunning && hasRCON(image)
+}
+
+// playerSyncInterval is how often the panel re-asks every running game who is
+// actually on. Long enough that it is not a load, short enough that a sidebar
+// is never wrong for a whole session.
+const playerSyncInterval = 60 * time.Second
+
+// playerSyncLoop keeps the sidebar honest.
+//
+// Console parsing is the fast path and the only one a proxy has, but it is a
+// stream of announcements, and an announcement can be missed: a plugin can
+// cancel the join broadcast, the socket can shed lines under backpressure, and
+// a panel restart replays only the tail. Every one of those leaves the list
+// quietly wrong, with nothing to indicate it - which is the failure an operator
+// reports as "the panel does not see my players".
+//
+// So the announcements stay, and once a minute the game itself gets the last
+// word.
+func (m *Manager) playerSyncLoop() {
+	defer recoverPanic("player sync")
+	t := time.NewTicker(playerSyncInterval)
+	defer t.Stop()
+	for range t.C {
+		for _, s := range m.List() {
+			m.reconcilePlayers(s)
+		}
+	}
 }

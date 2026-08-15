@@ -98,6 +98,63 @@ func TestTrackPlayerAddsAndRemoves(t *testing.T) {
 	}
 }
 
+// The Lobby on the deployed network never prints "joined the game" - a plugin
+// cancels the broadcast - so the panel saw people leave a world it had never
+// seen them enter, and the sidebar stayed empty for a player who was standing
+// in it. These lines are copied from that server's own log.
+func TestServerAuthoredLinesTrackPlayers(t *testing.T) {
+	const login = `[03:18:06 INFO]: Steve_Example[/192.168.1.160:46714] logged in with entity id 9 at ([minecraft:overworld]8.46, 3.0, 2.94)`
+	const lost = `[03:41:11 INFO]: Steve_Example lost connection: Disconnected`
+
+	m := loginRe.FindStringSubmatch(login)
+	if m == nil || m[1] != "Steve_Example" {
+		t.Fatalf("a login the panel must see did not parse: %q -> %v", login, m)
+	}
+	m = lostConnRe.FindStringSubmatch(lost)
+	if m == nil || m[1] != "Steve_Example" {
+		t.Fatalf("a disconnect the panel must see did not parse: %q -> %v", lost, m)
+	}
+
+	// The timestamp prefix is the trap: "INFO]" is a word followed by a
+	// bracket, and a looser pattern reads it as a player name.
+	for _, line := range []string{
+		`[03:17:58 INFO]: UUID of player Steve_Example is 00000000-0000-3000-8000-000000000000`,
+		`[03:46:18 INFO]: [Metrics] Connection refused`,
+		`[23:57:03 INFO]: Done (1.43s)!`,
+	} {
+		if loginRe.MatchString(line) || lostConnRe.MatchString(line) {
+			t.Errorf("a line that is not a player session was read as one: %q", line)
+		}
+	}
+}
+
+// A server that prints both the broadcast and its own line announces one
+// arrival twice. The sidebar must show one player.
+func TestBroadcastAndServerLineCountOnePlayer(t *testing.T) {
+	mgr := NewManager(t.TempDir(), NewHub())
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	s := mgr.List()[0]
+
+	for _, line := range []string{
+		`[03:18:06 INFO]: Steve_Example[/192.168.1.160:46714] logged in with entity id 9 at (x)`,
+		`[03:18:06 INFO]: Steve_Example joined the game`,
+	} {
+		if m := joinRe.FindStringSubmatch(line); m != nil {
+			mgr.trackPlayer(s, m[1], m[2] == "joined")
+		} else if m := loginRe.FindStringSubmatch(line); m != nil {
+			mgr.trackPlayer(s, m[1], true)
+		}
+	}
+	s.mu.Lock()
+	n := len(s.players)
+	s.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("one arrival announced twice produced %d players", n)
+	}
+}
+
 // A panel restart loses who is online: the tail replays the last 200 lines and
 // rebuilds recent arrivals only, so a player who joined an hour earlier vanishes
 // from the sidebar while still standing in the world. reconcilePlayers asks the
@@ -119,6 +176,24 @@ func TestParsePlayerList(t *testing.T) {
 		{"paper, nobody on", paperZero, []string{}, true},
 		{"paper via essentials", essentialsNoOne, []string{}, true},
 		{"proxy has no rcon", velocity, nil, false},
+
+		// EssentialsX answers the count on one line and the names on the next,
+		// one line per permission group. Copied byte for byte from the deployed
+		// Lobby with a player actually online - the case the first parser
+		// refused, which is every case that mattered.
+		{
+			"paper via essentials, one on",
+			"\x1b[33mThere are \x1b[31m1\x1b[33m out of maximum \x1b[31m20\x1b[33m players online.\n\x1b[0m\x1b[33mdefault\x1b[0m: Steve_Example\n\x1b[0m",
+			[]string{"Steve_Example"}, true,
+		},
+		{
+			"essentials, two groups",
+			"There are 3 out of maximum 20 players online.\nadmins: Alice\ndefault: Bob, Steve_Example\n",
+			[]string{"Alice", "Bob", "Steve_Example"}, true,
+		},
+		// The count is the check. A reply whose names do not add up to what the
+		// server said is refused outright rather than half-believed.
+		{"essentials, names disagree with count", "There are 4 out of maximum 20 players online.\ndefault: Alice\n", nil, false},
 
 		{"vanilla, two on", "There are 2 of a max of 20 players online: Alice, Steve_Example\n", []string{"Alice", "Steve_Example"}, true},
 		{"vanilla, one on", "There are 1 of a max of 200 players online: Steve_Example", []string{"Steve_Example"}, true},

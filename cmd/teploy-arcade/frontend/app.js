@@ -1449,9 +1449,86 @@ async function router(force) {
 
   host.innerHTML = '';
   host.appendChild(el);
+  applyRole(host);
   renderRail();
   renderTabstrip();
   void same; void force;
+}
+
+// ------------------------------------------------------------------- roles
+
+// The API has enforced roles since RBAC landed; the UI never learned about
+// them anywhere except Panel settings. A viewer therefore saw a complete
+// control surface - Start, Stop, Kill, Delete, the console input, Back up now -
+// and every one of them returned 403 on click. The panel was not insecure, it
+// was dishonest: it offered work it knew would be refused, and the operator had
+// to discover their own permissions one error toast at a time.
+//
+// Selector-driven rather than an attribute on every button, because these
+// controls are built as HTML strings in seven files. One table here is a place
+// to look; two hundred attributes are not. Anything added later that is not in
+// the table simply behaves as it does today, which is the safe direction to
+// fail - the server still refuses it.
+const ROLE_RANK = { viewer: 1, operator: 2, admin: 3 };
+
+const GUARDED = [
+  [2, [
+    '[data-act="start"]', '[data-act="stop"]', '[data-act="restart"]',
+    '[data-dact="start"]', '[data-dact="stop"]', '[data-dact="restart"]',
+    '[data-act="clear-failures"]',
+    '#cmdInput', '#mkBackup', '#newFolder', '#save', '#saveBtn', '#saveRestartBtn',
+    '#addBtn', '#newTask', '#plInstall', '#createBtn',
+    '[data-run]', '[data-edit]', '[data-toggle]', '[data-rm]',
+    '[data-need="operator"]',
+  ]],
+  [3, [
+    '[data-act="kill"]', '[data-act="delete"]',
+    '[data-restore]', '[data-del]',
+    '#impScan', '#impGo', '#clGo',
+    '[data-need="admin"]',
+  ]],
+];
+
+function myRoleRank() {
+  const me = state.me;
+  if (!me) return 0;
+  // An unclaimed panel has no accounts, so nobody is an admin and everybody can
+  // do everything - the same rule viewAdmin applies to its own controls.
+  if (me.unclaimed) return 3;
+  return ROLE_RANK[me.user && me.user.role] || 0;
+}
+
+function applyRole(root) {
+  const rank = myRoleRank();
+  if (rank >= 3) return;
+  for (const [need, selectors] of GUARDED) {
+    if (rank >= need) continue;
+    const label = need === 3 ? 'an admin' : 'an operator';
+    for (const el of root.querySelectorAll(selectors.join(','))) {
+      if (el.dataset.denied) continue;
+      el.dataset.denied = '1';
+      el.disabled = true;
+      el.classList.add('is-denied');
+      el.title = `Only ${label} can do this`;
+    }
+  }
+}
+
+// Views re-render their own lists - a file listing after a delete, the task
+// table after a run, the backup list after one lands - and those replacements
+// never pass through the router. Guarding only at mount would leave a viewer
+// with live controls the moment anything refreshed, which is the same bug with
+// a delay. One observer covers every path, present and future.
+function watchRoleSurface() {
+  if (myRoleRank() >= 3) return;
+  const host = document.getElementById('view');
+  if (!host || typeof MutationObserver === 'undefined') return;
+  let queued = false;
+  new MutationObserver(() => {
+    if (queued) return;
+    queued = true;
+    queueMicrotask(() => { queued = false; applyRole(host); });
+  }).observe(host, { childList: true, subtree: true });
 }
 
 // -------------------------------------------------------------- live feed
@@ -1529,6 +1606,7 @@ async function boot() {
     return;
   }
   window.addEventListener('hashchange', () => router());
+  watchRoleSurface();
   await router();
 
   // ?nolive renders one static frame and opens no long-lived connections, so a

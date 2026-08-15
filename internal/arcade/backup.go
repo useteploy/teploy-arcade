@@ -117,7 +117,18 @@ func (m *Manager) ListBackups(s *Server) ([]Backup, error) {
 			InProgress: m.backupLocked(s.ID) && id == m.currentBackupID(s.ID),
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Created > out[j].Created })
+	// Newest first, and the ID breaks a tie. Two archives can carry the same
+	// mtime to the second - a restore, a copy off another host, two backups a
+	// moment apart - and mtime alone then orders them arbitrarily, which for
+	// retention means the arbitrary one is the archive that gets deleted. The
+	// ID is a millisecond timestamp and sorts lexicographically, so it is the
+	// tiebreak that makes "keep the newest N" mean something.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Created != out[j].Created {
+			return out[i].Created > out[j].Created
+		}
+		return out[i].ID > out[j].ID
+	})
 	return out, nil
 }
 
@@ -135,6 +146,30 @@ func (m *Manager) CreateBackup(s *Server, note, actor string) (*Backup, error) {
 	dir := m.backupDir(s.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
+	}
+
+	// Refuse a backup the disk cannot hold, the same way create, clone and
+	// import already do - this was the one path writing gigabytes with nothing
+	// checking there was room for them.
+	//
+	// It matters more here than anywhere else, and for a reason particular to
+	// this panel: worlds and backups share a filesystem by design (see
+	// hostcap.go), so a backup that fills the disk does not merely fail. It
+	// takes every running server on the host down with it, mid-chunk-write,
+	// while protecting the thing it just destroyed.
+	//
+	// The uncompressed size is the bar because it is the only bound that is
+	// certainly enough - a tar.gz is normally a fraction of it, so this refuses
+	// some backups that would have fit. That trade is deliberate: a refused
+	// backup costs an operator a disk cleanup, and a full disk costs them the
+	// fleet.
+	if size, _, _ := measureTree(src); size > 0 {
+		if free, err := diskFree(m.dataDir); err == nil && free < size+importFreeMargin {
+			return nil, fmt.Errorf(
+				"backing up %s could need up to %s and only %s is free on the panel's disk; "+
+					"delete an old backup or raise retention first",
+				s.Name, humanSize(size+importFreeMargin), humanSize(free))
+		}
 	}
 
 	wasRunning := s.State() == StatusRunning
@@ -198,8 +233,65 @@ func (m *Manager) CreateBackup(s *Server, note, actor string) (*Backup, error) {
 	m.audit(actor, "backup.create", s.ID, fmt.Sprintf("%s (%s)", id, humanSize(size)))
 	m.broadcastEvent("backup.created", s.ID)
 
+	m.pruneBackups(s, actor)
+
 	return &Backup{ID: id, Server: s.ID, Name: id + ".tar.gz", Size: size,
 		Created: time.Now().Unix(), Note: note}, nil
+}
+
+// pruneBackups enforces this server's retention, newest kept.
+//
+// Called only after a backup has actually landed, never on a timer. Retention
+// that runs on its own schedule deletes the last copy of a world on the day the
+// backup job is broken - precisely when the operator needs it - so a new archive
+// existing is the precondition for an old one going away.
+//
+// A prune failure is logged and not returned: the backup succeeded, and telling
+// the operator it failed because the cleanup afterwards did would be a lie about
+// the thing they asked for.
+func (m *Manager) pruneBackups(s *Server, actor string) {
+	s.mu.Lock()
+	keep := s.BackupKeep
+	s.mu.Unlock()
+	if keep <= 0 {
+		return
+	}
+	list, err := m.ListBackups(s)
+	if err != nil || len(list) <= keep {
+		return
+	}
+	// ListBackups returns newest first, so everything past the keep count is
+	// the tail to drop.
+	dir := m.backupDir(s.ID)
+	for _, b := range list[keep:] {
+		if err := os.Remove(filepath.Join(dir, b.ID+".tar.gz")); err != nil {
+			log.Printf("%s: could not prune backup %s: %v", s.Name, b.ID, err)
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, b.ID+".note"))
+		m.audit(actor, "backup.prune", s.ID, fmt.Sprintf("%s (retention keeps %d)", b.ID, keep))
+	}
+	m.broadcastEvent("backup.pruned", s.ID)
+}
+
+// SetBackupKeep sets this server's retention. 0 keeps every archive.
+//
+// Deliberately does not prune on the way out: lowering retention from ten to
+// two is a statement about future backups, and acting on it immediately would
+// destroy eight archives from a settings field. The next backup applies it,
+// by which point there is a fresh copy to keep.
+func (m *Manager) SetBackupKeep(s *Server, keep int, actor string) error {
+	if keep < 0 || keep > 1000 {
+		return fmt.Errorf("keep must be between 0 (keep everything) and 1000")
+	}
+	s.mu.Lock()
+	s.BackupKeep = keep
+	s.mu.Unlock()
+	if err := m.Save(); err != nil {
+		return err
+	}
+	m.audit(actor, "backup.retention", s.ID, fmt.Sprintf("keep=%d", keep))
+	return nil
 }
 
 // RestoreBackup replaces the server directory with an archive's contents. The
@@ -222,8 +314,23 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		return fmt.Errorf("bad backup id %q", backupID)
 	}
 	archive := filepath.Join(m.backupDir(s.ID), filepath.Base(backupID)+".tar.gz")
-	if _, err := os.Stat(archive); err != nil {
+	st, err := os.Stat(archive)
+	if err != nil {
 		return fmt.Errorf("no such backup")
+	}
+
+	// A restore extracts into a staging directory on the same filesystem before
+	// anything live is touched, so running out of room part way through cannot
+	// damage the world - the staging tree is removed and the server directory
+	// is untouched. This check is not what makes that safe; it is what stops
+	// the panel from spending ten minutes filling a shared disk, and taking
+	// every other server on the host down with it, to reach that conclusion.
+	if need := uncompressedSize(archive, st.Size()); need > 0 {
+		if free, err := diskFree(m.dataDir); err == nil && free < need+importFreeMargin {
+			return fmt.Errorf(
+				"restoring this backup needs about %s free and only %s is left on the panel's disk",
+				humanSize(need+importFreeMargin), humanSize(free))
+		}
 	}
 
 	dir, err := m.ensureServerDir(s)
@@ -296,6 +403,39 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	m.audit(actor, "backup.restore", s.ID, backupID)
 	m.broadcastEvent("backup.restored", s.ID)
 	return nil
+}
+
+// uncompressedSize estimates what a .tar.gz will expand to.
+//
+// gzip records the uncompressed length in the last four bytes of the stream,
+// which is exact - and modulo 4 GiB, which most game-server archives are not
+// but a modpack world can be. A recorded length below the compressed size is
+// proof the counter wrapped, so in that case it is discarded for a flat
+// multiple of the file on disk. Four is a deliberate under-estimate of what
+// region files actually compress to: this decides whether to attempt a restore,
+// and refusing one that would have fit is worse than attempting one that then
+// fails safely into staging.
+//
+// Returns 0 when the trailer cannot be read at all, which the caller treats as
+// "unknown" and does not refuse on.
+func uncompressedSize(path string, compressed int64) int64 {
+	if compressed < 18 { // smaller than an empty gzip member
+		return 0
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	var trailer [4]byte
+	if _, err := f.ReadAt(trailer[:], compressed-4); err != nil {
+		return 0
+	}
+	isize := int64(trailer[0]) | int64(trailer[1])<<8 | int64(trailer[2])<<16 | int64(trailer[3])<<24
+	if isize <= compressed {
+		return compressed * 4
+	}
+	return isize
 }
 
 // validBackupID accepts only the shape CreateBackup produces:

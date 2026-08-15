@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -338,11 +340,80 @@ func (m *Manager) seed() {
 
 // ------------------------------------------------------------------ CRUD
 
-var idSeq int64
+var idSeq atomic.Int64
 
-func nextID() string {
-	idSeq++
-	return fmt.Sprintf("s%d%02d", time.Now().Unix()%100000, idSeq%100)
+// newID returns an ID no existing server holds.
+//
+// A server's ID is not a label. It names the container (gamepanel-<id>), the
+// server directory and the backup directory, so two servers sharing one is not
+// a display bug - it is one world overwriting another and one server's backups
+// filed under another's name.
+//
+// The old generator was `s<unix%100000><seq%100>` off a process-global counter,
+// and every part of that was reachable: the counter restarts at zero with the
+// panel, so the pair regenerates exactly after a restart within the same
+// 100,000-second window; the increment was an unsynchronised ++ on a shared
+// int64, so two concurrent creates could take the same value outright. Nothing
+// then checked the result against the servers that already existed.
+//
+// Same shape, because the ID is embedded in paths and container names on every
+// deployed host and must keep parsing as what it always was. What changed is
+// that the counter is atomic, entropy replaces the wrap when it has to, and the
+// candidate is checked against the map and the filesystem before it is handed
+// out. Uniqueness is now verified rather than assumed.
+func (m *Manager) newID() string {
+	for attempt := 0; attempt < 50; attempt++ {
+		n := idSeq.Add(1)
+		var id string
+		if attempt < 10 {
+			id = fmt.Sprintf("s%d%02d", time.Now().Unix()%100000, n%100)
+		} else {
+			// The obvious names are taken; stop being predictable about it.
+			id = fmt.Sprintf("s%d%s", time.Now().Unix()%100000, randomDigits(4))
+		}
+		if m.idTaken(id) {
+			continue
+		}
+		return id
+	}
+	// 50 collisions in a row is not a busy panel, it is a broken assumption.
+	// A long random ID is still a valid one, and losing a world is not.
+	return "s" + randomDigits(12)
+}
+
+// idTaken checks both places an ID can already be in use. The map is the
+// panel's own view; the directory catches an ID whose server was removed from
+// the panel while its files were left behind, which `teploy-arcade` does on
+// purpose for a delete that keeps data.
+func (m *Manager) idTaken(id string) bool {
+	m.mu.RLock()
+	_, ok := m.servers[id]
+	m.mu.RUnlock()
+	if ok {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(m.dataDir, "servers", id)); err == nil {
+		return true
+	}
+	if _, err := os.Stat(m.backupDir(id)); err == nil {
+		return true
+	}
+	return false
+}
+
+// randomDigits returns n cryptographically random decimal digits. Falls back to
+// the counter rather than to a fixed string: a predictable fallback in an ID
+// generator reintroduces exactly the collision it is there to avoid.
+func randomDigits(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%0*d", n, idSeq.Add(1)%1e9)
+	}
+	out := make([]byte, n)
+	for i, v := range b {
+		out[i] = '0' + v%10
+	}
+	return string(out)
 }
 
 func (m *Manager) newServer(name string, t *Template, version string, port int, runtime string) *Server {
@@ -350,7 +421,7 @@ func (m *Manager) newServer(name string, t *Template, version string, port int, 
 		version = t.Versions[0]
 	}
 	s := &Server{
-		ID:       nextID(),
+		ID:       m.newID(),
 		Name:     name,
 		Template: t.Slug,
 		Mark:     t.Mark,
@@ -362,6 +433,9 @@ func (m *Manager) newServer(name string, t *Template, version string, port int, 
 		// cannot explain it.
 		Image:      imageForVersion(t.Image, version),
 		Port:       port,
+		Protocols:  t.Protocols,
+		PortSpan:   t.PortSpan,
+		ReadyLog:   t.ReadyLog,
 		MemoryMB:   t.MemoryMB,
 		CPU:        t.CPU,
 		DiskGB:     t.DiskGB,
@@ -403,6 +477,33 @@ func checkServerLimits(port, memMB int, cpu float64) error {
 	return nil
 }
 
+// checkFitsHost refuses a limit the machine cannot honour.
+//
+// checkServerLimits above bounds a server against absolutes - 512 MB to 1 TB,
+// 0.1 to 256 cores - which are the same numbers on a Raspberry Pi and a 512 GB
+// server, so on any real host they permit a number that cannot work. Disk has
+// been refused against the real machine since checkDiskSpace; memory and CPU
+// were checked against nothing at all. The create wizard drew a warning bar
+// when the total went over, and the Settings page did not even do that, so
+// giving one server more memory than the box has was a valid request that
+// succeeded, reported success, and was resolved by the OOM killer at the next
+// restart.
+//
+// This refuses only what is impossible for a single server. Overcommitment
+// across servers stays allowed and stays a warning: limits are caps rather than
+// reservations, and a host deliberately running five 4 GB caps on 13 GB is an
+// operations decision the panel has no business overruling. See hostCapacity
+// for the sum it reports and the wizard's bar.
+func checkFitsHost(memMB int, cpu float64) error {
+	if memMB > 0 && hostMemMB > 0 && memMB > hostMemMB {
+		return fmt.Errorf("this asks for %d MB and the host has %d MB in total", memMB, hostMemMB)
+	}
+	if cpu > 0 && hostCPUs > 0 && cpu > hostCPUs {
+		return fmt.Errorf("this asks for %g cores and the host has %g", cpu, hostCPUs)
+	}
+	return nil
+}
+
 func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu float64, runtime string) (*Server, error) {
 	t := templateBySlug(tplSlug)
 	if t == nil {
@@ -419,12 +520,34 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	if err := checkServerLimits(port, memMB, cpu); err != nil {
 		return nil, err
 	}
+	if err := checkFitsHost(memMB, cpu); err != nil {
+		return nil, err
+	}
 	if port == 0 {
 		port = m.NextFreePort(t.PortHint)
 	}
-	if used := m.portOwner(port); used != nil {
-		return nil, fmt.Errorf("port %d is already used by %q", port, used.Name)
+	// Claimed, not merely checked.
+	//
+	// portOwner walks the registered servers and nothing else, and Create does
+	// not register its server until several steps later - a disk check, a seed,
+	// a Save. Two creates arriving together therefore both passed, and an
+	// import already holding a reservation was invisible to both: the panel
+	// happily produced two servers on one port, and the second one to start
+	// failed inside Docker with a bind error that named nothing the operator
+	// could act on.
+	//
+	// Import and clone have claimed through reservedPorts since the concurrent
+	// import bug; create was the path still doing it the old way, which meant
+	// the reservation could only ever be half-honoured.
+	if holder, ok := m.claimPort(port, name); !ok {
+		return nil, fmt.Errorf("port %d is already used by %q", port, holder)
 	}
+	claimHeld := true
+	defer func() {
+		if claimHeld {
+			m.releasePort(port)
+		}
+	}()
 	if runtime != RuntimeDocker {
 		runtime = RuntimeSim
 	}
@@ -451,7 +574,9 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	m.mu.Lock()
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)
+	delete(m.reservedPorts, port) // the server itself now holds the port
 	m.mu.Unlock()
+	claimHeld = false
 
 	// Seeded by a process running as root, into a directory root just made, so
 	// every file belongs to root - and the container runs as uid 1000 with no
@@ -482,6 +607,9 @@ func (m *Manager) SetResources(s *Server, memMB int, cpu float64) ([]string, err
 	// Same bounds as every other way a server's resources get set. A limit that
 	// only holds at creation is not a limit.
 	if err := checkServerLimits(0, memMB, cpu); err != nil {
+		return nil, err
+	}
+	if err := checkFitsHost(memMB, cpu); err != nil {
 		return nil, err
 	}
 	if memMB == 0 && cpu == 0 {
@@ -607,6 +735,12 @@ func (m *Manager) Delete(id string) error {
 
 	m.metrics.drop(id)
 	m.hub.DropRoom(id)
+	// Everything else that referred to this server is dropped here; its
+	// schedule was the one thing that stayed behind, firing on a timer at a
+	// server that no longer exists.
+	if n := m.sched.DropServer(id); n > 0 {
+		log.Printf("%s: removed %d scheduled task(s) along with the server", id, n)
+	}
 	_ = os.RemoveAll(filepath.Join(m.dataDir, "servers", id))
 	_ = os.RemoveAll(m.backupDir(id))
 
@@ -673,6 +807,14 @@ func (m *Manager) NextFreePort(hint int) int {
 	for _, s := range m.List() {
 		used[s.Port] = true
 	}
+	// Reservations count as used. A copy import runs for minutes before its
+	// server is registered, and suggesting the port it is already holding sends
+	// the operator straight into the collision the reservation exists to stop.
+	m.mu.RLock()
+	for p := range m.reservedPorts {
+		used[p] = true
+	}
+	m.mu.RUnlock()
 	for p := hint; p < hint+400; p++ {
 		if !used[p] {
 			return p

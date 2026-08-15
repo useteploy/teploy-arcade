@@ -81,6 +81,7 @@ func Run(cfg Config) error {
 	go mgr.metricsLoop()
 	go mgr.sampleLoop()
 	go mgr.guardLoop()
+	go mgr.playerSyncLoop()
 	go mgr.sched.loop()
 
 	api := &API{mgr: mgr, hub: hub}
