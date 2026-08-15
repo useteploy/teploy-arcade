@@ -1150,6 +1150,15 @@ async function openCreate() {
     const cpu = parseFloat($('#fCpu', modal).value || '0');
     const newMem = host.memory.allocated_mb + mem, newCpu = host.cpu.allocated_vcpu + cpu;
     const memOver = capOver(newMem, host.memory.total_mb), cpuOver = capOver(newCpu, host.cpu.total_vcpu);
+
+    // Disk is the one the agent will actually refuse on, and it refuses on
+    // free space rather than on commitment - so the two are shown as two
+    // different things. Over-committed is normal; not fitting is fatal.
+    const disk = (picked && picked.disk_gb) || 0;
+    const newDisk = host.disk.allocated_gb + disk;
+    const diskOver = capOver(newDisk, host.disk.total_gb);
+    const freeGB = Math.max(0, host.disk.total_gb - host.disk.used_gb);
+    const wontFit = capKnown(host.disk.total_gb) && disk > freeGB;
     $('#budget', modal).innerHTML = `
       <div class="row-flex" style="justify-content:space-between;margin-bottom:5px">
         <span>CPU</span><span class="num"><b style="color:var(--t-0)">${newCpu.toFixed(1)}</b> / ${capKnown(host.cpu.total_vcpu) ? host.cpu.total_vcpu + ' vCPU' : 'unknown'}</span>
@@ -1158,9 +1167,23 @@ async function openCreate() {
       <div class="row-flex" style="justify-content:space-between;margin-bottom:5px">
         <span>Memory</span><span class="num"><b style="color:var(--t-0)">${(newMem / 1024).toFixed(1)}</b> / ${capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) + ' GB' : 'unknown'}</span>
       </div>
-      <div class="bar"><i class="${memOver ? 'warn' : ''}" style="width:${capPct(newMem, host.memory.total_mb)}%"></i></div>
-      ${(memOver || cpuOver) ? `<div class="warnbox"><i class="ico ico-sm ico-warning"></i>
-        <span>Overcommitted. Allowed &mdash; limits are ceilings, not reservations &mdash; but if every server peaks at once the kernel picks the loser.</span></div>` : ''}`;
+      <div class="bar" style="margin-bottom:12px"><i class="${memOver ? 'warn' : ''}" style="width:${capPct(newMem, host.memory.total_mb)}%"></i></div>
+      <div class="row-flex" style="justify-content:space-between;margin-bottom:5px">
+        <span>Disk</span><span class="num"><b style="color:var(--t-0)">${newDisk}</b> / ${capKnown(host.disk.total_gb) ? host.disk.total_gb + ' GB' : 'unknown'}${capKnown(host.disk.total_gb) ? ` <span class="muted">(${freeGB} GB free)</span>` : ''}</span>
+      </div>
+      <div class="bar"><i class="${diskOver ? 'warn' : ''}" style="width:${capPct(newDisk, host.disk.total_gb)}%"></i></div>
+      ${wontFit ? `<div class="warnbox"><i class="ico ico-sm ico-warning"></i>
+        <span>This will be refused: the template asks for ${disk} GB and only ${freeGB} GB is free. Delete a backup or an unused server first.</span></div>` : ''}
+      ${(memOver || cpuOver || diskOver) ? `<div class="warnbox"><i class="ico ico-sm ico-warning"></i>
+        <span>Overcommitted. Allowed &mdash; limits are ceilings, not reservations &mdash; but if every server peaks at once the kernel picks the loser${diskOver ? ', and disk is the one nobody gets back' : ''}.</span></div>` : ''}`;
+
+    // The agent will refuse this create, and the sidebar that says so is below
+    // the fold. Say it on the button you were about to press.
+    const create = $('#createBtn', modal);
+    create.disabled = wontFit;
+    create.title = wontFit
+      ? `Needs ${disk} GB; only ${freeGB} GB is free on the host.`
+      : '';
   };
 
   const applyPick = (t) => {
@@ -1236,7 +1259,7 @@ function viewTemplates() {
 // of step with the agent and nobody would notice.
 const CAP_LABELS = {
   scheduled_backups: ['Scheduled backups', 'The scheduler can run <code>!backup</code> on a timer; there is no built-in schedule.'],
-  disk_quota: ['Disk quotas', 'Declared per template but enforced nowhere &mdash; needs XFS project quotas.'],
+  disk_quota: ['Disk quotas (hard)', 'No filesystem-level quota &mdash; ext4 inside an LXC has no project quotas. The panel shows usage against each allowance and refuses a create the disk cannot hold.'],
   plugins: ['Plugin management', 'List, enable, disable, delete and install from a URL.'],
   import: ['Import an existing server', 'Scan a directory and copy or adopt it.'],
   files: ['File manager', 'Browse and edit files inside a server directory.'],
@@ -1244,6 +1267,21 @@ const CAP_LABELS = {
   metrics: ['Metrics', 'CPU, memory and player history.'],
   audit: ['Audit log', 'Who did what.'],
 };
+
+// Disk used against the allowance the template gave the server. Nothing
+// enforces that allowance - ext4 inside an LXC has no project quotas - so this
+// is the whole of what "soft limit" means: you can see it being passed. The
+// bar warns at 90% and reads full past 100%, which is a state the panel allows
+// and the filesystem eventually will not.
+function diskCell(s) {
+  if (!s.disk_mb) return '<span class="muted">—</span>';
+  const limitMB = (s.disk_gb || 0) * 1024;
+  if (!limitMB) return `<span class="mono">${fmtMB(s.disk_mb)}</span>`;
+  const pct = Math.min(100, Math.round((s.disk_mb / limitMB) * 100));
+  const over = s.disk_mb >= limitMB;
+  return `<div class="bar bar-sm"><i class="${over || pct >= 90 ? 'warn' : ''}" style="width:${pct}%"></i></div>
+    <span class="${over ? 'num' : 'muted'}" ${over ? 'style="color:var(--amber)"' : ''}>${fmtMB(s.disk_mb)} / ${s.disk_gb} GB</span>`;
+}
 
 function notBuiltRows() {
   const caps = state.caps;
@@ -1311,7 +1349,7 @@ function viewDashboard() {
                 <span class="muted">${up ? cpu + '%' : '—'}</span></td>
             <td><div class="bar bar-sm"><i style="width:${capPct(memU, memL)}%"></i></div>
                 <span class="muted">${up ? fmtMB(memU) + ' / ' + fmtMB(memL) : '—'}</span></td>
-            <td class="mono">${s.disk_mb ? fmtMB(s.disk_mb) : '—'}</td>
+            <td>${diskCell(s)}</td>
             <td class="mono">${s.players ? s.players.online + ' / ' + s.players.max : '—'}</td>
             <td><span class="st ${cls}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span></td>
           </tr>`;

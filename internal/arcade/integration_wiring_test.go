@@ -124,6 +124,11 @@ func TestCapabilitiesAgreeWithTheRegisteredRoutes(t *testing.T) {
 		{"metrics", "/api/servers/" + s.ID + "/metrics"},
 		{"audit", "/api/audit"},
 		{"import", "/api/import/no-such-job"},
+		// The route half of scheduled backups. The behavioural half - that
+		// `!backup` in a task actually produces an archive - is asserted in
+		// TestScheduledBackupsCapabilityMatchesTheScheduler, because a task
+		// route proves a scheduler exists, not that the action works.
+		{"scheduled_backups", "/api/servers/" + s.ID + "/tasks"},
 	}
 
 	for _, c := range shipped {
@@ -142,8 +147,11 @@ func TestCapabilitiesAgreeWithTheRegisteredRoutes(t *testing.T) {
 	}
 
 	// And a feature that is honestly off stays off, so the map is not just
-	// every key set to true.
-	for _, off := range []string{"scheduled_backups", "disk_quota"} {
+	// every key set to true. disk_quota is the honest one now: the panel warns
+	// and refuses a create the disk cannot hold, but nothing enforces a
+	// per-server allowance at the filesystem layer, and on ext4 inside an LXC
+	// nothing can.
+	for _, off := range []string{"disk_quota"} {
 		if caps.Features[off] {
 			t.Errorf("capabilities advertises %q, which is not implemented", off)
 		}

@@ -80,9 +80,17 @@ and it costs nothing sitting stopped.
 - [ ] **No monitoring.** Nothing watches whether the panel or the servers are
       up. The panel restarts on failure (`Restart=always`); nothing tells you it
       did.
-- [ ] **Backups are manual.** `scheduled_backups` is declared `false` in
-      capabilities. The scheduler can run `!backup` on a timer — no task exists
-      yet, so in practice there is no backup schedule.
+- [ ] **Backups are manual** — on this panel. The *feature* was never missing:
+      `scheduler.go` has dispatched `!backup [note]` to `CreateBackup` since it
+      was written, the Scheduler tab documents it, and a task running it
+      produces a real archive with its note (verified end to end). What was
+      wrong was `scheduled_backups: false` in capabilities, which since the
+      dashboard started reading capabilities meant the panel advertised one of
+      its own working features as "not built" on its front page. Now `true`,
+      asserted against the behaviour rather than against a copy of the flag.
+      What remains is genuinely operational: **no task exists on the deployed
+      panel**, so there is still no schedule. The only backups are the frozen
+      `pre-Crafty-decommission` set from 2026-08-14.
 
 ## 3. Known rough edges
 
@@ -113,8 +121,20 @@ Each of these is understood; none is fixed.
 - [ ] **Clone a server.** Import exists; clone does not.
 - [ ] **Plugin catalogue.** Installing from a URL works. Browsing an index
       (Modrinth, Spigot) is a network dependency and a licensing question.
-- [ ] **Disk quotas.** Declared per template, enforced nowhere. Needs XFS
-      project quotas, and the `DiskGB` field is currently decoration.
+- [x] ~~Disk quotas~~ — as far as this host allows, and no further. The stated
+      fix was XFS project quotas; the box is **ext4 inside an LXC**, where they
+      do not exist, so that route was never available. What the panel can
+      promise, it now does: a create is refused when the disk cannot physically
+      hold the template's allowance, and every server shows real usage against
+      its allowance (amber at 90%, and past 100% the figure goes amber too).
+      The refusal is on **free space, not commitment** — the deployed host has
+      87 GB committed of 99 GB while using 25 GB, so a commitment rule would
+      have refused a 15 GB Forge server with 74 GB free. Over-commitment is
+      instead a warning in the create wizard, beside the existing CPU and
+      memory ones, and the Create button disables itself with the numbers when
+      the agent would refuse. `disk_quota` stays `false` in capabilities: there
+      is still no filesystem-level enforcement, and saying otherwise would be
+      the same lie in the other direction.
 - [x] ~~Forced password change for admin-created users~~ — and the larger gap
       behind it: there was no way to change a password **at all**. No route, no
       field, no UI. Nobody could rotate their own, an admin who created an
@@ -256,9 +276,10 @@ fixed; it is all recorded so it can be picked up deliberately.
 ### 8e. Dead code
 
 - [x] ~~14 dead CSS definitions~~ — all removed.
-- [ ] **`Template.DiskGB` is decoration.** It is stored, summed into the
-      "committed" figure and shown, but never enforced anywhere — the same gap
-      as the `disk_quota: false` capability, from the other end.
+- [x] ~~`Template.DiskGB` is decoration~~ — it is now the number the create
+      check reads and the number each server's disk usage is shown against. See
+      §4 for what is and is not enforced, and why a hard quota is not available
+      on this host.
 
 ### 8f. Not a problem, checked and clear
 

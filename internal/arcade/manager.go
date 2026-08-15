@@ -370,6 +370,9 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	if runtime == RuntimeDocker && !dockerAvailable() {
 		return nil, fmt.Errorf("docker is not reachable on this host")
 	}
+	if err := m.checkDiskSpace(t.DiskGB); err != nil {
+		return nil, err
+	}
 
 	s := m.newServer(name, t, version, port, runtime)
 	if memMB > 0 {
@@ -1082,6 +1085,41 @@ func (m *Manager) sampleHostCPU() {
 		m.hostCPU = busy / total * 100
 	}
 	m.usageMu.Unlock()
+}
+
+// checkDiskSpace refuses a create the disk cannot physically hold.
+//
+// Disk gets different treatment from memory and CPU on purpose. Those are caps
+// on a shared, reclaimable resource, which is why the dashboard reports usage
+// rather than commitment - 22 vCPU allocated on a 4 vCPU box is normal and
+// reporting it as a crisis was a bug. Disk is not reclaimable: a world that
+// grows into its allowance keeps it, and running out is not slowness, it is
+// every server on the host writing into a full filesystem at once.
+//
+// But the refusal is on free space, not on commitment. Commitment is the sum
+// of template defaults, which is a number nobody chose: the deployed host has
+// 87 GB committed against 99 GB while using 25 GB, so a commitment rule would
+// refuse a 15 GB Forge server with 74 GB genuinely free. Refuse what cannot
+// work; warn about what is merely promised - the host payload already carries
+// that sum as disk.allocated_gb, and the create wizard warns from it.
+//
+// Nothing enforces the per-server figure at the filesystem layer. That wants
+// XFS project quotas, and this host is ext4 inside an LXC, where they do not
+// exist - so the panel promises only what it can keep: it will not hand out
+// space the disk does not have, and it shows what each server uses against
+// what it was given.
+func (m *Manager) checkDiskSpace(wantGB int) error {
+	if wantGB <= 0 || hostDiskGB <= 0 {
+		return nil
+	}
+	free := hostDiskGB - diskUsedGB(m.dataDir)
+	if wantGB > free {
+		return fmt.Errorf(
+			"this asks for %d GB and the host has %d GB free of %d GB; "+
+				"delete a backup or an unused server first",
+			wantGB, free, hostDiskGB)
+	}
+	return nil
 }
 
 // dirSizeMB is the on-disk size of a server's directory, refreshed on a slow

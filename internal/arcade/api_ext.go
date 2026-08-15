@@ -507,8 +507,17 @@ func (a *API) capabilities(w http.ResponseWriter, r *http.Request) {
 		"console":  map[string]any{"websocket": true, "ring_buffer": ringSize},
 		"features": map[string]bool{
 			"files": true, "backups": true, "metrics": true, "audit": true,
-			"import":            true,
-			"scheduled_backups": false, "disk_quota": false, "plugins": true,
+			"import": true,
+			// The scheduler has run `!backup [note]` since it existed - step()
+			// dispatches it to CreateBackup, and the Scheduler tab documents it
+			// in the panel itself. This said false the whole time, and once the
+			// dashboard started reading capabilities the panel was advertising
+			// a working feature as "not built yet" on its own front page.
+			"scheduled_backups": true,
+			// Still false, and honestly: DiskGB is stored, summed and shown,
+			// and nothing enforces it. See TODO 8e.
+			"disk_quota": false,
+			"plugins":    true,
 		},
 	})
 }
