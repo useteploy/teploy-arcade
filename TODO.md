@@ -201,6 +201,25 @@ and it costs nothing sitting stopped.
 
 ## 4. Not built
 
+- [ ] **No UI for adding a template.** A template is one JSON file in
+      `data/templates/` and can now describe a game the panel has never heard of
+      - image, versions, protocols, port span, extra ports, data path, env,
+      args, console, ready log. Adding Terraria took zero code, which is the
+      test of whether that is real. But it takes SSH and a text editor, so it is
+      a capability the operator has and a *user* of the panel does not.
+      Deliberately deferred 2026-08-15 after being offered.
+- [ ] **Backups have no per-template excludes.** Steam-based games (Palworld,
+      Project Zomboid, Rust, 7 Days to Die, CS2) download the game itself into
+      the same directory as the saves, so a backup would archive 20 GB of game
+      install alongside a 200 MB world - and with the free-space guard and
+      retention now in place, that turns one backup into a disk event. This
+      blocks any Steam-based template being honest, and is why none was added.
+      Deliberately deferred 2026-08-15 after being offered.
+- [ ] **A first start on a missing image looks like a hang.** Start backgrounds
+      a `docker pull` and then runs `docker run`, which pulls again itself and
+      blocks - for minutes on a multi-GB image - while the panel line says only
+      that a pull is happening. No progress, no size, no estimate.
+
 - [x] ~~Clone a server~~ — `POST /api/clone`, reached from the wizard's Clone
       Existing tab and the Servers page link, both of which used to toast "not
       built yet". It reuses import's copy, progress job, port claim and
