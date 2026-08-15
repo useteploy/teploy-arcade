@@ -388,7 +388,7 @@ function viewServers() {
   root.querySelectorAll('[data-import]').forEach((a) =>
     a.addEventListener('click', () => { location.hash = '#/import'; }));
   root.querySelectorAll('[data-clone]').forEach((a) =>
-    a.addEventListener('click', () => toast('Cloning a server is not built yet.', 'warn')));
+    a.addEventListener('click', () => window.extraViews.openClone()));
 
   root.querySelectorAll('.card').forEach((card) => {
     const id = card.dataset.id;
@@ -1123,7 +1123,7 @@ async function openCreate() {
   $('#cancelBtn', modal).addEventListener('click', close);
   modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
   $('#tabImport', modal).addEventListener('click', () => { close(); location.hash = '#/import'; });
-  $('#tabClone', modal).addEventListener('click', () => toast('Cloning a server is not built yet.', 'warn'));
+  $('#tabClone', modal).addEventListener('click', () => { close(); window.extraViews.openClone(); });
 
   const startNow = $('#startNow', modal);
   startNow.addEventListener('click', (e) => {
@@ -1295,7 +1295,6 @@ function notBuiltRows() {
   // separate so it is obvious which list is authoritative.
   const known = [
     ['Plugin catalogue', 'Browse a plugin index &mdash; installing from a URL already works.'],
-    ['Clone', 'Copy an existing server &mdash; importing one already works.'],
   ];
 
   return [...off, ...known]

@@ -769,4 +769,119 @@ function viewForcePassword(name) {
   return root;
 }
 
-window.extraViews = { viewFiles, viewBackups, viewAdmin, viewLogin, viewSetup, viewForcePassword, openEditor };
+
+// Clone a server. A separate dialog rather than a third body inside the create
+// wizard: the wizard's state is a template pick, and a clone has no template
+// to pick - it inherits the source's, down to the jar it launches.
+function openClone(sourceId) {
+  const servers = state.servers || [];
+  if (!servers.length) { toast('There is nothing to clone yet.', 'warn'); return; }
+  const first = servers.find((s) => s.id === sourceId) || servers[0];
+
+  const modal = h(`<div class="scrim">
+    <div class="modal" style="width:min(560px,100%)">
+      <div class="modal-bar"><i class="ico ico-sm ico-layers"></i> Clone Server
+        <span class="spacer"></span><span class="chip-x" id="cx">&times;</span></div>
+      <div class="modal-banner">
+        <h2>Clone an existing server</h2>
+        <p>Copies the world and configuration into a new server on its own port.</p>
+      </div>
+      <div class="modal-body">
+        <div class="field" style="margin-bottom:12px">
+          <label>Source</label>
+          <select class="inp" id="clSrc">
+            ${servers.map((s) => `<option value="${esc(s.id)}" ${s.id === first.id ? 'selected' : ''}>${esc(s.name)} &mdash; ${esc(s.template)} ${esc(s.version)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label>New name</label>
+            <input class="inp" id="clName" value="${esc(first.name)} copy">
+          </div>
+          <div class="field">
+            <label>Port</label>
+            <input class="inp mono" id="clPort" placeholder="next free">
+          </div>
+        </div>
+        <div class="muted" style="font-size:11.5px;line-height:1.55">
+          Logs, crash reports and the world lock are not copied, and neither are
+          markers left by another panel. A running source has its saves paused
+          while the copy runs, the same as a backup.
+        </div>
+        <div id="clProg" hidden style="margin-top:14px">
+          <div class="bar"><i id="clBar" style="width:0%"></i></div>
+          <div class="row-flex" style="justify-content:space-between;margin-top:6px;font-size:11.5px">
+            <span class="muted" id="clState">Copying&hellip;</span>
+            <span class="muted num" id="clBytes"></span>
+          </div>
+          <div class="muted mono" id="clCurrent" style="font-size:11px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span class="spacer"></span>
+        <button type="button" class="btn btn-quiet" id="clCancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="clGo"><i class="ico ico-sm ico-layers"></i> Clone</button>
+      </div>
+    </div>
+  </div>`);
+
+  $('#modalHost').appendChild(modal);
+  const close = () => modal.remove();
+  $('#cx', modal).addEventListener('click', close);
+  $('#clCancel', modal).addEventListener('click', close);
+
+  // Renaming follows the source until the operator types their own name.
+  let nameTouched = false;
+  $('#clName', modal).addEventListener('input', () => { nameTouched = true; });
+  $('#clSrc', modal).addEventListener('change', () => {
+    if (nameTouched) return;
+    const s = servers.find((x) => x.id === $('#clSrc', modal).value);
+    if (s) $('#clName', modal).value = `${s.name} copy`;
+  });
+
+  let timer = null;
+  const stop = () => { if (timer) clearInterval(timer); timer = null; };
+
+  $('#clGo', modal).addEventListener('click', async () => {
+    const btn = $('#clGo', modal);
+    btn.disabled = true;
+    let job;
+    try {
+      job = await api('/api/clone', {
+        method: 'POST',
+        body: JSON.stringify({
+          source: $('#clSrc', modal).value,
+          name: $('#clName', modal).value,
+          port: parseInt($('#clPort', modal).value || '0', 10) || 0,
+        }),
+      });
+    } catch (e) { toast(e.message, 'err'); btn.disabled = false; return; }
+
+    $('#clProg', modal).hidden = false;
+    // Polled for the same reason the import is: the copy is the one thing here
+    // that runs for minutes, and the event feed carries server state - this is
+    // not a server yet.
+    timer = setInterval(async () => {
+      let j;
+      try { j = await api(`/api/import/${encodeURIComponent(job.id)}`); }
+      catch (e) { stop(); toast(e.message, 'err'); btn.disabled = false; return; }
+      $('#clBar', modal).style.width = `${j.percent || 0}%`;
+      $('#clState', modal).textContent = j.state === 'done' ? 'Done' : j.state === 'failed' ? 'Failed' : 'Copying…';
+      $('#clBytes', modal).textContent = j.total_bytes ? `${humanBytes(j.copied_bytes)} of ${humanBytes(j.total_bytes)}` : '';
+      $('#clCurrent', modal).textContent = j.error || j.current_file || '';
+      if (j.state === 'running') return;
+      stop();
+      if (j.state !== 'done') { toast(j.error || 'The clone failed.', 'err'); btn.disabled = false; return; }
+      toast(`Cloned ${j.name}`);
+      try {
+        const d = await api('/api/servers');
+        state.servers = d.servers;
+        state.host = d.host;
+      } catch { /* the feed will catch up */ }
+      close();
+      location.hash = `#/s/${j.server_id}/dashboard`;
+    }, 700);
+  });
+}
+
+window.extraViews = { viewFiles, viewBackups, viewAdmin, viewLogin, viewSetup, viewForcePassword, openClone, openEditor };

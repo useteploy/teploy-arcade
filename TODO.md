@@ -118,7 +118,19 @@ Each of these is understood; none is fixed.
 
 ## 4. Not built
 
-- [ ] **Clone a server.** Import exists; clone does not.
+- [x] ~~Clone a server~~ — `POST /api/clone`, reached from the wizard's Clone
+      Existing tab and the Servers page link, both of which used to toast "not
+      built yet". It reuses import's copy, progress job, port claim and
+      free-space refusal rather than growing a second set, and adds the part
+      import does not need: what must **not** come across. `session.lock`
+      (a lock describing another process), logs and crash reports, the RCON
+      credentials the image generates per container, and the `crafty_managed`
+      /`.pterodactyl` markers — copied, those turn "another panel manages this
+      directory" into a warning about a panel that has never seen the clone.
+      A running source is quiesced exactly as a backup quiesces it, so the
+      copy is not read mid-write. The clone inherits the source's image and
+      launch jar rather than re-matching by version, which is what stops a
+      cloned modpack landing on a loader its mods were not built against.
 - [ ] **Plugin catalogue.** Installing from a URL works. Browsing an index
       (Modrinth, Spigot) is a network dependency and a licensing question.
 - [x] ~~Disk quotas~~ — as far as this host allows, and no further. The stated

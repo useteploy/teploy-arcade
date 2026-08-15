@@ -841,6 +841,15 @@ func adoptInPlace(link, target string) error {
 // following one copies a tree from outside the import - or, pointed at an
 // ancestor, loops until the disk is full.
 func copyTree(src, dst string, j *importJob) error {
+	// An import copies the directory as it found it: the operator pointed at
+	// this tree and everything in it is theirs. Clone is the caller with
+	// things to leave behind - see cloneSkip.
+	return copyTreeFiltered(src, dst, j, nil)
+}
+
+// copyTreeFiltered copies src to dst, skipping what skip reports. A skipped
+// directory is not descended into.
+func copyTreeFiltered(src, dst string, j *importJob, skip func(rel string, d fs.DirEntry) bool) error {
 	buf := make([]byte, copyBufBytes)
 	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -849,6 +858,13 @@ func copyTree(src, dst string, j *importJob) error {
 		rel, err := filepath.Rel(src, p)
 		if err != nil {
 			return err
+		}
+		if skip != nil && rel != "." && skip(rel, d) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			j.skip()
+			return nil
 		}
 		target := filepath.Join(dst, rel)
 
@@ -1136,6 +1152,22 @@ func (a *API) RoutesImport(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/import/scan", auth.require(RoleAdmin, a.importScan))
 	mux.HandleFunc("POST /api/import", auth.require(RoleAdmin, a.importStart))
 	mux.HandleFunc("GET /api/import/{job}", auth.require(RoleAdmin, a.importStatus))
+	// A clone reports through the import job, so it belongs with them.
+	mux.HandleFunc("POST /api/clone", auth.require(RoleAdmin, a.cloneStart))
+}
+
+func (a *API) cloneStart(w http.ResponseWriter, r *http.Request) {
+	var req CloneRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	job, err := a.mgr.StartClone(req, actorOf(r))
+	if err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 202, job)
 }
 
 func (a *API) importScan(w http.ResponseWriter, r *http.Request) {
