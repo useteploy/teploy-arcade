@@ -335,6 +335,17 @@ func (a *API) liveSession(r *http.Request) *Session {
 //
 // Inbound messages route to the game server's stdin and are never fanned out to
 // other viewers (NEUTRON-ISSUES NI-002). Outbound is normal room fanout.
+// How often the console socket pings, and how long it waits for the pong.
+//
+// 25 seconds is chosen against the common 60-second idle timeout in reverse
+// proxies: two pings inside the window, so a single lost one is not a
+// disconnect. The timeout is what stops a peer that never answers from holding
+// the writer goroutine open for the life of the process.
+const (
+	pingInterval = 25 * time.Second
+	pingTimeout  = 10 * time.Second
+)
+
 func (a *API) console(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("server")
 	s := a.mgr.Get(id)
@@ -385,10 +396,39 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 		var lastDropped int64
 		t := time.NewTicker(700 * time.Millisecond)
 		defer t.Stop()
+		// Keepalive.
+		//
+		// An idle console is genuinely silent: a server with nothing to say
+		// produces no lines, the reader blocks on Read forever, and the dropped
+		// counter only writes when it changes. So nothing crossed this socket in
+		// either direction, sometimes for hours - and anything between the
+		// browser and the panel that times out an idle connection will close it.
+		// A reverse proxy is the documented way to put TLS in front of this
+		// panel, and 60 seconds is a common default there, so the deployment we
+		// tell people to use is the one where consoles drop.
+		//
+		// The client already reconnects with backoff and replays the buffer, so
+		// the failure was survivable rather than damaging. It was still the
+		// panel looking unreliable for no reason.
+		//
+		// A ping also detects a peer that has gone away without closing, which
+		// is what stops a dead viewer holding a room subscription open.
+		ping := time.NewTicker(pingInterval)
+		defer ping.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-ping.C:
+				// Bounded: Ping waits for the pong, and a peer that never
+				// answers must not block this goroutine for the life of the
+				// process.
+				pctx, pcancel := context.WithTimeout(ctx, pingTimeout)
+				err := c.Ping(pctx)
+				pcancel()
+				if err != nil {
+					return
+				}
 			case msg, ok := <-conn.Send:
 				if !ok {
 					return

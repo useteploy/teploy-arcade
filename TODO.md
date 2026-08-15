@@ -13,7 +13,7 @@ has not been.
 
 | | |
 |---|---|
-| **Panel** | v0.26.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
+| **Panel** | v0.27.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
 | **Reachable** | `192.168.1.85:3457`, plain HTTP on the LAN, auth enforced |
 | **Servers** | 8 migrated, 5 running: Velocity proxy + 4 Paper backends; 3 modpacks stopped |
 | **Templates exercised** | velocity, paper, forge, fabric, vanilla, spigot, purpur, terraria |
@@ -293,7 +293,11 @@ and it costs nothing sitting stopped.
 - [ ] **No load test.** Four Paper servers idle. Nothing is known about the
       panel under a busy console, many viewers, or a large file listing.
 - [ ] **Never run behind a reverse proxy in anger.** The WebSocket origin check
-      has a test behind a real proxy, but the deployed panel is direct.
+      has a test behind a real proxy, but the deployed panel is direct. One
+      concrete hazard was found and fixed unprompted: the console socket sent
+      nothing in either direction while a server was quiet, so any proxy with an
+      idle timeout - 60s is a common default - would close it. It now pings
+      every 25s. The rest of the proxy path is still untested.
 
 ## 7. Deferred on purpose
 
