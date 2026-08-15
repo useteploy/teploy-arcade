@@ -172,9 +172,16 @@ func LoadTemplates(dataDir string) error {
 		return fmt.Errorf("no usable templates in %s (%s)", dir, strings.Join(bad, "; "))
 	}
 
-	// Group order is stable and intentional: playable servers first, then
-	// proxies, then everything else.
-	rank := map[string]int{"Playable Server": 0, "Network Proxy": 1, "Other": 2}
+	// Group order is stable and intentional: Minecraft first, then proxies,
+	// then the other games.
+	//
+	// The group used to be called "Playable Server", which stopped meaning
+	// anything once it held Bedrock and not Terraria: Terraria, Rust and CS2
+	// are all playable servers too, so the label described nothing and the
+	// split it implied was between Minecraft and everything else all along.
+	// Both editions of Minecraft belong together; a different game does not
+	// belong among Minecraft's server flavours.
+	rank := map[string]int{"Minecraft": 0, "Network Proxy": 1, "Other": 2}
 	sort.SliceStable(loaded, func(i, j int) bool {
 		ri, okI := rank[loaded[i].Group]
 		rj, okJ := rank[loaded[j].Group]

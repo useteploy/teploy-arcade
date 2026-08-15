@@ -286,44 +286,44 @@ const (
 
 var templates = []Template{
 	{
-		Slug: "vanilla", Name: "Vanilla", Game: "minecraft-java", Group: "Playable Server",
+		Slug: "vanilla", Name: "Vanilla", Game: "minecraft-java", Group: "Minecraft",
 		Mark: "vanilla", Description: "The basic Vanilla experience without plugins.",
 		Maturity: "stable", Image: "itzg/minecraft-server", Versions: []string{"1.20.4", "1.20.1", "1.19.4"},
 		MemoryMB: 2048, CPU: 2, DiskGB: 10, MaxPlayers: 20, PortHint: 25565,
 	},
 	{
-		Slug: "spigot", Name: "Spigot", Game: "minecraft-java", Group: "Playable Server",
+		Slug: "spigot", Name: "Spigot", Game: "minecraft-java", Group: "Minecraft",
 		Mark: "spigot", Description: "Most used modded Minecraft server software based on CraftBukkit.",
 		Maturity: "stable", Image: "itzg/minecraft-server", Versions: []string{"1.20.4", "1.19.4"},
 		MemoryMB: 3072, CPU: 2, DiskGB: 10, MaxPlayers: 20, PortHint: 25565,
 	},
 	{
-		Slug: "paper", Name: "Paper", Game: "minecraft-java", Group: "Playable Server",
+		Slug: "paper", Name: "Paper", Game: "minecraft-java", Group: "Minecraft",
 		Mark: "paper", Description: "High performance fork of Spigot with many features and performance improvements.",
 		Recommended: true, Maturity: "stable", Image: "itzg/minecraft-server",
 		Versions: []string{"1.20.4", "1.20.1", "1.19.4"},
 		MemoryMB: 4096, CPU: 2, DiskGB: 10, MaxPlayers: 20, PortHint: 25565,
 	},
 	{
-		Slug: "purpur", Name: "Purpur", Game: "minecraft-java", Group: "Playable Server",
+		Slug: "purpur", Name: "Purpur", Game: "minecraft-java", Group: "Minecraft",
 		Mark: "purpur", Description: "Drop-in replacement for Paper servers designed for configurability and new, exciting gameplay features.",
 		Maturity: "stable", Image: "itzg/minecraft-server", Versions: []string{"1.20.4", "1.19.4"},
 		MemoryMB: 4096, CPU: 2, DiskGB: 10, MaxPlayers: 20, PortHint: 25565,
 	},
 	{
-		Slug: "forge", Name: "Forge", Game: "minecraft-java", Group: "Playable Server",
+		Slug: "forge", Name: "Forge", Game: "minecraft-java", Group: "Minecraft",
 		Mark: "forge", Description: "Drastically change the way how Minecraft looks and feels with mods.",
 		Maturity: "stable", Image: "itzg/minecraft-server", Versions: []string{"1.20.1", "1.19.2"},
 		MemoryMB: 6144, CPU: 2, DiskGB: 15, MaxPlayers: 20, PortHint: 25565,
 	},
 	{
-		Slug: "neoforge", Name: "NeoForge", Game: "minecraft-java", Group: "Playable Server",
+		Slug: "neoforge", Name: "NeoForge", Game: "minecraft-java", Group: "Minecraft",
 		Mark: "forge", Description: "The modloader most packs built for 1.20.2 and later use. Forge's successor, not a variant of it.",
 		Maturity: "stable", Image: "itzg/minecraft-server", Versions: []string{"1.21.1", "1.20.6", "1.20.4"},
 		MemoryMB: 4096, CPU: 2, DiskGB: 15, MaxPlayers: 20, PortHint: 25565,
 	},
 	{
-		Slug: "fabric", Name: "Fabric", Game: "minecraft-java", Group: "Playable Server",
+		Slug: "fabric", Name: "Fabric", Game: "minecraft-java", Group: "Minecraft",
 		Mark: "fabric", Description: "Fabric is a lightweight, experimental modding toolchain for Minecraft.",
 		Maturity: "stable", Image: "itzg/minecraft-server", Versions: []string{"1.20.4", "1.20.1"},
 		MemoryMB: 4096, CPU: 2, DiskGB: 12, MaxPlayers: 20, PortHint: 25565,
@@ -340,7 +340,7 @@ var templates = []Template{
 		MemoryMB: 1024, CPU: 1, DiskGB: 5, MaxPlayers: 200, PortHint: 25577,
 	},
 	{
-		Slug: "bedrock", Name: "Bedrock", Game: "minecraft-bedrock", Group: "Other",
+		Slug: "bedrock", Name: "Bedrock Edition", Game: "minecraft-bedrock", Group: "Minecraft",
 		Mark: "bedrock", Description: "Multiplatform version of Minecraft from Mojang.",
 		// LATEST, not a pin. The only version this template ever offered was
 		// 1.20.71, and Mojang's CDN now 404s it - the template's single option
@@ -353,7 +353,7 @@ var templates = []Template{
 		Protocols: []string{"udp"}, ReadyLog: "Server started.",
 	},
 	{
-		Slug: "terraria", Name: "Terraria", Game: "terraria", Group: "Playable Server",
+		Slug: "terraria", Name: "Terraria", Game: "terraria", Group: "Other",
 		Mark: "vanilla", Description: "TShock server. Small worlds, small memory - the one that fits on a busy host.",
 		Maturity: "preview", Image: "ryshe/terraria", Versions: []string{"latest"},
 		// Two cores because the cost is all in world generation, which is

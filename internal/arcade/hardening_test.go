@@ -667,3 +667,44 @@ func TestCS2TemplateMatchesItsImage(t *testing.T) {
 		t.Error("RCON password is not being set at all, so the image default applies")
 	}
 }
+
+// The groups drifted from what they meant. "Playable Server" held the seven
+// Java flavours and Terraria while Bedrock - which is Minecraft - sat under
+// "Other" with Rust and Valheim. Terraria, Rust and CS2 are all playable
+// servers too, so the label described nothing; the split was Minecraft versus
+// everything else all along.
+func TestGroupsSplitMinecraftFromOtherGames(t *testing.T) {
+	byGroup := map[string][]string{}
+	for _, tpl := range allTemplates() {
+		byGroup[tpl.Group] = append(byGroup[tpl.Group], tpl.Slug)
+	}
+
+	inMinecraft := map[string]bool{}
+	for _, slug := range byGroup["Minecraft"] {
+		inMinecraft[slug] = true
+	}
+	// Both editions, and every Java flavour.
+	for _, slug := range []string{"vanilla", "bedrock", "spigot", "paper", "purpur", "fabric", "forge", "neoforge"} {
+		if !inMinecraft[slug] {
+			t.Errorf("%s is Minecraft but is not in the Minecraft group", slug)
+		}
+	}
+	// And nothing that is not Minecraft.
+	for _, slug := range byGroup["Minecraft"] {
+		tpl := templateBySlug(slug)
+		if !strings.HasPrefix(tpl.Game, "minecraft") {
+			t.Errorf("%s (%s) is in the Minecraft group but is not Minecraft", slug, tpl.Game)
+		}
+	}
+	for _, slug := range []string{"terraria", "rust", "valheim", "palworld", "cs2"} {
+		if tpl := templateBySlug(slug); tpl == nil || tpl.Group != "Other" {
+			t.Errorf("%s should be grouped with the other games, not %q", slug, tpl.Group)
+		}
+	}
+	if len(byGroup["Network Proxy"]) != 1 || byGroup["Network Proxy"][0] != "velocity" {
+		t.Errorf("the proxy group is %v", byGroup["Network Proxy"])
+	}
+	if len(byGroup["Playable Server"]) != 0 {
+		t.Errorf("the old group name is still in use: %v", byGroup["Playable Server"])
+	}
+}
