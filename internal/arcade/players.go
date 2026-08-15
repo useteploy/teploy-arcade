@@ -510,9 +510,9 @@ func (m *Manager) canAskWhoIsOnline(s *Server) bool {
 		return false
 	}
 	s.mu.Lock()
-	game, status, image := s.Game, s.Status, s.Image
+	game, status, image, mode := s.Game, s.Status, s.Image, consoleMode(s)
 	s.mu.Unlock()
-	return game != "proxy" && status == StatusRunning && hasRCON(image)
+	return game != "proxy" && status == StatusRunning && mode == ConsoleRCON && hasRCON(image)
 }
 
 // playerSyncInterval is how often the panel re-asks every running game who is

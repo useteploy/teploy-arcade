@@ -50,13 +50,18 @@ type Server struct {
 	// have to keep matching the container that is actually up. Empty means the
 	// Java default - one TCP port - which is what every server created before
 	// these fields existed gets, and is correct for all of them.
-	Protocols  []string `json:"protocols,omitempty"`
-	PortSpan   int      `json:"port_span,omitempty"`
-	ReadyLog   string   `json:"ready_log,omitempty"`
-	MemoryMB   int      `json:"memory_mb"`
-	CPU        float64  `json:"cpu"`
-	DiskGB     int      `json:"disk_gb"`
-	MaxPlayers int      `json:"max_players"`
+	Protocols []string          `json:"protocols,omitempty"`
+	PortSpan  int               `json:"port_span,omitempty"`
+	ReadyLog  string            `json:"ready_log,omitempty"`
+	DataPath  string            `json:"data_path,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	Args      []string          `json:"args,omitempty"`
+	Console   string            `json:"console,omitempty"`
+
+	MemoryMB   int     `json:"memory_mb"`
+	CPU        float64 `json:"cpu"`
+	DiskGB     int     `json:"disk_gb"`
+	MaxPlayers int     `json:"max_players"`
 	// BackupKeep is how many archives to keep for this server; 0 keeps every
 	// one. Zero is the default deliberately: a panel upgrade must not delete an
 	// operator's backups because a new field arrived with an opinion. Retention
@@ -179,7 +184,10 @@ func (s *Server) Snapshot() map[string]any {
 			// the container gets would be worse than showing none.
 			"heap_mb": jvmHeapMB(s.MemoryMB),
 		},
-		"disk_gb":         s.DiskGB,
+		"disk_gb": s.DiskGB,
+		// So the console screen can refuse input up front rather than take a
+		// command and report that it could not be delivered.
+		"console":         consoleMode(s),
 		"address":         map[string]any{"host": hostAddr, "port": s.Port},
 		"motd":            s.MOTD(),
 		"last_exit":       lastExit,
@@ -227,7 +235,40 @@ type Template struct {
 	// every non-Java template was being judged by - so a Bedrock server that had
 	// been up for ten minutes still showed "starting".
 	ReadyLog string `json:"ready_log,omitempty"`
+
+	// How to actually launch an image that is not one of itzg's.
+	//
+	// Every environment variable the runner set was an itzg convention -
+	// EULA, TYPE, VERSION, MEMORY, MAX_PLAYERS, MOTD, SERVER_PORT - and the
+	// bind mount always landed on /data. That is fine for the Minecraft images
+	// and wrong for everything else: ryshe/terraria keeps its worlds in
+	// /root/.local/share/Terraria/Worlds and takes its settings as command-line
+	// flags, so the panel would have mounted an empty /data, passed it seven
+	// variables it ignores, and produced a server with no world.
+	//
+	// So a template that is not an itzg image describes its own launch. These
+	// four fields are what "add a game with no code changes" actually needs:
+	//
+	//	DataPath - where the bind mount goes inside the container
+	//	Env      - image-specific environment
+	//	Args     - command-line arguments after the image
+	//	Console  - how, or whether, a command can be delivered
+	//
+	// Env values and Args are expanded for ${PORT}, ${MEMORY_MB},
+	// ${MAX_PLAYERS}, ${MOTD} and ${DATA}, so a template can wire the panel's
+	// own settings into whatever names the image expects.
+	DataPath string            `json:"data_path,omitempty"`
+	Env      map[string]string `json:"env,omitempty"`
+	Args     []string          `json:"args,omitempty"`
+	Console  string            `json:"console,omitempty"`
 }
+
+// Console delivery modes a template can declare.
+const (
+	ConsoleRCON = "rcon"         // rcon-cli inside the container; the default
+	ConsoleSend = "send-command" // writes to the server's stdin; no reply
+	ConsoleNone = "none"         // output only - the panel cannot send anything
+)
 
 var templates = []Template{
 	{
@@ -290,6 +331,34 @@ var templates = []Template{
 		Maturity: "preview", Image: "itzg/minecraft-bedrock-server", Versions: []string{"LATEST"},
 		MemoryMB: 2048, CPU: 2, DiskGB: 10, MaxPlayers: 10, PortHint: 19132,
 		Protocols: []string{"udp"}, ReadyLog: "Server started.",
+	},
+	{
+		Slug: "terraria", Name: "Terraria", Game: "terraria", Group: "Playable Server",
+		Mark: "vanilla", Description: "TShock server. Small worlds, small memory - the one that fits on a busy host.",
+		Maturity: "preview", Image: "ryshe/terraria", Versions: []string{"latest"},
+		MemoryMB: 1024, CPU: 1, DiskGB: 5, MaxPlayers: 8, PortHint: 7777,
+		// TShock announces itself when the world has finished loading.
+		ReadyLog: "Server started",
+		// The image keeps worlds here, not in /data. A mount on the wrong path
+		// does not fail - the server generates a world in its own empty
+		// directory and runs - so the panel's files and backups would address a
+		// tree the running game shares nothing with.
+		DataPath: "/root/.local/share/Terraria/Worlds",
+		// bootstrap.sh reads WORLD_FILENAME, and refuses to start unless either
+		// that world already exists or -autocreate is passed. Both are set, so
+		// a first start makes a world and every later start loads it.
+		Env: map[string]string{"WORLD_FILENAME": "world.wld"},
+		Args: []string{
+			"-autocreate", "2", // 2 = medium; small worlds finish generating in seconds
+			"-port", "${PORT}",
+			"-maxplayers", "${MAX_PLAYERS}",
+			"-worldname", "${MOTD}",
+		},
+		// TShock reads commands on the server process's own stdin. Containers
+		// run detached and without -i - deliberately, so a panel restart is not
+		// an outage - so there is no pipe to write to. Output still streams;
+		// input is refused with a reason rather than accepted and dropped.
+		Console: ConsoleNone,
 	},
 	{
 		Slug: "rust", Name: "Rust", Game: "rust", Group: "Other",

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -558,6 +559,63 @@ func containerDataPath(image string) string {
 	return "/data"
 }
 
+// serverDataPath is containerDataPath with the template's own answer preferred.
+//
+// The image-name rule only ever knew about itzg's two layouts. ryshe/terraria
+// keeps worlds in /root/.local/share/Terraria/Worlds, and a bind mount landing
+// on /data instead does not fail - the image starts from its own empty
+// directory, generates a world there, and runs. The panel's file manager and
+// backups then address a directory the running server shares nothing with,
+// which is exactly the silent, total failure the proxy's /server mount was
+// found to cause.
+func serverDataPath(s *Server) string {
+	if s.DataPath != "" {
+		return s.DataPath
+	}
+	return containerDataPath(s.Image)
+}
+
+// usesItzgConventions reports whether the image takes the Minecraft images'
+// environment: EULA, TYPE, VERSION, MEMORY, MAX_PLAYERS, MOTD, SERVER_PORT.
+//
+// Every one of those was sent to every container unconditionally. They are
+// harmless noise to another image, but they are also the only way the panel had
+// of telling a server its port or its player cap - so a non-itzg game got none
+// of its settings, and the panel had no way to express them.
+func usesItzgConventions(image string) bool { return strings.HasPrefix(image, "itzg/") }
+
+// expandVars substitutes the panel's own settings into a template's env and
+// args, so a template can wire them into whatever names its image expects
+// rather than the runner having to know them.
+func expandVars(s *Server, in string) string {
+	r := strings.NewReplacer(
+		"${PORT}", itoa(s.Port),
+		"${MEMORY_MB}", itoa(s.MemoryMB),
+		"${MAX_PLAYERS}", itoa(s.MaxPlayers),
+		"${MOTD}", s.MOTD(),
+		"${DATA}", serverDataPath(s),
+	)
+	return r.Replace(in)
+}
+
+// templateLaunchArgs is the env and command line for an image that describes
+// its own launch. Sorted so the command a test asserts on, and the one an
+// operator reads in `docker inspect`, are stable rather than map-ordered.
+func templateLaunchArgs(s *Server) (env []string, cmd []string) {
+	keys := make([]string, 0, len(s.Env))
+	for k := range s.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		env = append(env, "-e", k+"="+expandVars(s, s.Env[k]))
+	}
+	for _, a := range s.Args {
+		cmd = append(cmd, expandVars(s, a))
+	}
+	return env, cmd
+}
+
 // publishArgs builds the -p flags for a server.
 //
 // This was one hardcoded `-p port:port`, which is TCP, which is correct for
@@ -626,6 +684,23 @@ func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 		"run", "-d", "--rm", "--name", name,
 	}
 	args = append(args, publishArgs(s)...)
+
+	// An image that describes its own launch gets that and nothing else. The
+	// Minecraft variables below are not neutral for it - EULA and MEMORY mean
+	// nothing to Terraria, and SERVER_PORT would be the panel claiming to have
+	// set a port it has not.
+	if !usesItzgConventions(s.Image) {
+		env, cmd := templateLaunchArgs(s)
+		args = append(args, env...)
+		args = append(args,
+			"--memory", fmt.Sprintf("%dm", s.MemoryMB),
+			"--cpus", fmt.Sprintf("%.2f", s.CPU),
+			"-v", fmt.Sprintf("%s:%s", mountPath, serverDataPath(s)),
+			s.Image,
+		)
+		return append(args, cmd...)
+	}
+
 	args = append(args,
 		"-e", "EULA=TRUE",
 		// Forced on rather than left to the image default, because an imported
@@ -684,7 +759,7 @@ func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 		"--cpus", fmt.Sprintf("%.2f", s.CPU),
 		// bind the panel's own directory, so the file manager and backups
 		// see exactly what the container sees
-		"-v", fmt.Sprintf("%s:%s", mountPath, containerDataPath(s.Image)),
+		"-v", fmt.Sprintf("%s:%s", mountPath, serverDataPath(s)),
 		s.Image,
 	)
 
@@ -987,6 +1062,13 @@ func (r *dockerRunner) Send(s *Server, cmd string) error {
 		return fmt.Errorf("server is not running")
 	}
 
+	if consoleMode(s) == ConsoleNone {
+		return fmt.Errorf(
+			"%s does not accept console commands through the panel - its server reads them on "+
+				"its own stdin, and containers run detached so a panel restart is not an outage",
+			s.Template)
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1017,6 +1099,24 @@ func consoleTool(image string) string {
 		return "send-command"
 	}
 	return "rcon-cli"
+}
+
+// consoleMode is how a command reaches this particular server.
+//
+// A template may declare it; otherwise the image decides, which is the rule
+// that has always applied. "none" is a real answer and a necessary one: TShock
+// takes its commands on the server process's own stdin, and the panel runs
+// every container detached without -i precisely so that a panel restart is not
+// a server outage. There is no pipe to write to, and pretending otherwise gives
+// an operator a console that accepts input and drops it.
+func consoleMode(s *Server) string {
+	if s.Console != "" {
+		return s.Console
+	}
+	if consoleTool(s.Image) == "send-command" {
+		return ConsoleSend
+	}
+	return ConsoleRCON
 }
 
 // hasRCON reports whether this image can answer a question, not just take an

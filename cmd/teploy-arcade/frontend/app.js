@@ -736,6 +736,9 @@ class ConsoleController {
         $('#replayNote', this.root).innerHTML =
           m.count ? `restored <b>${m.count}</b> lines &middot; buffer holds <b>${m.buffer_capacity}</b>` : 'no buffered history yet';
         this.seq = m.seq || 0;
+        // The replay carries the server snapshot, and it is the first thing to
+        // arrive - so the input is settled before anyone can type into it.
+        this.applyConsoleMode(m.server);
         this.toBottom(true);
         break;
       }
@@ -757,7 +760,19 @@ class ConsoleController {
     }
   }
 
+  // A game whose server reads commands on its own stdin cannot be driven from
+  // here - containers run detached, so there is no pipe to write to. Say that
+  // on the input itself rather than accepting a command and reporting that it
+  // could not be delivered.
+  applyConsoleMode(s) {
+    if (!this.input || !s || s.console !== 'none') return;
+    this.input.disabled = true;
+    this.input.classList.add('is-denied');
+    this.input.placeholder = `${s.template} takes commands in its own console, not through the panel`;
+  }
+
   onStatus(s) {
+    this.applyConsoleMode(s);
     const i = state.servers.findIndex((x) => x.id === s.id);
     if (i >= 0) state.servers[i] = s; else state.servers.push(s);
     renderTabstrip();

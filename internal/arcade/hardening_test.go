@@ -389,6 +389,72 @@ func mustRead(t *testing.T, path string) []byte {
 	return b
 }
 
+// Every environment variable the runner set was an itzg convention, and the
+// bind mount always landed on /data. Terraria keeps its worlds elsewhere and
+// takes its settings as command-line flags, so it would have been handed seven
+// variables it ignores and a mount on a path it never reads - generating a
+// world in its own empty directory while the panel backed up nothing.
+func TestTemplateDrivenImageLaunchesFromItsOwnTemplate(t *testing.T) {
+	tpl := templateBySlug("terraria")
+	if tpl == nil {
+		t.Fatal("the terraria template is missing")
+	}
+	s := &Server{
+		ID: "s1", Name: "T", Template: "terraria", Image: tpl.Image,
+		Port: 7777, MemoryMB: 1024, CPU: 1, MaxPlayers: 8,
+		DataPath: tpl.DataPath, Env: tpl.Env, Args: tpl.Args, Console: tpl.Console,
+		Props: map[string]string{"motd": "friends"},
+	}
+	got := strings.Join(dockerRunArgs(s, "gamepanel-s1", "/var/teploy-arcade/servers/s1", "secret"), " ")
+
+	// None of the Minecraft environment belongs on this image.
+	for _, unwanted := range []string{"EULA=", "TYPE=", "VERSION=", "MEMORY=", "SERVER_PORT=", "MAX_PLAYERS=", "RCON"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("a Minecraft variable (%s) was passed to a non-Minecraft image: %s", unwanted, got)
+		}
+	}
+	for _, want := range []string{
+		"WORLD_FILENAME=world.wld",
+		"-v /var/teploy-arcade/servers/s1:/root/.local/share/Terraria/Worlds",
+		"-p 7777:7777/tcp",
+		"-autocreate 2",
+		"-port 7777",         // ${PORT} expanded
+		"-maxplayers 8",      // ${MAX_PLAYERS} expanded
+		"-worldname friends", // ${MOTD} expanded
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in: %s", want, got)
+		}
+	}
+	// Arguments go after the image, not before it.
+	if strings.Index(got, tpl.Image) > strings.Index(got, "-autocreate") {
+		t.Error("command arguments were placed before the image name")
+	}
+
+	// TShock reads its console on stdin and containers run detached, so there
+	// is no pipe. Refused with a reason beats accepted and dropped.
+	if consoleMode(s) != ConsoleNone {
+		t.Fatalf("terraria console mode is %q", consoleMode(s))
+	}
+	// And nothing may ask it for a player list it cannot answer.
+	mgr := NewManager(t.TempDir(), NewHub())
+	if mgr.canAskWhoIsOnline(s) {
+		t.Error("the panel would query a server that cannot answer")
+	}
+
+	// A Minecraft image must be completely unaffected by all of this.
+	mc := &Server{
+		ID: "s2", Template: "paper", Image: "itzg/minecraft-server", Port: 25565,
+		MemoryMB: 2048, CPU: 2, MaxPlayers: 20, Props: map[string]string{},
+	}
+	mcArgs := strings.Join(dockerRunArgs(mc, "gamepanel-s2", "/srv", "secret"), " ")
+	for _, want := range []string{"EULA=TRUE", "ENABLE_RCON=true", "SERVER_PORT=25565", "-v /srv:/data"} {
+		if !strings.Contains(mcArgs, want) {
+			t.Errorf("the Minecraft launch changed: missing %q", want)
+		}
+	}
+}
+
 // Create checked ports by walking the registered servers and did not register
 // its own until several steps later, so two creates could both pass - and an
 // import already holding a reservation was invisible to both.
