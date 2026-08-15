@@ -188,6 +188,56 @@ func TestUDPGamesPublishUDP(t *testing.T) {
 	if n := len(publishArgs(wild)) / 2; n > 16 {
 		t.Errorf("an unbounded span published %d ports", n)
 	}
+
+	// Geyser listens on UDP 19132 regardless of the proxy's own port, so a span
+	// cannot express it. It ran on the deployed proxy for the whole migration
+	// with nothing published for it.
+	proxy := &Server{Port: 25565, ExtraPorts: []string{"19132/udp"}}
+	got := join(proxy)
+	if !strings.Contains(got, "-p 25565:25565/tcp") || !strings.Contains(got, "-p 19132:19132/udp") {
+		t.Errorf("proxy publish is %q", got)
+	}
+	// A protocol-less entry is tcp, matching docker's own -p.
+	if got := join(&Server{Port: 1, ExtraPorts: []string{"8080"}}); !strings.Contains(got, "-p 8080:8080/tcp") {
+		t.Errorf("a bare extra port is %q", got)
+	}
+	// A typo in a template must not be the reason a working server will not
+	// start, and must not duplicate a binding either.
+	messy := &Server{Port: 25565, ExtraPorts: []string{"", "notaport", "70000/udp", "19132/sctp", "25565/tcp", "19132/udp", "19132/udp"}}
+	got = join(messy)
+	if strings.Count(got, "-p ") != 2 {
+		t.Errorf("bad and duplicate entries were not handled: %q", got)
+	}
+}
+
+// Servers created before extra_ports existed must adopt their template's, and
+// must say a restart is needed rather than silently waiting for one - published
+// ports are fixed when a container is created.
+func TestExtraPortsBackfillFlagsARestart(t *testing.T) {
+	mgr := NewManager(t.TempDir(), NewHub())
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	s := mgr.List()[0]
+	s.Template = "velocity"
+	s.ExtraPorts = nil
+	s.PendingRestart = nil
+
+	mgr.backfillExtraPorts()
+
+	if len(s.ExtraPorts) == 0 || s.ExtraPorts[0] != "19132/udp" {
+		t.Fatalf("the template's extra ports were not adopted: %v", s.ExtraPorts)
+	}
+	if !contains(s.PendingRestart, "Ports") {
+		t.Errorf("no restart was flagged: %v", s.PendingRestart)
+	}
+
+	// An operator's own list is never replaced.
+	s.ExtraPorts = []string{"1234/udp"}
+	mgr.backfillExtraPorts()
+	if len(s.ExtraPorts) != 1 || s.ExtraPorts[0] != "1234/udp" {
+		t.Errorf("an existing list was overwritten: %v", s.ExtraPorts)
+	}
 }
 
 // Every non-Java game was judged ready by a banner only Java prints, so it
@@ -210,6 +260,24 @@ func TestReadyDetectionPerGame(t *testing.T) {
 	}
 	if isReady(bedrock, `[2026-08-15 03:00:00 INFO] Starting Server`) {
 		t.Error("a starting line was read as ready")
+	}
+
+	// Copied from a real Terraria boot on the deployed host. Everything before
+	// the listen line is world generation, which on one core runs for minutes -
+	// exactly the window in which a wrong marker would have the panel claim a
+	// server is up while it is still making terrain.
+	terraria := &Server{Game: "terraria", ReadyLog: templateBySlug("terraria").ReadyLog}
+	for _, notYet := range []string{
+		"Creating world - Seed: 687713729, Width: 6400, Height: 1800",
+		"Generating jungle",
+		"Settling liquids",
+	} {
+		if isReady(terraria, notYet) {
+			t.Errorf("world generation was read as ready: %q", notYet)
+		}
+	}
+	if !isReady(terraria, "Listening on port 7777") {
+		t.Error("the line Terraria prints when it starts accepting players was not recognised")
 	}
 }
 

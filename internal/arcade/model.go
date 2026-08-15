@@ -50,13 +50,14 @@ type Server struct {
 	// have to keep matching the container that is actually up. Empty means the
 	// Java default - one TCP port - which is what every server created before
 	// these fields existed gets, and is correct for all of them.
-	Protocols []string          `json:"protocols,omitempty"`
-	PortSpan  int               `json:"port_span,omitempty"`
-	ReadyLog  string            `json:"ready_log,omitempty"`
-	DataPath  string            `json:"data_path,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-	Args      []string          `json:"args,omitempty"`
-	Console   string            `json:"console,omitempty"`
+	Protocols  []string          `json:"protocols,omitempty"`
+	PortSpan   int               `json:"port_span,omitempty"`
+	ExtraPorts []string          `json:"extra_ports,omitempty"`
+	ReadyLog   string            `json:"ready_log,omitempty"`
+	DataPath   string            `json:"data_path,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+	Args       []string          `json:"args,omitempty"`
+	Console    string            `json:"console,omitempty"`
 
 	MemoryMB   int     `json:"memory_mb"`
 	CPU        float64 `json:"cpu"`
@@ -230,6 +231,19 @@ type Template struct {
 	Protocols []string `json:"protocols,omitempty"`
 	PortSpan  int      `json:"port_span,omitempty"`
 
+	// ExtraPorts are fixed ports this software listens on that have nothing to
+	// do with its main one, as "<port>/<proto>".
+	//
+	// PortSpan cannot express them: it walks upwards from the server's own
+	// port, and a plugin's listener is wherever that plugin's config says. The
+	// case that found this is Geyser, which has been running on the deployed
+	// Velocity since the migration - "Started Geyser on UDP port 19132" in its
+	// own log - while the container published nothing but 25565/tcp. Loaded,
+	// healthy, announcing itself, and unreachable by a single Bedrock client.
+	// Nothing in the panel could show that, because from the panel's side the
+	// proxy was fine.
+	ExtraPorts []string `json:"extra_ports,omitempty"`
+
 	// ReadyLog is a substring of the line this game prints when it is accepting
 	// players. Empty falls back to the Java and proxy banners, which is what
 	// every non-Java template was being judged by - so a Bedrock server that had
@@ -314,10 +328,18 @@ var templates = []Template{
 	// path, and PLAN.md §7 is explicit about shipping a focused set rather than
 	// chasing Pterodactyl's breadth.
 	{
+		// Geyser is the reason for extra_ports. It is the standard way a Java
+		// network accepts Bedrock clients, it is already on the deployed proxy,
+		// and it listens on UDP 19132 regardless of what the proxy's own port
+		// is. A second proxy on one host will now fail to start with a port
+		// conflict rather than silently being the one nobody can reach on
+		// Bedrock - which is the better of the two failures, and the only one
+		// an operator can act on.
 		Slug: "velocity", Name: "Velocity", Game: "proxy", Group: "Network Proxy",
 		Mark: "proxy", Description: "Modern proxy that fronts several servers behind one address. The maintained successor to BungeeCord and Waterfall.",
 		Recommended: true, Maturity: "stable", Image: "itzg/bungeecord", Versions: []string{"3.3.0"},
 		MemoryMB: 1024, CPU: 1, DiskGB: 5, MaxPlayers: 200, PortHint: 25577,
+		ExtraPorts: []string{"19132/udp"},
 	},
 	{
 		Slug: "bedrock", Name: "Bedrock", Game: "minecraft-bedrock", Group: "Other",
@@ -336,9 +358,19 @@ var templates = []Template{
 		Slug: "terraria", Name: "Terraria", Game: "terraria", Group: "Playable Server",
 		Mark: "vanilla", Description: "TShock server. Small worlds, small memory - the one that fits on a busy host.",
 		Maturity: "preview", Image: "ryshe/terraria", Versions: []string{"latest"},
-		MemoryMB: 1024, CPU: 1, DiskGB: 5, MaxPlayers: 8, PortHint: 7777,
-		// TShock announces itself when the world has finished loading.
-		ReadyLog: "Server started",
+		// Two cores because the cost is all in world generation, which is
+		// single-threaded but competes with everything else on the box: a
+		// medium world took roughly ten minutes on one core during the live
+		// test. Steady-state use is nothing - 416 MB and idle CPU with the
+		// world loaded.
+		MemoryMB: 1024, CPU: 2, DiskGB: 5, MaxPlayers: 8, PortHint: 7777,
+		// Taken from a real boot on the deployed host, not guessed. Both
+		// "Listening on port 7777" and TShock's own "Server started" appear;
+		// this one is the earlier of the two and is the moment the server
+		// actually accepts a connection, which is what this field means. It is
+		// also Terraria's own line rather than TShock's, so it still holds if
+		// the image is switched to one of ryshe's vanilla tags.
+		ReadyLog: "Listening on port",
 		// The image keeps worlds here, not in /data. A mount on the wrong path
 		// does not fail - the server generates a world in its own empty
 		// directory and runs - so the panel's files and backups would address a

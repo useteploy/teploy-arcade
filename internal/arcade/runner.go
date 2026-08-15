@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"os/exec"
 	"path/filepath"
@@ -642,13 +643,52 @@ func publishArgs(s *Server) []string {
 		span = 16
 	}
 	out := make([]string, 0, len(protos)*span*2)
+	seen := map[string]bool{}
+	add := func(port int, proto string) {
+		key := fmt.Sprintf("%d/%s", port, proto)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, "-p", fmt.Sprintf("%d:%d/%s", port, port, proto))
+	}
 	for i := 0; i < span; i++ {
-		p := s.Port + i
 		for _, proto := range protos {
-			out = append(out, "-p", fmt.Sprintf("%d:%d/%s", p, p, proto))
+			add(s.Port+i, proto)
 		}
 	}
+	// Fixed listeners that have nothing to do with the main port - Geyser's
+	// Bedrock socket is the case this exists for. Bad entries are skipped
+	// rather than failing the start: a typo in a template must not be the
+	// reason a working server will not come up.
+	for _, e := range s.ExtraPorts {
+		port, proto, ok := parseExtraPort(e)
+		if !ok {
+			log.Printf("%s: ignoring unparseable extra_ports entry %q", s.Name, e)
+			continue
+		}
+		add(port, proto)
+	}
 	return out
+}
+
+// parseExtraPort reads "19132/udp". The protocol may be omitted and defaults to
+// tcp, matching docker's own -p behaviour.
+func parseExtraPort(spec string) (int, string, bool) {
+	spec = strings.TrimSpace(spec)
+	proto := "tcp"
+	if i := strings.LastIndex(spec, "/"); i >= 0 {
+		proto = strings.ToLower(strings.TrimSpace(spec[i+1:]))
+		spec = spec[:i]
+	}
+	if proto != "tcp" && proto != "udp" {
+		return 0, "", false
+	}
+	port := atoi(strings.TrimSpace(spec))
+	if port < 1 || port > 65535 {
+		return 0, "", false
+	}
+	return port, proto, true
 }
 
 // isReady reports whether a console line says this server is accepting players.
