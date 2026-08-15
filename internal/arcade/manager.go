@@ -139,9 +139,69 @@ func (m *Manager) Load() error {
 	}
 	m.mu.Unlock()
 
-	m.reconcile()
-	m.resume(wasUp)
+	m.recoverAfterBoot(wasUp)
 	return nil
+}
+
+// How long to keep waiting for the Docker daemon at startup, and how often to
+// ask. The panel's unit is ordered After=docker.service, which is satisfied
+// when that unit *starts*, not when the socket answers - so on a cold boot the
+// panel can come up first and find nothing.
+var (
+	bootRecoveryWindow = 2 * time.Minute
+	bootRecoveryPoll   = 3 * time.Second
+)
+
+// recoverAfterBoot re-adopts what is still running and restarts what the host
+// took down, waiting for the daemon if it has to.
+//
+// Both halves fail closed when Docker is not answering: reconcile returns
+// early and resume's Start refuses with "docker is not reachable". Run once at
+// startup with no retry, that turns the exact scenario resume was built for -
+// a host reboot - into the failure it was built to prevent, because after a
+// reboot is precisely when the daemon is least likely to be up yet. It would
+// have looked identical to the original bug: every server stopped, nothing
+// explaining why.
+func (m *Manager) recoverAfterBoot(wasUp map[string]bool) {
+	// A healthy boot behaves exactly as before: synchronous, no goroutine.
+	if dockerReachable() {
+		m.reconcile()
+		m.resume(wasUp)
+		return
+	}
+
+	// Nothing to wait for. Notably this is every test and every simulator-only
+	// run, so neither pays for a polling goroutine.
+	docked := false
+	for _, s := range m.List() {
+		if s.Runtime == RuntimeDocker {
+			docked = true
+			break
+		}
+	}
+	if !docked {
+		return
+	}
+
+	go func() {
+		defer recoverPanic("boot recovery")
+		deadline := time.Now().Add(bootRecoveryWindow)
+		for time.Now().Before(deadline) {
+			time.Sleep(bootRecoveryPoll)
+			if !dockerReachable() {
+				continue
+			}
+			log.Printf("docker answered; re-adopting and resuming servers")
+			m.reconcile()
+			m.resume(wasUp)
+			return
+		}
+		// Loudly: this is the state where the panel shows a fleet of stopped
+		// servers and the operator has no idea one of them ever tried.
+		log.Printf("docker did not answer within %s of startup; %d server(s) that were running "+
+			"before the panel stopped were NOT restored, and no container was re-adopted",
+			bootRecoveryWindow, len(wasUp))
+	}()
 }
 
 // resume restarts servers that were running when the panel last saw them and
@@ -205,7 +265,7 @@ var resumeStagger = 15 * time.Second
 // wrong for Docker: those containers keep running across a panel restart.
 func (m *Manager) reconcile() {
 	dr, ok := m.docker.(*dockerRunner)
-	if !ok || !dockerAvailable() {
+	if !ok || !dockerReachable() {
 		return
 	}
 	for _, s := range m.List() {
@@ -269,16 +329,7 @@ func (m *Manager) seed() {
 		// seedServerFiles now reports a genuinely failed write instead of a
 		// stat race, and a demo server with no eula.txt looks fine in the panel
 		// until the operator tries to start it. Say so at boot.
-		// Seeded by a process running as root, into a directory it just made, so
-	// every file in it is root's - and the container runs as uid 1000 and
-	// cannot write a single one of them. Handed over before anything starts.
-	defer func() {
-		if s.Runtime == RuntimeDocker {
-			chownTree(filepath.Join(m.dataDir, "servers", s.ID), containerRunUID, containerRunGID)
-		}
-	}()
-
-	if err := m.seedServerFiles(s); err != nil {
+		if err := m.seedServerFiles(s); err != nil {
 			log.Printf("could not seed files for %q: %v", sp.name, err)
 		}
 	}
@@ -376,7 +427,9 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	if runtime != RuntimeDocker {
 		runtime = RuntimeSim
 	}
-	if runtime == RuntimeDocker && !dockerAvailable() {
+	// The same seam Start probes through, rather than a second direct call:
+	// one question, one answer, and it is what makes the create path testable.
+	if runtime == RuntimeDocker && !dockerReachable() {
 		return nil, fmt.Errorf("docker is not reachable on this host")
 	}
 	if err := m.checkDiskSpace(t.DiskGB); err != nil {
@@ -398,6 +451,15 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)
 	m.mu.Unlock()
+
+	// Seeded by a process running as root, into a directory root just made, so
+	// every file belongs to root - and the container runs as uid 1000 with no
+	// --user flag, so it cannot write one of them. Handed over before anything
+	// can start. Deferred so a half-seeded tree is handed over too, rather than
+	// left as root's for someone to puzzle over.
+	if s.Runtime == RuntimeDocker {
+		defer chownTree(filepath.Join(m.dataDir, "servers", s.ID), containerRunUID, containerRunGID)
+	}
 
 	if err := m.seedServerFiles(s); err != nil {
 		return nil, err

@@ -287,6 +287,12 @@ async function viewAdmin() {
   // An unclaimed panel has no accounts, so nobody is an admin - but everyone
   // can do everything, which is what the admin affordances need to reflect.
   const isAdmin = !!(me && (me.unclaimed || (me.user && me.user.role === 'admin')));
+  // Everyone except you. Resetting your own password through the admin row
+  // always failed: the agent reads a self-target as a self-change and asks for
+  // the current password, which that row has no field for - so the control
+  // offered you an action it would refuse. Change your own below instead.
+  const selfName = (me && me.user && me.user.name) || '';
+  const others = users.filter((u) => u.name.toLowerCase() !== selfName.toLowerCase());
 
   root.innerHTML = `
     <div class="page-head"><h1 class="page-title">Panel settings</h1></div>
@@ -383,11 +389,11 @@ async function viewAdmin() {
           </select>
           <button type="button" class="btn btn-sm" id="nuBtn">Add</button>
         </div>
-        <div class="row">
+        ${others.length ? `<div class="row">
           <span class="k">Reset a password</span>
           <span class="spacer"></span>
           <select class="inp" id="rpUser" style="width:140px">
-            ${users.map((u) => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('')}
+            ${others.map((u) => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('')}
           </select>
           <input class="inp" id="rpPass" type="password" placeholder="new (8+)" style="width:150px" autocomplete="new-password">
           <button type="button" class="btn btn-sm" id="rpBtn">Set</button>
@@ -395,13 +401,15 @@ async function viewAdmin() {
         <div class="row"><span class="k"></span>
           <span class="muted" style="font-size:12px">A password you set for someone else is one you know. They are refused
           the panel until they replace it.</span>
-        </div>` : ''}
-        <div class="row"><span class="k">Your password</span>
+        </div>` : ''}` : ''}
+        ${selfName ? `<div class="row"><span class="k">Your password</span>
           <span class="spacer"></span>
           <input class="inp" id="pwCur" type="password" placeholder="current" style="width:150px" autocomplete="current-password">
           <input class="inp" id="pwNew" type="password" placeholder="new (8+)" style="width:150px" autocomplete="new-password">
           <button type="button" class="btn btn-sm" id="pwBtn">Change</button>
-        </div>
+        </div>` : `<div class="row"><span class="k">Your password</span>
+          <span class="muted">Nobody is signed in - this panel is running with authentication off.</span>
+        </div>`}
         <div class="row"><span class="k"></span><span class="spacer"></span>
           <button type="button" class="btn btn-quiet btn-sm" id="logoutBtn">Sign out</button></div>`}
     </div>

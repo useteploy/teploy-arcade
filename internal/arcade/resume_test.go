@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -115,5 +116,89 @@ func TestResumeIgnoresSimulatorServers(t *testing.T) {
 	case id := <-rec.started:
 		t.Fatalf("resumed simulator server %s", id)
 	case <-time.After(400 * time.Millisecond):
+	}
+}
+
+// The panel's unit is ordered After=docker.service, which is satisfied when
+// that unit starts rather than when the socket answers. On a cold boot the
+// panel can therefore come up first, find no daemon, and give up - turning the
+// one scenario resume exists for into the failure it was built to prevent, and
+// looking identical to the original bug: every server stopped, nothing saying
+// why.
+func TestBootRecoveryWaitsForADaemonThatIsNotUpYet(t *testing.T) {
+	dir := t.TempDir()
+
+	first := NewManager(dir, NewHub())
+	if err := first.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	up := first.List()[0]
+	up.mu.Lock()
+	up.Runtime = RuntimeDocker
+	up.Status = StatusRunning
+	up.mu.Unlock()
+	if err := first.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	reach, local := dockerReachable, dockerImageLocal
+	window, poll, stagger := bootRecoveryWindow, bootRecoveryPoll, resumeStagger
+	t.Cleanup(func() {
+		dockerReachable, dockerImageLocal = reach, local
+		bootRecoveryWindow, bootRecoveryPoll, resumeStagger = window, poll, stagger
+	})
+	dockerImageLocal = func(string) bool { return true }
+	bootRecoveryWindow = 5 * time.Second
+	bootRecoveryPoll = 20 * time.Millisecond
+	resumeStagger = time.Millisecond
+
+	// Down for the first few asks, the way a daemon still starting behaves.
+	var mu sync.Mutex
+	asks := 0
+	dockerReachable = func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		asks++
+		return asks > 3
+	}
+
+	rec := &resumeRunner{started: make(chan string, 8)}
+	m := NewManager(dir, NewHub())
+	m.docker = rec
+	if err := m.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	select {
+	case id := <-rec.started:
+		if id != up.ID {
+			t.Fatalf("resumed %s, expected %s", id, up.ID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the panel gave up on a daemon that was only a moment late; the server stayed down")
+	}
+
+	// resume writes an audit entry after Start returns, and t.TempDir removes
+	// the directory the moment the test does - which fails the cleanup rather
+	// than the assertion. Let the goroutine finish its write.
+	time.Sleep(250 * time.Millisecond)
+}
+
+// A run with no docker-runtime servers must not leave a polling goroutine
+// behind - which is every test and every simulator-only run.
+func TestBootRecoveryDoesNotPollWhenThereIsNothingToRecover(t *testing.T) {
+	reach := dockerReachable
+	window := bootRecoveryWindow
+	t.Cleanup(func() { dockerReachable, bootRecoveryWindow = reach, window })
+	bootRecoveryWindow = time.Hour // a poll loop here would outlive the test
+	asked := 0
+	dockerReachable = func() bool { asked++; return false }
+
+	m := NewManager(t.TempDir(), NewHub())
+	if err := m.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if asked > 1 {
+		t.Errorf("asked docker %d times with only simulator servers; expected one probe", asked)
 	}
 }

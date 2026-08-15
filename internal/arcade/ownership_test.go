@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -153,6 +154,70 @@ func TestSavingSettingsKeepsTheGameAsOwner(t *testing.T) {
 	for _, h := range handed {
 		if h[1] != uid || h[2] != gid {
 			t.Errorf("%v handed to %v:%v, want %d:%d", h[0], h[1], h[2], uid, gid)
+		}
+	}
+}
+
+// The first attempt at this landed in seed(), which only ever makes simulator
+// servers, so the guard was never true and the fix was dead code. The existing
+// helper test could not catch that - it calls chownTree directly. This drives
+// Manager.Create, which is the route a server is actually made by.
+func TestCreatingADockerServerHandsTheTreeToTheGameUser(t *testing.T) {
+	mgr := NewManager(t.TempDir(), NewHub())
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	oldReach := dockerReachable
+	t.Cleanup(func() { dockerReachable = oldReach })
+	dockerReachable = func() bool { return true }
+
+	calls := withChownRecorder(t)
+	s, err := mgr.Create("Handover", "paper", "1.20.4", 25599, 0, 0, RuntimeDocker)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Scoped to the server's own tree. The same run also rewrites servers.json,
+	// which is panel state and correctly keeps the data directory's owner - a
+	// create must not hand the panel's ledger to the game.
+	want := filepath.Join(mgr.dataDir, "servers", s.ID)
+	var sawRoot bool
+	for _, c := range *calls {
+		p := c[0].(string)
+		if !strings.HasPrefix(p, want) {
+			if c[1] == containerRunUID && c[2] == containerRunGID {
+				t.Errorf("%s is outside the server tree but was handed to the game's user", p)
+			}
+			continue
+		}
+		if c[1] != containerRunUID || c[2] != containerRunGID {
+			t.Errorf("%s handed to %v:%v, want %d:%d", p, c[1], c[2], containerRunUID, containerRunGID)
+		}
+		if p == want {
+			sawRoot = true
+		}
+	}
+	if !sawRoot {
+		t.Fatalf("a new docker server's tree was never handed to uid %d; it would fail on its first start "+
+			"the way Lobby did. chowned: %v", containerRunUID, *calls)
+	}
+}
+
+// A simulator server runs in-process as the panel's own user, so handing its
+// files to uid 1000 would take them away from the only process that reads them.
+func TestCreatingASimulatorServerDoesNotChangeOwnership(t *testing.T) {
+	mgr := NewManager(t.TempDir(), NewHub())
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	calls := withChownRecorder(t)
+	if _, err := mgr.Create("Sim", "paper", "1.20.4", 25601, 0, 0, RuntimeSim); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for _, c := range *calls {
+		if c[1] == containerRunUID {
+			t.Fatalf("a simulator server's tree was handed to the container user: %v", c)
 		}
 	}
 }
