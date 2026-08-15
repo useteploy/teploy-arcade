@@ -578,3 +578,55 @@ func TestCreateClaimsItsPort(t *testing.T) {
 		t.Errorf("server landed on port %d, want %d", s.Port, held)
 	}
 }
+
+// Palworld is the case that proved the memory guard earns its place. Its own
+// documentation asks for 16 GB, the deployed host has 13, and the honest thing
+// is a template carrying the real number and a create that refuses with the
+// machine's actual capacity - not a smaller number that starts and is killed.
+func TestPalworldIsRefusedOnASmallHost(t *testing.T) {
+	tpl := templateBySlug("palworld")
+	if tpl == nil {
+		t.Fatal("the palworld template is missing")
+	}
+	if tpl.MemoryMB != 16384 {
+		t.Errorf("palworld asks for %d MB; the honest figure is its documented 16384", tpl.MemoryMB)
+	}
+
+	mgr := NewManager(t.TempDir(), NewHub())
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	prev := hostMemMB
+	hostMemMB = 13312 // the deployed LXC
+	defer func() { hostMemMB = prev }()
+
+	_, err := mgr.Create("pals", "palworld", "latest", 0, tpl.MemoryMB, tpl.CPU, RuntimeSim)
+	if err == nil {
+		t.Fatal("a 16 GB server was created on a 13 GB host")
+	}
+	if !strings.Contains(err.Error(), "13312") {
+		t.Errorf("the refusal does not say what the host actually has: %v", err)
+	}
+
+	// And on a host that can hold it, nothing stands in the way.
+	hostMemMB = 32768
+	if _, err := mgr.Create("pals2", "palworld", "latest", 0, tpl.MemoryMB, tpl.CPU, RuntimeSim); err != nil {
+		t.Fatalf("refused on a host with room: %v", err)
+	}
+}
+
+// Palworld's ports are two UDP listeners that a span cannot express: the game
+// on 8211 and Steam's query on 27015.
+func TestPalworldPublishesBothUDPPorts(t *testing.T) {
+	tpl := templateBySlug("palworld")
+	s := &Server{Port: tpl.PortHint, Protocols: tpl.Protocols, ExtraPorts: tpl.ExtraPorts}
+	got := strings.Join(publishArgs(s, ""), " ")
+	for _, want := range []string{"-p 8211:8211/udp", "-p 27015:27015/udp"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %q", want, got)
+		}
+	}
+	if strings.Contains(got, "/tcp") {
+		t.Errorf("published a TCP port for a UDP-only game: %q", got)
+	}
+}

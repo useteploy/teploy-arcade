@@ -391,6 +391,34 @@ var templates = []Template{
 		Console: ConsoleNone,
 	},
 	{
+		Slug: "palworld", Name: "Palworld", Game: "palworld", Group: "Other",
+		Mark: "vanilla", Description: "Memory-hungry even when idle. Needs 16 GB to itself; the panel will refuse it on a smaller host.",
+		Maturity: "preview", Image: "thijsvanloef/palworld-server-docker", Versions: []string{"latest"},
+		// 16 GB is the floor its own documentation gives, and 32 GB is what it
+		// recommends. Left at the honest number rather than a hopeful one: on a
+		// host that cannot supply it, checkFitsHost refuses the create and says
+		// how much the machine actually has, which is a far better answer than
+		// a server that starts and is killed by the kernel an hour in.
+		MemoryMB: 16384, CPU: 4, DiskGB: 30, MaxPlayers: 16, PortHint: 8211,
+		// 8211 game, 27015 Steam query. Both UDP; the span covers neither, so
+		// the query port is named outright.
+		Protocols: []string{"udp"}, ExtraPorts: []string{"27015/udp"},
+		ReadyLog: "Setting breakpad minidump AppID",
+		// SteamCMD installs the game here and the saves live under it, which is
+		// exactly the arrangement that makes a backup archive the install too -
+		// see the excludes item in TODO.md before scheduling one.
+		DataPath: "/palworld",
+		Env: map[string]string{
+			"PORT":        "${PORT}",
+			"PLAYERS":     "${MAX_PLAYERS}",
+			"SERVER_NAME": "${MOTD}",
+		},
+		// RCON exists in this image but is off by default and needs a password
+		// the panel has no way to pass on the template-driven path yet. Claiming
+		// a working console would be worse than saying there is not one.
+		Console: ConsoleNone,
+	},
+	{
 		Slug: "rust", Name: "Rust", Game: "rust", Group: "Other",
 		Mark: "rust", Description: "Wipes on a schedule - the backup job matters here more than anywhere else.",
 		Maturity: "preview", Image: "didstopia/rust-server", Versions: []string{"latest"},
