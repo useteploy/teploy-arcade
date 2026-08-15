@@ -474,6 +474,27 @@ func classify(text string) string {
 
 var joinRe = regexp.MustCompile(`(\w{3,16}) (joined|left) the game`)
 
+// A proxy does not say "joined the game" - it never runs a world, so nobody
+// joins one. Velocity says this instead:
+//
+//	[connected player] Someone (/192.168.1.160:50545) has connected
+//	[connected player] Someone (/192.168.1.160:50545) has disconnected
+//
+// The proxy is the front door: every player on the network connects to it, and
+// most of them never touch a backend's console. So the one server an operator
+// watches to see who is on was the one server that tracked nobody, and its
+// Players sidebar sat empty through a full session.
+//
+// Anchored on the "[connected player]" tag deliberately. The same log also
+// carries
+//
+//	[server connection] Someone -> Lobby has connected
+//
+// which is the player being handed to a backend, not a second player arriving.
+// Matching loosely counts one player twice, and counts them out again when they
+// hop between backends.
+var proxyJoinRe = regexp.MustCompile(`\[connected player\] (\w{3,16}) \([^)]*\) has (connected|disconnected)`)
+
 // dockerRunArgs builds the container command for a server. Extracted from Start
 // so a test can assert on what the image is actually told: the interesting
 // decisions (which jar, which JRE, which limits) all live in these arguments,
@@ -719,6 +740,15 @@ func (r *dockerRunner) attach(s *Server, emit func(Line), adopted bool) error {
 		r.mgr.setStatus(s, StatusRunning, 0, "")
 		r.mgr.panelLine(s, "info",
 			"Re-attached to a container that was already running - the panel restarted, this server never stopped.")
+
+		// Who is online is in-memory state, and the panel just lost it. The
+		// tail replays the last 200 lines, which rebuilds recent arrivals and
+		// nothing older - so a player who joined an hour before the restart
+		// disappears from the sidebar while still standing in the world, and
+		// one whose join replayed but whose departure scrolled past appears
+		// though they left. Ask the game instead. Backgrounded: it shells into
+		// the container, and adoption should not wait on it.
+		go r.mgr.reconcilePlayers(s)
 	}
 	return nil
 }
@@ -799,6 +829,9 @@ func (r *dockerRunner) stream(s *Server, stdout io.Reader, emit func(Line), alre
 		if m := joinRe.FindStringSubmatch(text); m != nil {
 			src = "player"
 			r.mgr.trackPlayer(s, m[1], m[2] == "joined")
+		} else if m := proxyJoinRe.FindStringSubmatch(text); m != nil {
+			src = "player"
+			r.mgr.trackPlayer(s, m[1], m[2] == "connected")
 		}
 		// A proxy prints "Done (1.43s)!" with no help suffix, so the Minecraft
 		// line never arrives and the panel reported "starting" forever - for a
@@ -866,6 +899,28 @@ func (r *dockerRunner) Send(s *Server, cmd string) error {
 			strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// query runs an RCON command and returns what the game said, for the callers
+// that need the answer rather than the delivery. Send discards it: a console
+// command's reply reaches the operator through the log stream, so returning it
+// there would print everything twice.
+func (r *dockerRunner) query(s *Server, cmd string) (string, error) {
+	s.mu.Lock()
+	p, _ := s.proc.(*dockerProc)
+	s.mu.Unlock()
+	if p == nil {
+		return "", fmt.Errorf("server is not running")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	name := containerPrefix + "-" + s.ID
+	out, err := exec.Command("docker", "exec", name, "rcon-cli", cmd).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
 }
 
 // ------------------------------------------------------------------ helpers

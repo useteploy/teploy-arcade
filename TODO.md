@@ -94,6 +94,32 @@ and it costs nothing sitting stopped.
 
 ## 3. Known rough edges
 
+- [x] ~~The proxy never showed anyone in its Players sidebar~~ — reported live,
+      and the panel's own logs proved it. A proxy runs no world, so nothing
+      ever "joins the game" in its log, and `joinRe` was the only thing feeding
+      the player list. Velocity says `[connected player] Name (/ip:port) has
+      connected` instead. Every player on the network connects to the proxy —
+      it is the front door and the console you would naturally watch — so the
+      one server that should always know who is on was the only one that never
+      did. Matched on the `[connected player]` tag specifically: the same log
+      carries `[server connection] Name -> Lobby has connected`, which is the
+      handoff to a backend, and counting it would double every player and
+      remove them again on every backend hop.
+
+- [x] ~~Who is online was lost on every panel restart~~ — the tail replays the
+      last 200 lines and rebuilds recent arrivals only, so a player who joined
+      an hour before a restart vanished from the sidebar while still standing
+      in the world. The panel now asks the game itself over RCON when it
+      re-adopts a container. Written twice: the first parser accepted only
+      vanilla's `There are 2 of a max of 20 players online: names`, and this
+      fleet answers `There are 0 out of maximum 20 players online.` wrapped in
+      ANSI colour with EssentialsX appending its own line — so it matched
+      nothing and shipped dead until it was run against the real host. The
+      test strings are now copied from that host. A reply the parser does not
+      recognise leaves the console-derived list alone rather than replacing it
+      with a guess, which is also what happens on the proxy: Velocity has no
+      RCON at all.
+
 Each of these is understood; none is fixed.
 
 - [x] ~~No first-run screen~~ — an unclaimed panel now takes over the page:

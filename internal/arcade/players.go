@@ -3,8 +3,10 @@ package arcade
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -340,4 +342,132 @@ func (m *Manager) PlayerLists(s *Server) (map[string]any, error) {
 	out["running"] = s.State() == StatusRunning
 	out["whitelist_enforced"] = enforced
 	return out, nil
+}
+
+// ------------------------------------------------------- who is actually on
+
+// parsePlayerList reads the game's own answer to `list`.
+//
+// There is no single format. The deployed fleet answers, with ANSI colour
+// codes around every number:
+//
+//	There are 0 out of maximum 20 players online.
+//
+// vanilla answers:
+//
+//	There are 2 of a max of 20 players online: Alice, Bob
+//
+// and a plugin can replace either - EssentialsX is doing exactly that on this
+// fleet, which is where "There's no one online in this group!" comes from. The
+// first version of this function accepted only the vanilla sentence, so on the
+// one host it was written for it silently matched nothing and the reconcile did
+// nothing at all. Silent failure plus a wrong format is a feature that ships
+// dead, which is why the strings below are copied from that host.
+//
+// So: take the count from either sentence, take names only when the reply
+// actually lists them, and refuse everything else. ok=false means "keep what
+// the console told you", which is always better than replacing a real list with
+// a guess.
+func parsePlayerList(out string) ([]string, bool) {
+	clean := ansiRe.ReplaceAllString(out, "")
+
+	loc := listCountRe.FindStringSubmatchIndex(clean)
+	if loc == nil {
+		return nil, false
+	}
+	count := atoi(clean[loc[2]:loc[3]])
+
+	// Names, when the reply carries them, follow a colon on the SAME line.
+	// Confined to that line deliberately: a plugin can print anything
+	// afterwards, and this fleet's does - EssentialsX adds "Error: There's no
+	// one online in this group!", whose colon otherwise yields a player called
+	// "There's".
+	tail := clean[loc[1]:]
+	if j := strings.IndexAny(tail, "\r\n"); j >= 0 {
+		tail = tail[:j]
+	}
+	rest := ""
+	if i := strings.Index(tail, ":"); i >= 0 {
+		rest = strings.TrimSpace(tail[i+1:])
+	}
+
+	if rest == "" {
+		// "0 players online." is a complete answer: nobody is on. Any other
+		// count without names is not - the panel would know how many but not
+		// who, and the sidebar lists people.
+		if count == 0 {
+			return []string{}, true
+		}
+		return nil, false
+	}
+
+	var names []string
+	for _, part := range strings.Split(rest, ",") {
+		// Plugins decorate names constantly (prefixes, colours, "(afk)"), so
+		// take the first bare word and keep it only if it could be a name.
+		name := strings.TrimSpace(part)
+		if k := strings.IndexAny(name, " \t"); k > 0 {
+			name = name[:k]
+		}
+		name = strings.TrimFunc(name, func(r rune) bool {
+			return !(r == '_' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z')
+		})
+		if len(name) >= 3 && len(name) <= 16 {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, false
+	}
+	return names, true
+}
+
+var (
+	ansiRe      = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	listCountRe = regexp.MustCompile(`There are (\d+) (?:of a max of|out of maximum) (\d+) players online`)
+)
+
+// reconcilePlayers replaces the in-memory player list with the game's own.
+//
+// Only meaningful for a runtime that can be asked. A failure is silent on
+// purpose: the common case is a proxy or an image without rcon-cli, where the
+// panel simply keeps what the console told it.
+func (m *Manager) reconcilePlayers(s *Server) {
+	defer recoverPanic("reconcile players for " + s.ID)
+	dr, ok := m.runnerFor(s).(*dockerRunner)
+	if !ok {
+		return
+	}
+	out, err := dr.query(s, "list")
+	if err != nil {
+		return
+	}
+	names, ok := parsePlayerList(out)
+	if !ok {
+		return
+	}
+
+	s.mu.Lock()
+	prev := make(map[string]Player, len(s.players))
+	for _, p := range s.players {
+		prev[p.Name] = p
+	}
+	next := make([]Player, 0, len(names))
+	for _, n := range names {
+		// Keep the join time for anyone the console already knew about, so a
+		// reconcile does not reset every session clock to the panel's restart.
+		if p, ok := prev[n]; ok {
+			next = append(next, p)
+			continue
+		}
+		next = append(next, Player{Name: n, UUID: fakeUUID(n), PingMS: 30, JoinedAt: time.Now().Unix()})
+	}
+	changed := len(next) != len(s.players)
+	s.players = next
+	s.mu.Unlock()
+
+	if changed {
+		log.Printf("%s: %d player(s) online according to the server itself", s.Name, len(next))
+	}
+	m.pushPlayers(s)
 }
