@@ -143,50 +143,8 @@ func (m *Manager) Load() error {
 	m.mu.Unlock()
 
 	m.backfillVersions()
-	m.backfillExtraPorts()
 	m.recoverAfterBoot(wasUp)
 	return nil
-}
-
-// backfillExtraPorts adopts a template's fixed listeners for servers created
-// before the field existed.
-//
-// The deployed Velocity is the case. Geyser has been loaded on it since the
-// migration, announcing "Started Geyser on UDP port 19132" in its own log every
-// boot, while the container published 25565/tcp and nothing else - so no
-// Bedrock client could ever reach it. The proxy was healthy, the plugin was
-// running, and the feature simply did not exist from outside the host.
-//
-// Only fills a blank, like every other backfill here, and flags a restart
-// rather than performing one: published ports are fixed when a container is
-// created, so this cannot take effect until the operator chooses to restart -
-// and restarting a proxy disconnects everyone on the network.
-func (m *Manager) backfillExtraPorts() {
-	changed := 0
-	for _, s := range m.List() {
-		t := templateBySlug(s.Template)
-		if t == nil || len(t.ExtraPorts) == 0 {
-			continue
-		}
-		s.mu.Lock()
-		if len(s.ExtraPorts) > 0 {
-			s.mu.Unlock()
-			continue
-		}
-		s.ExtraPorts = t.ExtraPorts
-		if !contains(s.PendingRestart, "Ports") {
-			s.PendingRestart = append(s.PendingRestart, "Ports")
-			sort.Strings(s.PendingRestart)
-		}
-		name := s.Name
-		s.mu.Unlock()
-		log.Printf("%s: will publish %s on its next restart (from the %s template)",
-			name, strings.Join(t.ExtraPorts, ", "), s.Template)
-		changed++
-	}
-	if changed > 0 {
-		_ = m.Save()
-	}
 }
 
 // backfillVersions fills in a version for servers recorded as "unknown".
@@ -197,7 +155,7 @@ func (m *Manager) backfillExtraPorts() {
 // place. But detection runs at import time and only at import time, so every
 // server imported before that reader existed kept the "unknown" it was written
 // with, forever, while the answer sat inside a jar on disk the whole time. The
-// deployed fleet is four Paper servers reading "paper unknown" in their own
+// deployed fleet was four Paper servers reading "paper unknown" in their own
 // header for exactly this reason.
 //
 // Only ever fills a blank. A version already recorded is the operator's or the

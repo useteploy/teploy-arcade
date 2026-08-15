@@ -164,7 +164,7 @@ func TestDeletingAServerTakesItsTasks(t *testing.T) {
 // Publishing was one hardcoded TCP port, so every UDP game installed, booted,
 // reported healthy and could not be reached by anybody.
 func TestUDPGamesPublishUDP(t *testing.T) {
-	join := func(s *Server) string { return strings.Join(publishArgs(s), " ") }
+	join := func(s *Server) string { return strings.Join(publishArgs(s, ""), " ") }
 
 	java := &Server{Port: 25565}
 	if got := join(java); got != "-p 25565:25565/tcp" {
@@ -185,7 +185,7 @@ func TestUDPGamesPublishUDP(t *testing.T) {
 	// A template asking for a thousand ports is a bad template, not a thousand
 	// bindings on the daemon.
 	wild := &Server{Port: 100, Protocols: []string{"udp"}, PortSpan: 9999}
-	if n := len(publishArgs(wild)) / 2; n > 16 {
+	if n := len(publishArgs(wild, "")) / 2; n > 16 {
 		t.Errorf("an unbounded span published %d ports", n)
 	}
 
@@ -210,33 +210,50 @@ func TestUDPGamesPublishUDP(t *testing.T) {
 	}
 }
 
-// Servers created before extra_ports existed must adopt their template's, and
-// must say a restart is needed rather than silently waiting for one - published
-// ports are fixed when a container is created.
-func TestExtraPortsBackfillFlagsARestart(t *testing.T) {
-	mgr := NewManager(t.TempDir(), NewHub())
-	if err := mgr.Load(); err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	s := mgr.List()[0]
-	s.Template = "velocity"
-	s.ExtraPorts = nil
-	s.PendingRestart = nil
+// Geyser is a plugin, not a server, and it can sit on a proxy or on a Paper
+// server. Its port therefore belongs to whatever has it installed - putting
+// 19132 in the Velocity template would have every proxy claim a Bedrock port
+// whether or not it runs Geyser, and made a second proxy fail over a plugin it
+// does not have.
+func TestGeyserPortFollowsThePlugin(t *testing.T) {
+	dir := t.TempDir()
+	s := &Server{Port: 25565, Name: "Proxy"}
 
-	mgr.backfillExtraPorts()
-
-	if len(s.ExtraPorts) == 0 || s.ExtraPorts[0] != "19132/udp" {
-		t.Fatalf("the template's extra ports were not adopted: %v", s.ExtraPorts)
-	}
-	if !contains(s.PendingRestart, "Ports") {
-		t.Errorf("no restart was flagged: %v", s.PendingRestart)
+	// No plugin, no port. A proxy without Geyser publishes what a proxy needs.
+	if got := strings.Join(publishArgs(s, dir), " "); got != "-p 25565:25565/tcp" {
+		t.Fatalf("a proxy with no Geyser published %q", got)
 	}
 
-	// An operator's own list is never replaced.
-	s.ExtraPorts = []string{"1234/udp"}
-	mgr.backfillExtraPorts()
-	if len(s.ExtraPorts) != 1 || s.ExtraPorts[0] != "1234/udp" {
-		t.Errorf("an existing list was overwritten: %v", s.ExtraPorts)
+	// Installed but not yet configured - the normal state on a first boot,
+	// before Geyser has written a config.
+	plugins := filepath.Join(dir, "plugins")
+	if err := os.MkdirAll(plugins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plugins, "Geyser-Velocity.jar"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(publishArgs(s, dir), " "); !strings.Contains(got, "-p 19132:19132/udp") {
+		t.Errorf("an installed Geyser got no port: %q", got)
+	}
+
+	// Configured on a non-default port. Publishing 19132 while Geyser listens
+	// elsewhere reproduces the original bug with more steps.
+	cfgDir := filepath.Join(plugins, "Geyser-Velocity")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "# comment\nbedrock:\n  address: 0.0.0.0\n  port: 19140\n  clone-remote-port: false\nremote:\n  port: 25565\n"
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(publishArgs(s, dir), " ")
+	if !strings.Contains(got, "-p 19140:19140/udp") {
+		t.Errorf("the configured Bedrock port was not read: %q", got)
+	}
+	// `remote.port` is the Java server Geyser talks to, not a port to publish.
+	if strings.Contains(got, "-p 19132:") {
+		t.Errorf("published the default alongside the configured port: %q", got)
 	}
 }
 

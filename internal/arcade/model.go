@@ -317,6 +317,12 @@ var templates = []Template{
 		MemoryMB: 6144, CPU: 2, DiskGB: 15, MaxPlayers: 20, PortHint: 25565,
 	},
 	{
+		Slug: "neoforge", Name: "NeoForge", Game: "minecraft-java", Group: "Playable Server",
+		Mark: "forge", Description: "The modloader most packs built for 1.20.2 and later use. Forge's successor, not a variant of it.",
+		Maturity: "stable", Image: "itzg/minecraft-server", Versions: []string{"1.21.1", "1.20.6", "1.20.4"},
+		MemoryMB: 4096, CPU: 2, DiskGB: 15, MaxPlayers: 20, PortHint: 25565,
+	},
+	{
 		Slug: "fabric", Name: "Fabric", Game: "minecraft-java", Group: "Playable Server",
 		Mark: "fabric", Description: "Fabric is a lightweight, experimental modding toolchain for Minecraft.",
 		Maturity: "stable", Image: "itzg/minecraft-server", Versions: []string{"1.20.4", "1.20.1"},
@@ -328,18 +334,10 @@ var templates = []Template{
 	// path, and PLAN.md §7 is explicit about shipping a focused set rather than
 	// chasing Pterodactyl's breadth.
 	{
-		// Geyser is the reason for extra_ports. It is the standard way a Java
-		// network accepts Bedrock clients, it is already on the deployed proxy,
-		// and it listens on UDP 19132 regardless of what the proxy's own port
-		// is. A second proxy on one host will now fail to start with a port
-		// conflict rather than silently being the one nobody can reach on
-		// Bedrock - which is the better of the two failures, and the only one
-		// an operator can act on.
 		Slug: "velocity", Name: "Velocity", Game: "proxy", Group: "Network Proxy",
 		Mark: "proxy", Description: "Modern proxy that fronts several servers behind one address. The maintained successor to BungeeCord and Waterfall.",
 		Recommended: true, Maturity: "stable", Image: "itzg/bungeecord", Versions: []string{"3.3.0"},
 		MemoryMB: 1024, CPU: 1, DiskGB: 5, MaxPlayers: 200, PortHint: 25577,
-		ExtraPorts: []string{"19132/udp"},
 	},
 	{
 		Slug: "bedrock", Name: "Bedrock", Game: "minecraft-bedrock", Group: "Other",

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -628,7 +629,7 @@ func templateLaunchArgs(s *Server) (env []string, cmd []string) {
 //
 // Protocols and span come off the server, which copied them from its template,
 // so adding a game with a different transport stays a data change.
-func publishArgs(s *Server) []string {
+func publishArgs(s *Server, dir string) []string {
 	protos := s.Protocols
 	if len(protos) == 0 {
 		protos = []string{"tcp"}
@@ -669,8 +670,91 @@ func publishArgs(s *Server) []string {
 		}
 		add(port, proto)
 	}
+	// Geyser is a plugin and its port belongs to the server that has it
+	// installed, whichever that is - a proxy or a Paper server. See geyserPort.
+	if port, ok := geyserPort(dir); ok {
+		add(port, "udp")
+	}
 	return out
 }
+
+// geyserPort finds the Bedrock port of a Geyser install, if there is one.
+//
+// Geyser is a plugin, not a server, and it can sit on a proxy or on a Paper
+// server. Its port therefore belongs to whatever has the plugin installed, not
+// to a template - putting 19132 in the Velocity template would have every proxy
+// claim a Bedrock port whether or not it runs Geyser, and made a second proxy
+// on the host fail over a plugin it does not have.
+//
+// So the port follows the plugin. The plugins directory is on disk and readable
+// before the container starts, which is exactly when the publish flags are
+// decided.
+//
+// Reading its config rather than assuming 19132: the port is configurable, and
+// a panel that published the default while Geyser listened elsewhere would
+// reproduce the original bug with more steps. The default is only used when the
+// plugin is clearly present but its config is not readable yet - which is the
+// normal state on the very first boot, before Geyser has written one.
+func geyserPort(dir string) (int, bool) {
+	if dir == "" {
+		return 0, false
+	}
+	plugins := filepath.Join(dir, "plugins")
+	ents, err := os.ReadDir(plugins)
+	if err != nil {
+		return 0, false
+	}
+	found := false
+	var cfg string
+	for _, e := range ents {
+		name := strings.ToLower(e.Name())
+		if !strings.HasPrefix(name, "geyser") {
+			continue
+		}
+		found = true
+		if e.IsDir() {
+			cfg = filepath.Join(plugins, e.Name(), "config.yml")
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	if cfg == "" {
+		return geyserDefaultPort, true
+	}
+	b, err := os.ReadFile(cfg)
+	if err != nil {
+		return geyserDefaultPort, true
+	}
+	// A deliberately small YAML read: find the `bedrock:` block and take the
+	// first `port:` indented under it. Pulling in a YAML parser to read one
+	// integer out of one optional file is not a trade worth making, and a
+	// mis-read falls back to the default rather than failing a start.
+	inBedrock := false
+	for _, line := range strings.Split(string(b), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+			continue
+		}
+		indented := line != strings.TrimLeft(line, " \t")
+		if !indented {
+			inBedrock = strings.HasPrefix(trimmed, "bedrock:")
+			continue
+		}
+		if !inBedrock {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(trimmed, "port:"); ok {
+			if p := atoi(strings.TrimSpace(rest)); p > 0 && p <= 65535 {
+				return p, true
+			}
+			break
+		}
+	}
+	return geyserDefaultPort, true
+}
+
+const geyserDefaultPort = 19132
 
 // parseExtraPort reads "19132/udp". The protocol may be omitted and defaults to
 // tcp, matching docker's own -p behaviour.
@@ -723,7 +807,7 @@ func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 		// input then goes over RCON, which is why it is forced on below.
 		"run", "-d", "--rm", "--name", name,
 	}
-	args = append(args, publishArgs(s)...)
+	args = append(args, publishArgs(s, mountPath)...)
 
 	// An image that describes its own launch gets that and nothing else. The
 	// Minecraft variables below are not neutral for it - EULA and MEMORY mean
