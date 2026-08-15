@@ -318,6 +318,77 @@ func writeJar(t *testing.T, path string, files map[string]string) {
 	}
 }
 
+// The templates directory was seeded once, when empty, and never looked at
+// again - so every template fix shipped in an upgrade was inert on any panel
+// that had already been installed. v0.18.0's Bedrock, Rust and Valheim fixes
+// all landed in a build that could not reach the deployed panel's own copies.
+func TestSeededTemplatesRefreshButNeverClobberAnEdit(t *testing.T) {
+	dir := t.TempDir()
+
+	// First run seeds and records what it wrote.
+	if err := LoadTemplates(dir); err != nil {
+		t.Fatalf("first load: %v", err)
+	}
+	tpl := filepath.Join(dir, "templates", "bedrock.json")
+	if _, err := os.Stat(filepath.Join(dir, "templates", seedLedger)); err != nil {
+		t.Fatalf("no seed ledger written: %v", err)
+	}
+
+	// A stale seed - what the deployed panel actually had on disk: the dead
+	// pinned version, no UDP, no ready banner.
+	stale := `{"slug":"bedrock","name":"Bedrock","game":"minecraft-bedrock","group":"Other",
+	  "mark":"bedrock","description":"x","maturity":"preview",
+	  "image":"itzg/minecraft-bedrock-server","versions":["1.20.71"],
+	  "memory_mb":2048,"cpu":2,"disk_gb":10,"max_players":10,"port_hint":19132}`
+	if err := os.WriteFile(tpl, []byte(stale), 0o644); err != nil {
+		t.Fatalf("write stale: %v", err)
+	}
+	// A hand-edited file the panel did not write must survive, so the ledger
+	// has to treat "differs from what I wrote" as "not mine". Remove the ledger
+	// to reproduce a panel installed before it existed.
+	if err := os.Remove(filepath.Join(dir, "templates", seedLedger)); err != nil {
+		t.Fatalf("remove ledger: %v", err)
+	}
+	if err := LoadTemplates(dir); err != nil {
+		t.Fatalf("second load: %v", err)
+	}
+	got := templateBySlug("bedrock")
+	if got == nil || len(got.Versions) == 0 || got.Versions[0] != "LATEST" {
+		t.Fatalf("a stale seeded template was not refreshed: %+v", got)
+	}
+	if len(got.Protocols) == 0 || got.Protocols[0] != "udp" {
+		t.Error("the refreshed template still does not publish UDP")
+	}
+	// Nothing is thrown away when the panel cannot tell whose file it was.
+	if _, err := os.Stat(tpl + ".superseded"); err != nil {
+		t.Errorf("the previous file was discarded rather than kept aside: %v", err)
+	}
+
+	// Now an operator edits it on purpose, with the ledger in place.
+	edited := strings.Replace(string(mustRead(t, tpl)), `"max_players": 10`, `"max_players": 44`, 1)
+	if edited == string(mustRead(t, tpl)) {
+		t.Fatal("test did not actually change the file")
+	}
+	if err := os.WriteFile(tpl, []byte(edited), 0o644); err != nil {
+		t.Fatalf("write edit: %v", err)
+	}
+	if err := LoadTemplates(dir); err != nil {
+		t.Fatalf("third load: %v", err)
+	}
+	if got := templateBySlug("bedrock"); got == nil || got.MaxPlayers != 44 {
+		t.Fatalf("an operator's edit was reverted by an upgrade: %+v", got)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return b
+}
+
 // Create checked ports by walking the registered servers and did not register
 // its own until several steps later, so two creates could both pass - and an
 // import already holding a reservation was invisible to both.

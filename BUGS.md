@@ -1,5 +1,32 @@
 # BUGS.md — teploy-arcade audit findings
 
+## 2026-08-15 — every template fix shipped in an upgrade was inert on the deployed panel
+
+`data/templates/` was seeded once, when the directory was empty, and never
+looked at again. The on-disk copy is authoritative, so a template improved in a
+later build could not reach a panel that had already been installed.
+
+Not theoretical, and found by checking rather than by reasoning: v0.18.0 fixed
+Bedrock's pinned version (Mojang 404s 1.20.71), added UDP publishing for
+Bedrock, Rust and Valheim, and gave each its own ready banner. Every one of
+those was dead on the deployed panel, whose `bedrock.json` was still the
+snapshot written at first run. The release notes and the running system
+disagreed, and only the running system was right.
+
+The panel now records the hash of each file it writes, in `.seeded.json`. A file
+whose bytes still match what the panel wrote is the panel's and is refreshed; a
+file that differs is the operator's and is left alone - templates are meant to be
+edited, and an upgrade silently reverting an edit would be worse than the bug
+being fixed. A panel installed before the ledger existed has no record either
+way, so those files are refreshed with the previous one kept beside them as
+`<slug>.json.superseded`.
+
+The test for this immediately found a second defect: `.seeded.json` ends in
+`.json`, so the loader read the ledger as a template, failed it for having no
+slug, and returned "1 template(s) skipped" about a file the operator never
+created.
+
+
 ## 2026-08-15 — the Players sidebar was empty for a player who was standing in the world
 
 Reported live: a player connects and never appears in the sidebar. Root-caused

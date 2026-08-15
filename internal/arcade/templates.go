@@ -1,8 +1,10 @@
 package arcade
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,6 +33,95 @@ var (
 
 func templatesDir(dataDir string) string { return filepath.Join(dataDir, "templates") }
 
+// seedLedger records the hash of every template file the panel wrote itself.
+const seedLedger = ".seeded.json"
+
+// syncSeededTemplates keeps the panel's own templates current without ever
+// overwriting one an operator has edited.
+//
+// The directory used to be seeded once, when it was empty, and never looked at
+// again - so a template shipped in an upgrade could not reach a panel that had
+// already been installed. That is not theoretical: v0.18.0 fixed Bedrock's dead
+// pinned version, added UDP publishing for Bedrock, Rust and Valheim, and gave
+// each a ready banner, and every one of those fixes was inert on the deployed
+// panel because `bedrock.json` on its disk was still the snapshot written at
+// first run. A fix that cannot reach the installation it was written for is not
+// a fix.
+//
+// So the panel records what it wrote. A file whose bytes still match what the
+// panel put there is the panel's, and is replaced with the current version; a
+// file that differs is the operator's, and is left exactly alone. Templates are
+// meant to be edited - that is the whole point of them being files - and an
+// upgrade silently reverting an edit would be a far worse bug than the one this
+// fixes.
+//
+// A panel installed before the ledger existed has no record either way. Those
+// files are refreshed, but the old one is kept beside it as
+// `<slug>.json.superseded` rather than discarded, because "the panel could not
+// tell" is not grounds for destroying an edit that might be there.
+func syncSeededTemplates(dir string) error {
+	ledgerPath := filepath.Join(dir, seedLedger)
+	known := map[string]string{}
+	hadLedger := false
+	if b, err := os.ReadFile(ledgerPath); err == nil {
+		if json.Unmarshal(b, &known) == nil {
+			hadLedger = true
+		}
+	}
+
+	next := map[string]string{}
+	for _, t := range tplBuiltin {
+		b, err := json.MarshalIndent(t, "", "  ")
+		if err != nil {
+			return err
+		}
+		sum := fmt.Sprintf("%x", sha256.Sum256(b))
+		next[t.Slug] = sum
+
+		path := filepath.Join(dir, t.Slug+".json")
+		cur, err := os.ReadFile(path)
+		switch {
+		case os.IsNotExist(err):
+			// New template in this build, or a first run.
+
+		case err != nil:
+			return err
+
+		case fmt.Sprintf("%x", sha256.Sum256(cur)) == known[t.Slug]:
+			// The panel wrote this and nobody has touched it. Nothing to keep.
+
+		case fmt.Sprintf("%x", sha256.Sum256(cur)) == sum:
+			// Already current; do not rewrite it just to update the ledger's
+			// idea of it.
+			continue
+
+		case !hadLedger:
+			aside := path + ".superseded"
+			if err := os.WriteFile(aside, cur, 0o644); err != nil {
+				return err
+			}
+			log.Printf("template %s: refreshed to the version shipped with this build; "+
+				"the previous file was kept at %s", t.Slug, filepath.Base(aside))
+
+		default:
+			// Edited on purpose. It wins, and the ledger keeps pointing at what
+			// the panel last wrote so a later edit-revert is still detectable.
+			next[t.Slug] = known[t.Slug]
+			continue
+		}
+
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			return err
+		}
+	}
+
+	b, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(ledgerPath, b, 0o600)
+}
+
 // LoadTemplates reads data/templates/*.json, seeding it from the built-in set
 // on first run so the directory is discoverable and editable.
 func LoadTemplates(dataDir string) error {
@@ -42,36 +133,22 @@ func LoadTemplates(dataDir string) error {
 		return err
 	}
 
+	if err := syncSeededTemplates(dir); err != nil {
+		return err
+	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return err
-	}
-	seeded := 0
-	for _, e := range ents {
-		if strings.HasSuffix(e.Name(), ".json") {
-			seeded++
-		}
-	}
-	if seeded == 0 {
-		for _, t := range tplBuiltin {
-			b, err := json.MarshalIndent(t, "", "  ")
-			if err != nil {
-				return err
-			}
-			if err := os.WriteFile(filepath.Join(dir, t.Slug+".json"), b, 0o644); err != nil {
-				return err
-			}
-		}
-		ents, err = os.ReadDir(dir)
-		if err != nil {
-			return err
-		}
 	}
 
 	var loaded []Template
 	var bad []string
 	for _, e := range ents {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+		// Dotfiles are the panel's own bookkeeping, not templates. The seed
+		// ledger is `.seeded.json` and would otherwise be read as a template
+		// with no slug, failing the whole load with a validation error about a
+		// file the operator never created.
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
