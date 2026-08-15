@@ -665,7 +665,7 @@ func (r *dockerRunner) Start(s *Server, emit func(Line)) error {
 
 // containerRunning reports whether this server's container is alive right now,
 // regardless of what the panel's persisted state claims.
-func containerRunning(id string) bool {
+var containerRunning = func(id string) bool {
 	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}",
 		containerPrefix+"-"+id).Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
@@ -762,7 +762,21 @@ func (r *dockerRunner) watchExit(ctx context.Context, s *Server, name string) {
 	out, err := exec.CommandContext(ctx, "docker", "wait", name).Output()
 	if err != nil {
 		if ctx.Err() != nil {
-			return // we tore it down ourselves; the kill is not a container failure
+			// We tore it down ourselves, so the kill is not a container
+			// failure - but "we cancelled" is not the same as "someone else
+			// will report this". Stop cancels immediately after `docker stop`
+			// returns, and that cancel kills this `docker wait` before it can
+			// print the exit code. Nothing else moves the server on, so it sat
+			// in "stopping" permanently: Start refuses it ("still stopping"),
+			// Kill returns 200 and changes nothing, and reconcile skips it
+			// because its container is not running. The only way out was a
+			// panel restart, which clears the status on load.
+			//
+			// If the container is gone, the server has stopped. Say so.
+			if !containerRunning(s.ID) {
+				r.mgr.processExited(s, nil)
+			}
+			return
 		}
 		r.mgr.processExited(s, err)
 		return

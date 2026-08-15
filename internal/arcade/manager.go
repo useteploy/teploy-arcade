@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -874,6 +875,29 @@ func (m *Manager) Send(id, cmd, mode, actor string) error {
 	// Echo the command into the stream attributed to whoever ran it. This is
 	// also what the audit log wants, so the actor travels with the command.
 	m.emit(s, Line{Level: "info", Source: "command", Text: fmt.Sprintf("%s > %s", actor, cmd)})
+
+	// A docker server answers over RCON, and that answer was being thrown away:
+	// the runner captured it and used it only to build an error message. So
+	// `list` on a real server echoed the command and printed nothing, while the
+	// same command against the simulator printed its reply - a difference an
+	// operator reads as a broken server, not as a missing feature.
+	//
+	// Only commands a person or a task ran. Internal quiescing calls
+	// (save-off/save-all around a backup) go direct to the runner and stay
+	// quiet, which is why this lives here rather than inside Send.
+	if dr, ok := m.runnerFor(s).(*dockerRunner); ok {
+		out, err := dr.query(s, line)
+		if err != nil {
+			return err
+		}
+		for _, l := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+			if strings.TrimSpace(l) == "" {
+				continue
+			}
+			m.emit(s, Line{Level: classify(l), Source: "server", Text: l})
+		}
+		return nil
+	}
 	return m.runnerFor(s).Send(s, line)
 }
 
