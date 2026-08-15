@@ -630,3 +630,40 @@ func TestPalworldPublishesBothUDPPorts(t *testing.T) {
 		t.Errorf("published a TCP port for a UDP-only game: %q", got)
 	}
 }
+
+// CS2 is the inverse of Palworld: it fits in memory on this host and the cost
+// is a ~30 GB download on first start. Its values came from the image's own
+// config over the registry API, so they are worth pinning.
+func TestCS2TemplateMatchesItsImage(t *testing.T) {
+	tpl := templateBySlug("cs2")
+	if tpl == nil {
+		t.Fatal("the cs2 template is missing")
+	}
+	s := &Server{
+		ID: "s1", Template: "cs2", Image: tpl.Image, Port: tpl.PortHint,
+		MemoryMB: tpl.MemoryMB, CPU: tpl.CPU, MaxPlayers: tpl.MaxPlayers,
+		Protocols: tpl.Protocols, ExtraPorts: tpl.ExtraPorts,
+		DataPath: tpl.DataPath, Env: tpl.Env, Console: tpl.Console,
+		Props: map[string]string{"motd": "friends only"},
+	}
+	got := strings.Join(dockerRunArgs(s, "gamepanel-s1", "/srv/cs2", "secret"), " ")
+
+	for _, want := range []string{
+		"-p 27015:27015/udp", "-p 27015:27015/tcp", // game and rcon
+		"-p 27020:27020/udp",                    // GOTV
+		"-v /srv/cs2:/home/steam/cs2-dedicated", // STEAMAPPDIR, not /data
+		"CS2_PORT=27015", "CS2_MAXPLAYERS=10", "CS2_SERVERNAME=friends only",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in: %s", want, got)
+		}
+	}
+	// RCON rides on a published port. Shipping the image's own "changeme" on it
+	// would be handing out a remote console to anyone who scans the host.
+	if strings.Contains(got, "changeme") {
+		t.Error("the image's default RCON password was shipped on a published port")
+	}
+	if !strings.Contains(got, "CS2_RCONPW=") {
+		t.Error("RCON password is not being set at all, so the image default applies")
+	}
+}

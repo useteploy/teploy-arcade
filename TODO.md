@@ -13,12 +13,12 @@ has not been.
 
 | | |
 |---|---|
-| **Panel** | v0.24.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
+| **Panel** | v0.25.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
 | **Reachable** | `192.168.1.85:3457`, plain HTTP on the LAN, auth enforced |
 | **Servers** | 8 migrated, 5 running: Velocity proxy + 4 Paper backends; 3 modpacks stopped |
 | **Templates exercised** | velocity, paper, forge, fabric, vanilla, spigot, purpur, terraria |
 | **Templates never run** | bedrock, rust, valheim — all three now publish UDP and know their own ready banner, none has been booted since |
-| **Templates** | 13 |
+| **Templates** | 14 |
 | **Tests** | 222 Go + a frontend guard, race-clean |
 | **Repo** | `Tyler/teploy-arcade` on Forgejo (`origin`) + `useteploy/teploy-arcade` on GitHub (`github`), both private |
 
@@ -274,7 +274,14 @@ and it costs nothing sitting stopped.
 
 ## 6. Testing gaps
 
-- [ ] **Three templates have never been run**: bedrock, rust, valheim. Vanilla,
+- [ ] **CS2's ready line is a guess.** Every other `ready_log` in this repo was
+      copied from a real boot; CS2's was not, because booting it downloads about
+      30 GB. If it is wrong the server runs correctly and the panel shows
+      "starting" forever - annoying rather than dangerous, and a one-line fix
+      the first time anybody boots one.
+- [ ] **Five templates have never been run**: bedrock, rust, valheim, palworld,
+      cs2. Palworld cannot be, on this host - it asks for 16 GB and the panel
+      correctly refuses it on 13. Rust and Valheim can now, the host is x86_64. Vanilla,
       spigot and purpur now pass end to end. The other three were exercised far
       enough to prove the panel could not have run them: Bedrock's only offered
       version 404s on Mojang's CDN, no template published UDP at all, and

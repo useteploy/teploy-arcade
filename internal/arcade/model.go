@@ -391,6 +391,40 @@ var templates = []Template{
 		Console: ConsoleNone,
 	},
 	{
+		Slug: "cs2", Name: "Counter-Strike 2", Game: "cs2", Group: "Other",
+		Mark: "vanilla", Description: "Light on memory, heavy on disk - the game itself is downloaded on first start, around 30 GB.",
+		Maturity: "preview", Image: "joedwards32/cs2", Versions: []string{"latest"},
+		// The opposite shape to Palworld: 4 GB is plenty, and the cost is the
+		// ~30 GB SteamCMD download the container performs on its first start.
+		// The image is small; the disk figure is for what it fetches.
+		MemoryMB: 4096, CPU: 2, DiskGB: 40, MaxPlayers: 10, PortHint: 27015,
+		// 27015 carries game traffic on UDP and RCON on TCP; 27020 is GOTV.
+		Protocols: []string{"udp", "tcp"}, ExtraPorts: []string{"27020/udp"},
+		// UNVERIFIED. Every other ready line in this file was copied from a real
+		// boot; this one has not been booted, because doing so downloads 30 GB.
+		// If it is wrong the server runs correctly and the panel shows
+		// "starting" forever - annoying, not dangerous, and a one-line fix once
+		// somebody boots it.
+		ReadyLog: "Connection to Steam servers successful",
+		DataPath: "/home/steam/cs2-dedicated",
+		Env: map[string]string{
+			"CS2_PORT":       "${PORT}",
+			"CS2_MAXPLAYERS": "${MAX_PLAYERS}",
+			"CS2_SERVERNAME": "${MOTD}",
+			// Empty rather than the image's own "changeme". RCON rides on a
+			// published port, so shipping a known password on it is worse than
+			// shipping no remote console at all - an empty password is how
+			// Source disables RCON. Set one here to turn it on deliberately.
+			"CS2_RCONPW": "",
+			// A Game Server Login Token from Steam, required for a server to be
+			// reachable from the internet rather than the LAN. Blank on purpose:
+			// it is per-account and cannot be defaulted.
+			"SRCDS_TOKEN": "",
+		},
+		// srcds takes commands over RCON, which this image has no client for.
+		Console: ConsoleNone,
+	},
+	{
 		Slug: "palworld", Name: "Palworld", Game: "palworld", Group: "Other",
 		Mark: "vanilla", Description: "Memory-hungry even when idle. Needs 16 GB to itself; the panel will refuse it on a smaller host.",
 		Maturity: "preview", Image: "thijsvanloef/palworld-server-docker", Versions: []string{"latest"},
