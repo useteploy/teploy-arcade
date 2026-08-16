@@ -85,8 +85,12 @@ type Server struct {
 	mu      sync.Mutex
 	proc    procHandle // whatever the runner needs to control this server
 	players []Player
-	cpuPct  float64
-	memMB   int
+	// While set, the panel is mid-query on this server's RCON and the console
+	// churn that produces is its own, not the operator's. Not persisted: it
+	// describes the next second, not the server.
+	quietRCONUntil time.Time
+	cpuPct         float64
+	memMB          int
 }
 
 type Player struct {

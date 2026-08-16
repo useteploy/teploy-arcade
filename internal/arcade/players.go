@@ -516,7 +516,15 @@ func (m *Manager) canAskWhoIsOnline(s *Server) bool {
 }
 
 // playerSyncInterval is how often the panel re-asks a game who is actually on.
-const playerSyncInterval = 60 * time.Second
+//
+// Five minutes, not one. The reconcile is a safety net now rather than the
+// primary source: joins and departures are read from `logged in with entity id`
+// and `lost connection:`, which the server writes itself and no plugin can
+// cancel. What is left for the net to catch is a line shed under backpressure
+// or one that fell outside a restart's replay window, and neither needs asking
+// every minute. Each ask costs an RCON connect, a command and a disconnect in
+// the operator's own log.
+const playerSyncInterval = 5 * time.Minute
 
 // playerSyncLoop keeps the sidebar honest for the consoles somebody is watching.
 //

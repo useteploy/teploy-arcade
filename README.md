@@ -7,6 +7,34 @@ long-running runtime, not part of the CLI (`PLAN.md` §9).
 Covers `PLAN.md` **phases 1-8** to varying depth — see "What is and isn't done"
 at the bottom, and the per-phase notes in `PLAN.md` itself.
 
+## Install
+
+A tagged release publishes a static binary for linux and darwin on amd64 and
+arm64, plus a container image. There is nothing to install alongside it: the
+frontend is embedded in the binary.
+
+```sh
+# binary - the supported path, see DEPLOY.md for the systemd unit
+curl -fsSLO https://github.com/useteploy/teploy-arcade/releases/latest/download/teploy-arcade_linux_amd64.tar.gz
+tar xzf teploy-arcade_linux_amd64.tar.gz
+sudo install -m 0755 teploy-arcade /usr/local/bin/teploy-arcade
+sudo install -d -m 0700 /var/teploy-arcade
+teploy-arcade -host 0.0.0.0 -port 3457 -data /var/teploy-arcade
+```
+
+It needs a Docker daemon on the same host to run anything real; without one it
+falls back to an in-process simulator so the panel is still usable. `DEPLOY.md`
+covers the unit file, the first admin account, the firewall and the container
+route.
+
+**Status: beta.** It runs a real 8-server network, and there are areas nobody
+has exercised — `TODO.md` is the honest list, kept current rather than
+aspirational. Bug reports against it are the point.
+
+## Licence
+
+MIT. See `LICENSE`.
+
 **The documents, and what each is for:**
 
 | | |

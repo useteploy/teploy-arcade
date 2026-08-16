@@ -1427,9 +1427,9 @@ function viewDashboard() {
 
     <div class="panelbox">
       <h3>Committed</h3>
-      <div class="row"><span class="k">CPU</span><span class="spacer"></span>
+      <div class="row"><span class="k">CPU</span>
         <span class="mono">${host ? host.cpu.allocated_vcpu : '-'} / ${host ? host.cpu.total_vcpu : '-'} vCPU</span></div>
-      <div class="row"><span class="k">Memory</span><span class="spacer"></span>
+      <div class="row"><span class="k">Memory</span>
         <span class="mono">${host ? (host.memory.allocated_mb / 1024).toFixed(1) : '-'} / ${host && capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) : '?'} GB</span></div>
       <div class="row"><span class="muted" style="font-size:12px">Every server's configured limit added up, running or not. Limits are caps rather than reservations, so exceeding the host is normal &mdash; it only matters if they all run at once.</span></div>
     </div>

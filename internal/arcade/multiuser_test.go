@@ -471,3 +471,51 @@ func TestPlayerSyncOnlyQueriesWatchedConsoles(t *testing.T) {
 		t.Fatalf("after the viewer left the room still reports %d", n)
 	}
 }
+
+// The panel's own RCON churn was appearing in the console it was showing the
+// operator. Reported from the deployed fleet: three lines a minute in Lobby's
+// console, describing the panel's own player query.
+func TestPanelRCONChurnIsNotShownToTheOperator(t *testing.T) {
+	thread := []string{
+		"[01:26:46 INFO]: Thread RCON Client /0:0:0:0:0:0:0:1 started",
+		"[01:26:46 INFO]: Thread RCON Client /0:0:0:0:0:0:0:1 shutting down",
+	}
+	for _, line := range thread {
+		if !rconThreadRe.MatchString(afterLogPrefix(line)) {
+			t.Errorf("transport churn was not recognised: %q", line)
+		}
+	}
+	// A real server line that merely mentions a thread must survive.
+	for _, keep := range []string{
+		"[01:26:46 INFO]: Starting minecraft server version 26.1.2",
+		"[01:26:46 INFO]: Steve_Example joined the game",
+		"[01:26:46 WARN]: Thread RCON Listener failed to bind",
+	} {
+		if rconThreadRe.MatchString(afterLogPrefix(keep)) {
+			t.Errorf("a real server line was treated as churn: %q", keep)
+		}
+	}
+
+	// The command echo is kept for an operator and dropped for the panel.
+	const echo = "[01:26:46 INFO]: [Essentials] Rcon issued server command: /list "
+	if !rconIssuedRe.MatchString(echo) {
+		t.Fatal("the command echo is no longer recognised")
+	}
+	s := &Server{}
+	if s.panelIsQuerying() {
+		t.Error("a server with no query in flight claims one")
+	}
+	s.mu.Lock()
+	s.quietRCONUntil = time.Now().Add(rconQuietWindow)
+	s.mu.Unlock()
+	if !s.panelIsQuerying() {
+		t.Error("a query in flight was not recognised")
+	}
+	// And the window closes.
+	s.mu.Lock()
+	s.quietRCONUntil = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	if s.panelIsQuerying() {
+		t.Error("an expired window still suppresses the operator's own echo")
+	}
+}

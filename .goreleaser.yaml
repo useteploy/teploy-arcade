@@ -24,7 +24,12 @@ builds:
 
 archives:
   - formats: [tar.gz]
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # No version in the file name, deliberately. GitHub only serves
+    # /releases/latest/download/<name> for an exact name, so embedding the
+    # version means the install line in README.md cannot be copied without
+    # editing it - and a first command that 404s is precisely the failure the
+    # unpublished ghcr image already made once.
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
   name_template: checksums.txt

@@ -115,8 +115,16 @@ docker run -d --name teploy-arcade \
   -p 3457:3457 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /var/teploy-arcade:/var/teploy-arcade \
-  ghcr.io/useteploy/teploy-arcade \
+  ghcr.io/useteploy/teploy-arcade:latest \
   -host 0.0.0.0 -port 3457 -data /var/teploy-arcade
+```
+
+The image is published by the release workflow on a `v*` tag, so it exists from
+the first tagged release onward and not before. Building it yourself is one
+command if you are ahead of a release:
+
+```sh
+docker build -t teploy-arcade --build-arg VERSION=dev .
 ```
 
 If the paths cannot match, pass `-data-host` with the host-side path so the

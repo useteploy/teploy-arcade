@@ -567,3 +567,57 @@ input.is-denied { pointer-events: none; }
    filter looks like a smudge; nearest-neighbour is what the game does. */
 .skin { position: relative; overflow: hidden; }
 .skin img { width: 100%; height: 100%; display: block; border-radius: inherit; image-rendering: pixelated; }
+
+/* Text inputs.
+ *
+ * `.inp` is applied 42 times across the views and was only ever styled inside
+ * `.field` and `.addbar`. Everywhere else - the retention box, the memory and
+ * CPU fields on a server's Settings page, the plugin URL, the task editor - it
+ * fell through to the browser default: a flat white box with 11px text, in the
+ * middle of a dark panel. It looked unfinished because it was unstyled, not
+ * because anyone chose that.
+ *
+ * This is the base every one of them should have had. The two contextual rules
+ * still win where they apply, so nothing that already looked right changes. */
+.inp {
+  height: 32px;
+  padding: 0 10px;
+  background: #2b2b2b;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--t-0);
+  font: inherit;
+  font-size: 13px;
+  line-height: 30px;
+  transition: border-color .12s ease, background .12s ease;
+}
+.inp::placeholder { color: var(--t-2); }
+.inp:hover:not(:disabled) { border-color: #4a4a4a; }
+.inp:focus,
+.inp:focus-visible {
+  outline: none;
+  background: #303030;
+  border-color: var(--lime);
+}
+.inp:disabled { opacity: .5; cursor: not-allowed; }
+/* A monospace field is usually a number or an identifier and reads better a
+   touch larger, since the digits are what the operator is checking. */
+.inp.mono { font-family: var(--mono); font-size: 13px; letter-spacing: .2px; }
+textarea.inp { height: auto; min-height: 96px; padding: 9px 10px; line-height: 1.5; resize: vertical; }
+select.inp { cursor: pointer; }
+
+/* Table gutters match the panel's.
+ *
+ * `.panelbox h3` and `.panelbox .row` both sit on a 15px gutter; `.dtable`
+ * cells were on 10px, so the Servers table did not line up with its own
+ * heading or with any other panel on the page. The server name looked further
+ * right still, because the game mark sits before it and the gap was doing the
+ * work of an indent nobody asked for. */
+.panelbox .dtable th:first-child,
+.panelbox .dtable td:first-child { padding-left: 15px; }
+.panelbox .dtable th:last-child,
+.panelbox .dtable td:last-child { padding-right: 15px; }
+.panelbox .dtable td:first-child .gm { margin-right: 7px; vertical-align: -2px; }
+/* The port sits under the name, so it lines up with the name and not with the
+   mark that precedes it. */
+.panelbox .dtable td:first-child > .muted.mono { margin-left: 21px; }

@@ -479,6 +479,32 @@ func classify(text string) string {
 // replaying before asking the game who is really on.
 const replaySettle = 3 * time.Second
 
+// RCON connection churn. Every query the panel makes - and every command an
+// operator types, since those go the same way - opens a connection, runs, and
+// closes, and the game logs all three steps:
+//
+//	Thread RCON Client /0:0:0:0:0:0:0:1 started
+//	[Essentials] Rcon issued server command: /list
+//	Thread RCON Client /0:0:0:0:0:0:0:1 shutting down
+//
+// The two thread lines describe the transport, never the server, and are noise
+// to whoever is reading the console no matter who caused them. They are dropped
+// from the stream. The middle line is kept when an operator typed the command -
+// that is the echo of their own action - and dropped when the panel asked on
+// its own behalf, which is what queryQuiet marks.
+// afterLogPrefix strips a "[HH:MM:SS INFO]: " style prefix so a pattern can be
+// anchored on what the server actually said.
+func afterLogPrefix(line string) string {
+	if i := strings.Index(line, "]: "); i >= 0 {
+		return strings.TrimSpace(line[i+3:])
+	}
+	return strings.TrimSpace(line)
+}
+
+var rconThreadRe = regexp.MustCompile(`^Thread RCON Client .* (started|shutting down)$`)
+
+var rconIssuedRe = regexp.MustCompile(`Rcon issued server command:`)
+
 var joinRe = regexp.MustCompile(`(\w{3,16}) (joined|left) the game`)
 
 // "X joined the game" is a chat broadcast, and a plugin can cancel it.
@@ -1199,6 +1225,17 @@ func (r *dockerRunner) stream(s *Server, stdout io.Reader, emit func(Line), alre
 	ready := alreadyReady
 	for sc.Scan() {
 		text := sc.Text()
+
+		// Transport churn is never worth showing. The middle line - the command
+		// echo - is kept when an operator typed it and dropped when the panel
+		// asked on its own behalf.
+		if body := afterLogPrefix(text); rconThreadRe.MatchString(body) {
+			continue
+		}
+		if rconIssuedRe.MatchString(text) && s.panelIsQuerying() {
+			continue
+		}
+
 		src := "server"
 		if m := joinRe.FindStringSubmatch(text); m != nil {
 			src = "player"
@@ -1335,11 +1372,30 @@ func (r *dockerRunner) query(s *Server, cmd string) (string, error) {
 	defer p.mu.Unlock()
 
 	name := containerPrefix + "-" + s.ID
+	// Mark the window before the exec, so the lines the game logs about this
+	// connection are attributed to the panel rather than shown to the operator
+	// as something that happened on their server.
+	s.mu.Lock()
+	s.quietRCONUntil = time.Now().Add(rconQuietWindow)
+	s.mu.Unlock()
 	out, err := exec.Command("docker", "exec", name, consoleTool(s.Image), cmd).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
+}
+
+// rconQuietWindow is how long after a panel-initiated query its own console
+// churn is suppressed. Generous relative to a local `docker exec`, and short
+// enough that an operator's own command a second later is still echoed.
+const rconQuietWindow = 3 * time.Second
+
+// panelIsQuerying reports whether the panel itself caused the RCON traffic
+// being logged right now.
+func (s *Server) panelIsQuerying() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Now().Before(s.quietRCONUntil)
 }
 
 // ------------------------------------------------------------------ helpers
