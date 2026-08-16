@@ -1315,25 +1315,9 @@ function viewTemplates() {
     <div class="panelbox">
       <h3>Registry</h3>
       <div class="row"><span class="k">Source</span><span class="muted">Loaded from <span class="mono">data/templates/*.json</span>. Drop a file in and restart to add a game &mdash; no code change.</span></div>
-      <div class="row"><span class="k">Remote registry</span><span class="muted">Not built. Templates are local files.</span></div>
     </div>
   </div>`);
 }
-
-// What the agent says it cannot do, rather than a list hand-maintained in the
-// UI. /api/capabilities exists precisely so a client can decide what to offer,
-// and the only client that ships was ignoring it - so this list could drift out
-// of step with the agent and nobody would notice.
-const CAP_LABELS = {
-  scheduled_backups: ['Scheduled backups', 'The scheduler can run <code>!backup</code> on a timer; there is no built-in schedule.'],
-  disk_quota: ['Disk quotas (hard)', 'No filesystem-level quota &mdash; ext4 inside an LXC has no project quotas. The panel shows usage against each allowance and refuses a create the disk cannot hold.'],
-  plugins: ['Plugin management', 'List, enable, disable, delete and install from a URL.'],
-  import: ['Import an existing server', 'Scan a directory and copy or adopt it.'],
-  files: ['File manager', 'Browse and edit files inside a server directory.'],
-  backups: ['Backups', 'Pause saves, flush, archive, resume.'],
-  metrics: ['Metrics', 'CPU, memory and player history.'],
-  audit: ['Audit log', 'Who did what.'],
-};
 
 // Disk used against the allowance the template gave the server. Nothing
 // enforces that allowance - ext4 inside an LXC has no project quotas - so this
@@ -1348,25 +1332,6 @@ function diskCell(s) {
   const over = s.disk_mb >= limitMB;
   return `<div class="bar bar-sm"><i class="${over || pct >= 90 ? 'warn' : ''}" style="width:${pct}%"></i></div>
     <span class="${over ? 'num' : 'muted'}" ${over ? 'style="color:var(--amber)"' : ''}>${fmtMB(s.disk_mb)} / ${s.disk_gb} GB</span>`;
-}
-
-function notBuiltRows() {
-  const caps = state.caps;
-  if (!caps) return '<div class="row muted">Asking the agent&hellip;</div>';
-
-  const off = Object.entries(caps)
-    .filter(([, on]) => !on)
-    .map(([k]) => CAP_LABELS[k] || [k, '']);
-
-  // Things the agent has no flag for, but which are still not built. Kept
-  // separate so it is obvious which list is authoritative.
-  const known = [
-    ['Plugin catalogue', 'Browse a plugin index &mdash; installing from a URL already works.'],
-  ];
-
-  return [...off, ...known]
-    .map(([k, d]) => `<div class="row"><span class="k">${esc(k)}</span><span class="muted">${d}</span></div>`)
-    .join('') || '<div class="row muted">Everything the agent advertises is built.</div>';
 }
 
 function viewDashboard() {
@@ -1434,10 +1399,6 @@ function viewDashboard() {
       <div class="row"><span class="muted" style="font-size:12px">Every server's configured limit added up, running or not. Limits are caps rather than reservations, so exceeding the host is normal &mdash; it only matters if they all run at once.</span></div>
     </div>
 
-    <div class="panelbox">
-      <h3>Not built yet</h3>
-      ${notBuiltRows()}
-    </div>
   </div>`);
 }
 
@@ -1634,14 +1595,6 @@ async function boot() {
   try {
     state.me = await api('/api/me');
   } catch { state.me = null; }
-
-  // Needs a session (RoleViewer), so this fails for an unauthenticated boot -
-  // which is fine, because the dashboard that renders it is behind sign-in too.
-  // Caught rather than awaited-and-thrown so a capabilities outage never blocks
-  // the panel loading.
-  try {
-    state.caps = (await api('/api/capabilities')).features;
-  } catch { state.caps = null; }
 
   // An unclaimed panel has exactly one thing to do. Show that instead of an
   // empty server list with the real task buried in Settings.

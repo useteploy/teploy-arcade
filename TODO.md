@@ -13,7 +13,7 @@ has not been.
 
 | | |
 |---|---|
-| **Panel** | v0.30.1, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
+| **Panel** | v0.31.0, systemd unit on a Debian 13 LXC, 13 GB / 4 vCPU / 100 GB |
 | **Reachable** | `192.168.1.85:3457`, plain HTTP on the LAN, auth enforced |
 | **Servers** | 8 migrated, 5 running: Velocity proxy + 4 Paper backends; 3 modpacks stopped |
 | **Templates exercised** | velocity, paper, forge, fabric, vanilla, spigot, purpur, terraria, bedrock |

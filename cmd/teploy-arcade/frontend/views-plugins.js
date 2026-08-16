@@ -30,9 +30,9 @@ async function viewPlugins(id) {
           <div class="row"><span class="k">From a URL</span><span class="muted">Paste a direct link to a
             <span class="mono">.jar</span> in the bar below. The download is capped, must be http or https,
             and must actually be a jar.</span></div>
-          <div class="row"><span class="k">No catalogue browser</span><span class="muted">Browsing Modrinth or
-            Spigot from here is not built: it is a network dependency the panel does not otherwise have, and
-            redistributing someone else's index is a licensing question this project has not answered.</span></div>
+          <div class="row"><span class="k">Finding a plugin</span><span class="muted">Copy the download link
+            from Modrinth, Hangar or SpigotMC and paste it below. The panel does not proxy those
+            indexes, so the link you use is the one the author published.</span></div>
           <div class="row"><span class="k">Uploading a file</span><span class="muted">Use the Files tab -
             it writes into the same directory.</span></div>
         </div>

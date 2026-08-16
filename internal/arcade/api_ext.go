@@ -527,8 +527,12 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// capabilities tells a client what this build can actually do, so the UI and
-// any MCP consumer stop guessing. Mirrors teploy-dash's /api/capabilities.
+// capabilities tells a client what this build can actually do, so teploy, an
+// MCP consumer or anything else driving this panel stops guessing. Mirrors
+// teploy-dash's /api/capabilities and is part of the service contract rather
+// than a convenience for the bundled UI - which no longer reads it, because
+// rendering a list of what is absent onto an operator's own dashboard was an
+// audit of the project wearing the clothes of a feature.
 func (a *API) capabilities(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"version":  agentVersion,
