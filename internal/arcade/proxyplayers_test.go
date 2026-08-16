@@ -11,7 +11,8 @@ import "testing"
 // operator watches to see who is on - so the one server that should always
 // know was the one that never did.
 //
-// The lines below are copied from the deployed Velocity's own log.
+// The lines below are copied from the deployed Velocity's own log, with the
+// player name replaced - the shapes are exact, the identity is not real.
 func TestProxyConnectLinesTrackPlayers(t *testing.T) {
 	cases := []struct {
 		line    string
@@ -101,7 +102,8 @@ func TestTrackPlayerAddsAndRemoves(t *testing.T) {
 // The Lobby on the deployed network never prints "joined the game" - a plugin
 // cancels the broadcast - so the panel saw people leave a world it had never
 // seen them enter, and the sidebar stayed empty for a player who was standing
-// in it. These lines are copied from that server's own log.
+// in it. These lines are copied from that server's own log, with the player
+// name replaced.
 func TestServerAuthoredLinesTrackPlayers(t *testing.T) {
 	const login = `[03:18:06 INFO]: Steve_Example[/192.168.1.160:46714] logged in with entity id 9 at ([minecraft:overworld]8.46, 3.0, 2.94)`
 	const lost = `[03:41:11 INFO]: Steve_Example lost connection: Disconnected`
