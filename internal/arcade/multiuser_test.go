@@ -439,3 +439,35 @@ func TestReadyWatchdogLeavesADeadContainerAlone(t *testing.T) {
 		t.Errorf("a dead container was reported as %q", s.State())
 	}
 }
+
+// The reconcile ticker used to query every running server whether or not anyone
+// was looking. Each query opens an RCON connection, runs /list and closes it,
+// and the game logs all three - so an idle panel wrote three lines a minute
+// into every Paper server's own log, forever, describing nothing the operator
+// did. Reported from the deployed fleet.
+func TestPlayerSyncOnlyQueriesWatchedConsoles(t *testing.T) {
+	mgr := NewManager(t.TempDir(), NewHub())
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	s := mgr.List()[0]
+
+	// Nobody is watching: the loop must skip it before it ever reaches the
+	// runner, which is what stops the RCON connection being opened at all.
+	if n := mgr.hub.Viewers(s.ID); n != 0 {
+		t.Fatalf("a fresh room already has %d viewers", n)
+	}
+
+	// A viewer arrives.
+	c := NewConn(8)
+	mgr.hub.Join(s.ID, c)
+	if n := mgr.hub.Viewers(s.ID); n != 1 {
+		t.Fatalf("after one viewer joined the room reports %d", n)
+	}
+
+	// And leaves again.
+	mgr.hub.Leave(s.ID, c)
+	if n := mgr.hub.Viewers(s.ID); n != 0 {
+		t.Fatalf("after the viewer left the room still reports %d", n)
+	}
+}

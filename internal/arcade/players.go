@@ -515,12 +515,10 @@ func (m *Manager) canAskWhoIsOnline(s *Server) bool {
 	return game != "proxy" && status == StatusRunning && mode == ConsoleRCON && hasRCON(image)
 }
 
-// playerSyncInterval is how often the panel re-asks every running game who is
-// actually on. Long enough that it is not a load, short enough that a sidebar
-// is never wrong for a whole session.
+// playerSyncInterval is how often the panel re-asks a game who is actually on.
 const playerSyncInterval = 60 * time.Second
 
-// playerSyncLoop keeps the sidebar honest.
+// playerSyncLoop keeps the sidebar honest for the consoles somebody is watching.
 //
 // Console parsing is the fast path and the only one a proxy has, but it is a
 // stream of announcements, and an announcement can be missed: a plugin can
@@ -529,14 +527,28 @@ const playerSyncInterval = 60 * time.Second
 // quietly wrong, with nothing to indicate it - which is the failure an operator
 // reports as "the panel does not see my players".
 //
-// So the announcements stay, and once a minute the game itself gets the last
-// word.
+// Gated on there being a viewer, which the first version was not, and that was
+// a mistake with a visible cost. Every RCON query opens a connection, runs the
+// command and closes, and the game logs all three - so a panel nobody was
+// looking at wrote this into every Paper server's log, once a minute, forever:
+//
+//	Thread RCON Client /0:0:0:0:0:0:0:1 started
+//	[Essentials] Rcon issued server command: /list
+//	Thread RCON Client /0:0:0:0:0:0:0:1 shutting down
+//
+// Three lines a minute per server, in the operator's own log file, describing
+// nothing they did. The player list only matters while somebody is reading it,
+// so that is when it is worth asking - an idle panel now produces no RCON
+// traffic at all, and a watched console is corrected exactly as before.
 func (m *Manager) playerSyncLoop() {
 	defer recoverPanic("player sync")
 	t := time.NewTicker(playerSyncInterval)
 	defer t.Stop()
 	for range t.C {
 		for _, s := range m.List() {
+			if m.hub.Viewers(s.ID) == 0 {
+				continue
+			}
 			m.reconcilePlayers(s)
 		}
 	}
