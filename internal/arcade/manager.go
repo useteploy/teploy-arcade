@@ -616,6 +616,26 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	}
 
 	s := m.newServer(name, t, version, port, runtime)
+	// A template's CPU figure is the panel's own suggestion, not the operator's
+	// request, and every template ships one sized for a normal host. On a small
+	// one - a 2-core VPS, which is a completely ordinary place to self-host this
+	// - most of them exceed it, and docker refuses a --cpus above the core count
+	// outright: "Range of CPUs is from 0.01 to 2.00, as there are only 2 CPUs
+	// available". So the default would have produced a server that could not
+	// start, on the machines least able to diagnose it.
+	//
+	// Capped rather than refused, and only when it came from the template.
+	// checkServerLimits refuses rather than clamps on purpose - silently
+	// substituting a limit an operator did not ask for is how they end up
+	// debugging a server running on numbers the panel never showed them - but
+	// that rule is about *their* number. Overruling our own suggestion to fit
+	// their machine is not the same act, and a lower CPU quota costs speed
+	// rather than correctness, which is why memory is still refused instead.
+	if cpu == 0 && hostCPUs > 0 && s.CPU > hostCPUs {
+		log.Printf("%s: template %s suggests %g cores and this host has %g; using %g",
+			name, t.Slug, s.CPU, hostCPUs, hostCPUs)
+		s.CPU = hostCPUs
+	}
 	if memMB > 0 {
 		s.MemoryMB = memMB
 	}

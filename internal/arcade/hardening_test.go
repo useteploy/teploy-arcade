@@ -608,9 +608,12 @@ func TestPalworldIsRefusedOnASmallHost(t *testing.T) {
 		t.Errorf("the refusal does not say what the host actually has: %v", err)
 	}
 
-	// And on a host that can hold it, nothing stands in the way.
+	// And on a host that can hold it, nothing stands in the way. CPU comes from
+	// the template rather than being asserted, because the runner this executes
+	// on may have fewer cores than Palworld's suggestion - which is the case the
+	// cap in Create exists for.
 	hostMemMB = 32768
-	if _, err := mgr.Create("pals2", "palworld", "latest", 0, tpl.MemoryMB, tpl.CPU, RuntimeSim); err != nil {
+	if _, err := mgr.Create("pals2", "palworld", "latest", 0, tpl.MemoryMB, 0, RuntimeSim); err != nil {
 		t.Fatalf("refused on a host with room: %v", err)
 	}
 }
@@ -745,5 +748,46 @@ func TestBedrockGivesItsIPv6ListenerItsOwnPort(t *testing.T) {
 		MemoryMB: 2048, CPU: 2, MaxPlayers: 20, Props: map[string]string{}}
 	if j := strings.Join(dockerRunArgs(java, "n", "/srv", "x"), " "); strings.Contains(j, "SERVER_PORT_V6") {
 		t.Errorf("a Java server was given Bedrock's IPv6 env: %s", j)
+	}
+}
+
+// CI runs on a 2-core runner and found this: every template ships a CPU figure
+// sized for a normal host, docker refuses a --cpus above the core count
+// outright, and the template default is the number a new operator gets by
+// pressing Create. On a small VPS - an entirely ordinary place to self-host -
+// most templates produced a server that could not start.
+func TestTemplateCPUIsCappedToTheHostButAnExplicitRequestIsNot(t *testing.T) {
+	mgr := NewManager(t.TempDir(), NewHub())
+	if err := mgr.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	prev := hostCPUs
+	hostCPUs = 2
+	defer func() { hostCPUs = prev }()
+
+	// forge suggests 2 cores, palworld 4; both must be creatable on a 2-core
+	// host when the operator takes the default.
+	s, err := mgr.Create("capped", "palworld", "latest", 0, 1024, 0, RuntimeSim)
+	if err != nil {
+		t.Fatalf("a template default was refused on a small host: %v", err)
+	}
+	if s.CPU != 2 {
+		t.Errorf("template CPU was not capped to the host: %g", s.CPU)
+	}
+
+	// An explicit request for more than the machine has is still refused -
+	// clamping somebody else's number silently is how they end up debugging a
+	// server running on limits the panel never showed them.
+	if _, err := mgr.Create("explicit", "paper", "1.20.4", 0, 1024, 8, RuntimeSim); err == nil {
+		t.Error("an explicit 8-core request was accepted on a 2-core host")
+	}
+
+	// And a request that fits is untouched.
+	s2, err := mgr.Create("fits", "paper", "1.20.4", 0, 1024, 1.5, RuntimeSim)
+	if err != nil {
+		t.Fatalf("a request that fits was refused: %v", err)
+	}
+	if s2.CPU != 1.5 {
+		t.Errorf("an explicit request was altered: %g", s2.CPU)
 	}
 }

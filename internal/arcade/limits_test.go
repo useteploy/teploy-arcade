@@ -122,10 +122,17 @@ func TestServerResourcesCanBeChangedAfterCreation(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	if _, err := mgr.SetResources(s, 6144, 4); err != nil {
+	// Derived from the host rather than hardcoded: CI runs on two vCPU, and a
+	// literal 4 here asserted something about the machine instead of about the
+	// panel.
+	wantCPU := 4.0
+	if hostCPUs > 0 && wantCPU > hostCPUs {
+		wantCPU = hostCPUs
+	}
+	if _, err := mgr.SetResources(s, 6144, wantCPU); err != nil {
 		t.Fatalf("set resources: %v", err)
 	}
-	if s.MemoryMB != 6144 || s.CPU != 4 {
+	if s.MemoryMB != 6144 || s.CPU != wantCPU {
 		t.Errorf("resources not applied: mem=%d cpu=%v", s.MemoryMB, s.CPU)
 	}
 
