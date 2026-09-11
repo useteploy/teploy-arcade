@@ -168,13 +168,27 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 			}
 			defer m.unlockBackup(src.ID)
 			m.panelLine(src, "info", "Cloning - pausing world saves and flushing to disk.")
-			_ = m.runnerFor(src).Send(src, "save-off")
-			_ = m.runnerFor(src).Send(src, "save-all flush")
-			time.Sleep(1500 * time.Millisecond)
+			runner := m.runnerFor(src)
+			// A quiesce command that cannot be delivered means the source's
+			// saves cannot be paused or flushed, and the copy would read
+			// region files mid-write - a clone that boots on a torn world.
+			// Abort instead; no bytes have been copied yet, so there is
+			// nothing to clean up but the claim and the lock.
+			if err := runner.Send(src, "save-off"); err != nil {
+				m.releasePort(port)
+				job.fail(fmt.Errorf("could not pause world saves on %s: %v", src.Name, err))
+				return
+			}
 			defer func() {
-				_ = m.runnerFor(src).Send(src, "save-on")
+				_ = runner.Send(src, "save-on")
 				m.panelLine(src, "info", "Clone finished - world saves resumed.")
 			}()
+			if err := runner.Send(src, "save-all flush"); err != nil {
+				m.releasePort(port)
+				job.fail(fmt.Errorf("could not flush %s's world to disk, so the clone was aborted rather than copy a torn world: %v", src.Name, err))
+				return
+			}
+			time.Sleep(1500 * time.Millisecond)
 		}
 
 		if err := copyTreeFiltered(srcDir, dst, job, cloneSkip); err != nil {

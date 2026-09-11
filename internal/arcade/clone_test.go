@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,4 +235,56 @@ func TestCloneFailsWhenTheServerListCannotBeSaved(t *testing.T) {
 		t.Error("a clone the panel cannot persist was left registered")
 	}
 	portReleasedOnceFailed(t, mgr, 25599)
+}
+
+// quiesceFaultRunner refuses the console commands named in fail, which is
+// what a dead RCON connection looks like to the clone path.
+type quiesceFaultRunner struct{ fail map[string]bool }
+
+func (r *quiesceFaultRunner) Start(s *Server, emit func(Line)) error { return nil }
+func (r *quiesceFaultRunner) Stop(s *Server) error                   { return nil }
+func (r *quiesceFaultRunner) Kill(s *Server) error                   { return nil }
+func (r *quiesceFaultRunner) Send(s *Server, cmd string) error {
+	if r.fail[cmd] {
+		return fmt.Errorf("rcon connection refused")
+	}
+	return nil
+}
+
+// A running source whose saves cannot be paused or flushed must not be
+// copied: the copy reads region files mid-write and the clone boots on a
+// torn world that looks like corruption in the copy.
+func TestCloneAbortsWhenTheSourceCannotBeQuiesced(t *testing.T) {
+	for _, tc := range []struct{ name, cmd, want string }{
+		{"save-off refused", "save-off", "pause world saves"},
+		{"save-all flush refused", "save-all flush", "flush"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, src := cloneFixture(t)
+			mgr.sim = &quiesceFaultRunner{fail: map[string]bool{tc.cmd: true}}
+			src.mu.Lock()
+			src.Status = StatusRunning
+			src.mu.Unlock()
+
+			before := len(mgr.List())
+			job, err := mgr.StartClone(CloneRequest{Source: src.ID, Port: 25599}, "tester")
+			if err != nil {
+				t.Fatalf("clone: %v", err)
+			}
+			done := waitForJob(t, job.ID)
+			if done.State != "failed" {
+				t.Fatalf("a clone of a source that cannot be quiesced reported %q", done.State)
+			}
+			if !strings.Contains(done.Error, tc.want) {
+				t.Errorf("the failure does not explain the refused %q: %s", tc.cmd, done.Error)
+			}
+			// The backup lock is released by a defer that races this
+			// assertion, so it is waited on rather than assumed.
+			waitFor(t, 3*time.Second, func() bool { return !mgr.backupLocked(src.ID) })
+			portReleasedOnceFailed(t, mgr, 25599)
+			if len(mgr.List()) != before {
+				t.Error("a clone was registered from a source that could not be quiesced")
+			}
+		})
+	}
 }
