@@ -3,7 +3,6 @@ package arcade
 import (
 	"fmt"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -191,19 +190,41 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		// as. Without this a clone starts once and dies on server.properties.
 		chownTreeLike(dst, srcDir)
 
+		// The copied server.properties still carries the source's port. Left
+		// alone the panel and the game disagree, and the game wins. Written
+		// and checked BEFORE the clone is registered: a clone whose
+		// properties could not be written must not be exposed as a
+		// configured server, because the panel and the game would disagree
+		// about its port from the first boot.
+		if err := m.writeProps(s); err != nil {
+			m.releasePort(port)
+			job.fail(fmt.Errorf("copied the files but could not write the clone's server.properties: %v", err))
+			return
+		}
+
 		m.mu.Lock()
 		m.servers[s.ID] = s
 		m.order = append(m.order, s.ID)
 		delete(m.reservedPorts, s.Port)
 		m.mu.Unlock()
 
+		// Registered, but not exposed until it survives persistence: a clone
+		// Save cannot record exists only in memory and vanishes on the next
+		// restart, so the registration is rolled back and the job fails
+		// rather than reporting a success the panel cannot keep.
 		if err := m.Save(); err != nil {
-			log.Printf("cloned %s but could not persist the server list: %v", s.Name, err)
-		}
-		// The copied server.properties still carries the source's port. Left
-		// alone the panel and the game disagree, and the game wins.
-		if err := m.writeProps(s); err != nil {
-			log.Printf("cloned %s but could not write server.properties: %v", s.Name, err)
+			m.mu.Lock()
+			delete(m.servers, s.ID)
+			for i, id := range m.order {
+				if id == s.ID {
+					m.order = append(m.order[:i], m.order[i+1:]...)
+					break
+				}
+			}
+			m.mu.Unlock()
+			m.releasePort(port)
+			job.fail(fmt.Errorf("copied the files but could not persist the server list: %v", err))
+			return
 		}
 
 		m.audit(actor, "server.clone", s.ID, fmt.Sprintf("%s from %s (%s)",

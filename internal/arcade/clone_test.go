@@ -3,6 +3,7 @@ package arcade
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -155,4 +156,82 @@ func TestCloneRefusesAnUnknownSource(t *testing.T) {
 	if _, err := mgr.StartClone(CloneRequest{Source: "nope"}, "tester"); err == nil {
 		t.Fatal("cloning a server that does not exist was allowed")
 	}
+}
+
+// portReleasedOnceFailed polls until the port a failed clone claimed is free
+// again. releasePort runs before job.fail, but the deferred unlockBackup races
+// the poll by design, so both are waited on rather than assumed.
+func portReleasedOnceFailed(t *testing.T, mgr *Manager, port int) {
+	t.Helper()
+	waitFor(t, 3*time.Second, func() bool {
+		mgr.mu.Lock()
+		_, held := mgr.reservedPorts[port]
+		mgr.mu.Unlock()
+		return !held
+	})
+}
+
+// A clone whose server.properties cannot be written must not be exposed. The
+// copied file still carries the source's port, so a "successful" job here
+// hands the operator a panel and a game that disagree about where to connect.
+func TestCloneFailsWhenServerPropertiesCannotBeWritten(t *testing.T) {
+	mgr, src := cloneFixture(t)
+	// The copy lands a directory where server.properties must go, so the
+	// panel's atomic write fails the way an unwritable disk would.
+	dir, err := mgr.ensureServerDir(src)
+	if err != nil {
+		t.Fatalf("server dir: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "server.properties")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "server.properties"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	before := len(mgr.List())
+	job, err := mgr.StartClone(CloneRequest{Source: src.ID, Port: 25599}, "tester")
+	if err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	done := waitForJob(t, job.ID)
+	if done.State != "failed" {
+		t.Fatalf("a clone with unwritable properties reported %q", done.State)
+	}
+	if !strings.Contains(done.Error, "server.properties") {
+		t.Errorf("the failure does not name the file: %s", done.Error)
+	}
+	if len(mgr.List()) != before {
+		t.Error("a clone whose properties could not be written was registered")
+	}
+	portReleasedOnceFailed(t, mgr, 25599)
+}
+
+// A clone the panel cannot persist exists only in memory; reporting it as
+// done would be a success that vanishes on the next restart.
+func TestCloneFailsWhenTheServerListCannotBeSaved(t *testing.T) {
+	mgr, src := cloneFixture(t)
+	// servers.json lives in the data dir; making that unwritable is what a
+	// full or read-only system disk looks like to Save().
+	if err := os.Chmod(mgr.dataDir, 0o500); err != nil {
+		t.Skipf("cannot chmod in this environment: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(mgr.dataDir, 0o755) })
+
+	before := len(mgr.List())
+	job, err := mgr.StartClone(CloneRequest{Source: src.ID, Port: 25599}, "tester")
+	if err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+	done := waitForJob(t, job.ID)
+	if done.State != "failed" {
+		t.Fatalf("a clone Save could not record reported %q", done.State)
+	}
+	if !strings.Contains(done.Error, "server list") {
+		t.Errorf("the failure does not name the server list: %s", done.Error)
+	}
+	if len(mgr.List()) != before {
+		t.Error("a clone the panel cannot persist was left registered")
+	}
+	portReleasedOnceFailed(t, mgr, 25599)
 }
