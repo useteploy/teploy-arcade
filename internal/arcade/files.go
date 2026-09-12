@@ -349,6 +349,12 @@ func (m *Manager) ReadFile(s *Server, rel string) (string, error) {
 }
 
 func (m *Manager) WriteFile(s *Server, rel, content string) error {
+	// Shared hold on the filesystem gate from before the backup check through
+	// the completed write: the check alone was check-then-act, and a backup
+	// could open its archive window between the check and the rename.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
 		return err
@@ -389,6 +395,9 @@ func (m *Manager) StatRel(s *Server, rel string) (os.FileInfo, error) {
 }
 
 func (m *Manager) DeletePath(s *Server, rel string) error {
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
 		return err
@@ -404,6 +413,12 @@ func (m *Manager) DeletePath(s *Server, rel string) error {
 }
 
 func (m *Manager) MkDir(s *Server, rel string) error {
+	// The file API's other mutations refuse writes during a backup window;
+	// mkdir used to skip the check entirely, so a directory could appear
+	// under the archiver's feet mid-walk.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
 		return err
@@ -443,6 +458,11 @@ func (m *Manager) OpenForDownload(s *Server, rel string) (io.ReadCloser, string,
 
 // writeProps materialises server.properties from the panel's model.
 func (m *Manager) writeProps(s *Server) error {
+	// A mutation of the server tree like any other: held shared on the
+	// filesystem gate so it cannot land inside a backup's archive window.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	r, err := m.serverRoot(s)
 	if err != nil {
 		return err

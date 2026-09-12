@@ -85,6 +85,12 @@ type Server struct {
 	mu      sync.Mutex
 	proc    procHandle // whatever the runner needs to control this server
 	players []Player
+	// fsMu gates the server's filesystem window: backups and restores hold it
+	// exclusively for their whole archive/swap, file and plugin mutations hold
+	// it shared. The backup-state lock alone was check-then-act - a write could
+	// pass its check and land mid-archive - so this is the lock that actually
+	// enforces the invariant the checks only report.
+	fsMu sync.RWMutex
 	// While set, the panel is mid-query on this server's RCON and the console
 	// churn that produces is its own, not the operator's. Not persisted: it
 	// describes the next second, not the server.
@@ -123,11 +129,28 @@ func (s *Server) State() string {
 	return s.Status
 }
 
-func (s *Server) MOTD() string {
+// motdLocked is MOTD for callers already holding s.mu - Snapshot is one, and
+// locking recursively would deadlock.
+func (s *Server) motdLocked() string {
 	if v, ok := s.Props["motd"]; ok {
 		return v
 	}
 	return "A Minecraft Server"
+}
+
+// MOTD and Prop are the locked readers for the props map. reloadProps and
+// ApplySettings write it under s.mu; an unlocked read is a fatal concurrent
+// map read/write, not a recoverable one.
+func (s *Server) MOTD() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.motdLocked()
+}
+
+func (s *Server) Prop(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Props[key]
 }
 
 // Snapshot copies the mutable bits under lock for JSON encoding.
@@ -194,7 +217,7 @@ func (s *Server) Snapshot() map[string]any {
 		// command and report that it could not be delivered.
 		"console":         consoleMode(s),
 		"address":         map[string]any{"host": hostAddr, "port": s.Port},
-		"motd":            s.MOTD(),
+		"motd":            s.motdLocked(),
 		"last_exit":       lastExit,
 		"pending_restart": s.PendingRestart,
 		"created_at":      s.CreatedAt,

@@ -132,8 +132,53 @@ func (m *Manager) ListBackups(s *Server) ([]Backup, error) {
 	return out, nil
 }
 
+// quiesceForBackup pauses world saves on a running server so an archive cannot
+// catch a half-written chunk, and returns the func that resumes them.
+//
+// Every command must succeed: the old shape discarded both errors, slept, and
+// archived anyway - so an RCON hiccup or a still-starting server produced a
+// "successful quiesced backup" of a world being written under it. Clone
+// already treats an undeliverable quiesce as fatal; backup is now consistent
+// with it. Only Minecraft's save commands have known semantics here, so for
+// every other game a live backup is refused rather than guessed at.
+func (m *Manager) quiesceForBackup(s *Server) (func(), error) {
+	if s.State() != StatusRunning {
+		return func() {}, nil
+	}
+	if s.Game != "minecraft-java" {
+		return nil, fmt.Errorf(
+			"live backups are not quiesce-safe for %s; stop the server before backing it up", s.Game)
+	}
+
+	r := m.runnerFor(s)
+	if err := r.Send(s, "save-off"); err != nil {
+		return nil, fmt.Errorf("could not pause world saves, backup aborted (the world is untouched): %w", err)
+	}
+	resume := func() {
+		if err := r.Send(s, "save-on"); err != nil {
+			log.Printf("%s: could not resume world saves after backup: %v", s.Name, err)
+			m.panelLine(s, "warn", "Backup finished, but world saves could not be resumed - run save-on if the server stays slow.")
+		}
+	}
+	if err := r.Send(s, "save-all flush"); err != nil {
+		resume()
+		return nil, fmt.Errorf("could not flush the world, backup aborted (the world is untouched): %w", err)
+	}
+	// Give the game a moment to actually flush before we read the tree.
+	time.Sleep(1500 * time.Millisecond)
+	return resume, nil
+}
+
 // CreateBackup runs the full quiesce -> archive -> resume cycle.
 func (m *Manager) CreateBackup(s *Server, note, actor string) (*Backup, error) {
+	// The whole archive window is exclusive on the server's filesystem gate:
+	// file and plugin mutations hold it shared from before their backup-state
+	// check through their completed write, so nothing can pass the check and
+	// land mid-archive. The backupState lock below still provides the friendly
+	// "already running" error; this one provides the invariant.
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
+
 	if !m.lockBackup(s.ID) {
 		return nil, fmt.Errorf("a backup is already running for this server")
 	}
@@ -173,20 +218,21 @@ func (m *Manager) CreateBackup(s *Server, note, actor string) (*Backup, error) {
 	}
 
 	wasRunning := s.State() == StatusRunning
-
 	if wasRunning {
 		m.panelLine(s, "info", "Backup starting - pausing world saves and flushing to disk.")
-		_ = m.runnerFor(s).Send(s, "save-off")
-		_ = m.runnerFor(s).Send(s, "save-all flush")
-		// Give the game a moment to actually flush before we read the tree.
-		time.Sleep(1500 * time.Millisecond)
 	}
-
+	resume, err := m.quiesceForBackup(s)
+	if err != nil {
+		if wasRunning {
+			m.panelLine(s, "error", "Backup aborted: "+err.Error())
+		}
+		return nil, err
+	}
 	// Resume saves no matter how the archive goes - a server left with
 	// save-off is a far worse outcome than a failed backup.
 	defer func() {
 		if wasRunning {
-			_ = m.runnerFor(s).Send(s, "save-on")
+			resume()
 			m.panelLine(s, "info", "Backup finished - world saves resumed.")
 		}
 	}()
@@ -301,6 +347,11 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	if st := s.State(); st != StatusStopped && st != StatusFailed {
 		return fmt.Errorf("stop the server before restoring a backup")
 	}
+	// Same filesystem gate as CreateBackup: the swap of the live tree is
+	// exclusive against file and plugin mutations.
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
+
 	if !m.lockBackup(s.ID) {
 		return fmt.Errorf("a backup is already running for this server")
 	}
@@ -348,11 +399,18 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	//
 	// Staging keeps the old guarantee (nothing is touched until the archive has
 	// fully extracted) without ever unlinking the target directory.
-	staging, err := os.MkdirTemp(m.dataDir, "restore-")
+	//
+	// It is created INSIDE the target directory, not under the panel's data
+	// dir: an adopted-in-place server's tree can live on another filesystem,
+	// and every rename below crosses between the target and the staging area -
+	// a staging dir on the panel's own volume made restore fail with EXDEV on
+	// the very first entry for exactly that layout.
+	staging, err := os.MkdirTemp(dir, ".arcade-restore-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(staging)
+	stagingName := filepath.Base(staging)
 
 	if err := untarGz(archive, staging); err != nil {
 		return fmt.Errorf("restore failed, the live world was not touched: %w", err)
@@ -367,6 +425,9 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		return err
 	}
 	for _, e := range entries {
+		if e.Name() == stagingName {
+			continue
+		}
 		if err := os.Rename(filepath.Join(dir, e.Name()), filepath.Join(held, e.Name())); err != nil {
 			// Put back whatever moved, so a partial failure is not a wipe.
 			restoreHeld(held, dir)
@@ -374,9 +435,16 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		}
 	}
 
+	// Installed entries are tracked so a failure part way through the install
+	// removes them before the held entries go back: restoring an old file over
+	// a just-installed new one fails with the destination already occupied
+	// (directories cannot be renamed over at all), which used to leave a mixed
+	// old/new world behind an error message claiming the previous world was
+	// put back.
+	var installed []string
 	staged, err := os.ReadDir(staging)
 	if err != nil {
-		restoreHeld(held, dir)
+		rollbackRestore(installed, held, dir)
 		return err
 	}
 	for _, e := range staged {
@@ -384,9 +452,10 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 			continue
 		}
 		if err := os.Rename(filepath.Join(staging, e.Name()), filepath.Join(dir, e.Name())); err != nil {
-			restoreHeld(held, dir)
+			rollbackRestore(installed, held, dir)
 			return fmt.Errorf("restore failed part way, the previous world was put back: %w", err)
 		}
+		installed = append(installed, e.Name())
 	}
 
 	// Extracted by root into staging and moved in, so every restored file is
@@ -673,6 +742,17 @@ func untarGzLimited(archive, dst string, lim restoreLimits) error {
 			// symlinks and devices are deliberately not restored
 		}
 	}
+}
+
+// rollbackRestore undoes a half-installed restore: the newly-installed entries
+// are removed first so restoreHeld's renames back into place cannot collide
+// with them. Best effort, like restoreHeld - the alternative to a partial
+// recovery is none at all.
+func rollbackRestore(installed []string, held, dir string) {
+	for _, name := range installed {
+		_ = os.RemoveAll(filepath.Join(dir, name))
+	}
+	restoreHeld(held, dir)
 }
 
 // restoreHeld puts the previous contents back after a failed restore. Best

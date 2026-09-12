@@ -646,6 +646,26 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	s.Props["server-port"] = itoa(port)
 	s.Props["motd"] = name
 
+	dir := filepath.Join(m.dataDir, "servers", s.ID)
+
+	// Seeded before registration, not after: the old order inserted the server
+	// into the manager first, so a failed seed returned an error while leaving
+	// a ghost in the list holding its port. The server is invisible to every
+	// other goroutine until it is both seeded and persisted, which also makes
+	// the unlocked Props writes above safe - nothing else can reach the map.
+	if err := m.seedServerFiles(s); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+
+	// Seeded by a process running as root, into a directory root just made, so
+	// every file belongs to root - and the container runs as uid 1000 with no
+	// --user flag, so it cannot write one of them. Handed over before anything
+	// can start.
+	if s.Runtime == RuntimeDocker {
+		chownTree(dir, containerRunUID, containerRunGID)
+	}
+
 	m.mu.Lock()
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)
@@ -653,19 +673,24 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	m.mu.Unlock()
 	claimHeld = false
 
-	// Seeded by a process running as root, into a directory root just made, so
-	// every file belongs to root - and the container runs as uid 1000 with no
-	// --user flag, so it cannot write one of them. Handed over before anything
-	// can start. Deferred so a half-seeded tree is handed over too, rather than
-	// left as root's for someone to puzzle over.
-	if s.Runtime == RuntimeDocker {
-		defer chownTree(filepath.Join(m.dataDir, "servers", s.ID), containerRunUID, containerRunGID)
+	// Persistence failures are not acknowledged: a server returned with "ok"
+	// that vanishes at the next restart is a lie the operator only meets as an
+	// outage. Rolled back the same way the clone path rolls its registration
+	// back, so the two paths stay consistent.
+	if err := m.Save(); err != nil {
+		m.mu.Lock()
+		delete(m.servers, s.ID)
+		for i, id := range m.order {
+			if id == s.ID {
+				m.order = append(m.order[:i], m.order[i+1:]...)
+				break
+			}
+		}
+		m.mu.Unlock()
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("could not persist the new server: %w", err)
 	}
 
-	if err := m.seedServerFiles(s); err != nil {
-		return nil, err
-	}
-	_ = m.Save()
 	m.broadcastEvent("server.created", s.ID)
 	return s, nil
 }
@@ -998,7 +1023,18 @@ func (m *Manager) Stop(id string) error {
 
 	go func() {
 		defer recoverPanic("stop worker for " + s.ID)
-		_ = m.runnerFor(s).Stop(s)
+		if err := m.runnerFor(s).Stop(s); err != nil {
+			// The runner only cancels its watchers on success, so a container
+			// that refused to stop is still supervised. Saying "stopping"
+			// forever for a live server is a lie; report what is true.
+			m.panelLine(s, "error", "Stop failed: "+err.Error())
+			if s.Runtime == RuntimeDocker && containerRunning(s.ID) {
+				m.setStatus(s, StatusRunning, 0, "")
+			} else {
+				m.setStatus(s, StatusFailed, 1, err.Error())
+			}
+			return
+		}
 		if s.Runtime == RuntimeSim {
 			time.Sleep(700 * time.Millisecond)
 			m.stopped(s)
@@ -1015,7 +1051,15 @@ func (m *Manager) Kill(id string) error {
 	m.panelLine(s, "warn", "Kill requested - the process is being terminated without a clean shutdown. Unsaved chunks are lost.")
 	go func() {
 		defer recoverPanic("kill worker for " + s.ID)
-		_ = m.runnerFor(s).Kill(s)
+		if err := m.runnerFor(s).Kill(s); err != nil {
+			m.panelLine(s, "error", "Kill failed: "+err.Error())
+			if s.Runtime == RuntimeDocker && containerRunning(s.ID) {
+				m.setStatus(s, StatusRunning, 0, "")
+			} else {
+				m.fail(s, 137, "killed")
+			}
+			return
+		}
 		if s.Runtime == RuntimeSim {
 			time.Sleep(200 * time.Millisecond)
 			m.fail(s, 137, "killed")
@@ -1539,8 +1583,17 @@ func (m *Manager) SettingsView(s *Server) []map[string]any {
 	groups := []string{"Gameplay", "World", "Network"}
 	byGroup := map[string][]map[string]any{}
 
+	// Copied under the lock, like Snapshot does: ApplySettings and reloadProps
+	// write this map, and a bare read is a fatal concurrent map access.
+	s.mu.Lock()
+	props := make(map[string]string, len(s.Props))
+	for k, v := range s.Props {
+		props[k] = v
+	}
+	s.mu.Unlock()
+
 	for _, meta := range propSchema {
-		v, ok := s.Props[meta.Key]
+		v, ok := props[meta.Key]
 		if !ok {
 			continue
 		}
@@ -1560,15 +1613,53 @@ func (m *Manager) SettingsView(s *Server) []map[string]any {
 	return out
 }
 
+// changeServerPort moves a server to a new port as one atomic manager-level
+// operation: the old check ran portOwner outside every lock and knew nothing
+// about reservedPorts, so two concurrent settings edits could both observe a
+// free port and both commit it, and a port an import was already holding could
+// be handed to an existing server underneath it.
+//
+// Lock order is m.mu -> s.mu, the same order claimStart and Save already use;
+// nothing acquires m.mu while holding an s.mu, so this cannot deadlock.
+func (m *Manager) changeServerPort(s *Server, port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port %d is out of range", port)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, id := range m.order {
+		other, ok := m.servers[id]
+		if !ok || other.ID == s.ID {
+			continue
+		}
+		other.mu.Lock()
+		taken, name := other.Port == port, other.Name
+		other.mu.Unlock()
+		if taken {
+			return fmt.Errorf("port %d is already used by %q", port, name)
+		}
+	}
+	if holder, ok := m.reservedPorts[port]; ok {
+		return fmt.Errorf("port %d is reserved by %q (an import or create in progress)", port, holder)
+	}
+
+	s.mu.Lock()
+	s.Port = port
+	s.Props["server-port"] = itoa(port)
+	s.mu.Unlock()
+	return nil
+}
+
 // ApplySettings writes changes and reports which need a restart.
 func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string, error) {
 	var needRestart []string
 
-	// Validate before taking the lock: portOwner walks every server and would
-	// deadlock against a sibling's s.mu, and a rejected change must not have
+	// Validate before taking the lock: a rejected change must not have
 	// half-applied.
 	running := s.State() == StatusRunning
-	newPort, newMax := 0, 0
+	newPort := 0
 	for k, v := range changes {
 		meta := propMetaFor(k)
 		if meta == nil {
@@ -1579,13 +1670,15 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 			if p < 1 || p > 65535 {
 				return nil, fmt.Errorf("port %s is out of range", v)
 			}
-			if owner := m.portOwner(p); owner != nil && owner.ID != s.ID {
-				return nil, fmt.Errorf("port %d is already used by %q", p, owner.Name)
-			}
 			newPort = p
 		}
-		if k == "max-players" {
-			newMax = atoi(v)
+	}
+
+	// The port moves first and atomically. If it is taken, the whole request
+	// is refused before any other setting has been applied.
+	if newPort > 0 {
+		if err := m.changeServerPort(s, newPort); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1599,10 +1692,7 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 		}
 		s.Props[k] = v
 	}
-	if newPort > 0 {
-		s.Port = newPort
-	}
-	if newMax > 0 {
+	if newMax := atoi(changes["max-players"]); newMax > 0 {
 		s.MaxPlayers = newMax
 	}
 	sort.Strings(needRestart)

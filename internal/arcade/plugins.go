@@ -203,6 +203,11 @@ func (m *Manager) statPlugin(r *os.Root, name, file string, enabled bool) (Plugi
 // state the caller wants, not a flip, so a double-clicked button cannot leave
 // the plugin in the state the operator was trying to leave.
 func (m *Manager) SetPluginEnabled(s *Server, file string, enable bool) (PluginEntry, error) {
+	// Shared hold across the whole rename, same as the file API: the backup
+	// check alone left a window for a rename to land mid-archive.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	dir, _, err := pluginDirFor(s)
 	if err != nil {
 		return PluginEntry{}, err
@@ -334,6 +339,13 @@ func (m *Manager) InstallPlugin(s *Server, rawURL string) (PluginEntry, error) {
 	if err != nil {
 		return PluginEntry{}, err
 	}
+	// Shared hold from the first tree mutation (the plugin dir below) through
+	// the final rename: the backup check used to run before a download that
+	// can take minutes, and the write landed however long after the check.
+	// Holding the gate across the download is deliberate - an install is a
+	// rare operator action, and a backup of a half-installed jar helps nobody.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
 	if err := r.MkdirAll(dirName, 0o755); err != nil {
 		return PluginEntry{}, err
 	}

@@ -634,23 +634,36 @@ func (a *API) createTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) updateTask(w http.ResponseWriter, r *http.Request) {
-	var body Task
+	// Pointer fields: this is PATCH, and the zero value of a bool is false.
+	// Assigning the bools unconditionally turned a partial edit like
+	// {"name": ...} into "disable this task and make it one-shot".
+	var body struct {
+		Name     *string `json:"name"`
+		Commands *string `json:"commands"`
+		Time     *string `json:"time"`
+		Repeat   *bool   `json:"repeat"`
+		Enabled  *bool   `json:"enabled"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
 	t, err := a.mgr.sched.Update(r.PathValue("tid"), func(t *Task) {
-		if body.Name != "" {
-			t.Name = body.Name
+		if body.Name != nil {
+			t.Name = *body.Name
 		}
-		if body.Commands != "" {
-			t.Commands = body.Commands
+		if body.Commands != nil {
+			t.Commands = *body.Commands
 		}
-		if body.Time != "" {
-			t.Time = body.Time
+		if body.Time != nil {
+			t.Time = *body.Time
 		}
-		t.Repeat = body.Repeat
-		t.Enabled = body.Enabled
+		if body.Repeat != nil {
+			t.Repeat = *body.Repeat
+		}
+		if body.Enabled != nil {
+			t.Enabled = *body.Enabled
+		}
 	})
 	if err != nil {
 		writeErr(w, 400, err)

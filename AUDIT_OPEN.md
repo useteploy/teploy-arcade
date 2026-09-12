@@ -20,3 +20,19 @@ Open items: 1 P2 improvement (1 total)
 
 - teploy-arcade-01, -02: FIXED - see audit commit (fan-out moved under r.mu; trySend stays nonblocking; DropRoom records absent-room tombstones; Join refuses dead rooms with tests).
 - teploy-arcade-03: DEFERRED (design) - Run()'s worker-lifecycle ownership (context, pre-bind listener, join-on-shutdown) is an entry-point API change; decide the embedding/test story first.
+
+## ChatGPT audit pass (2026-09-12, AUDIT-CHATGPT.md) - all 11 findings verified against source and fixed
+
+1. CRITICAL unlocked Props reads (SettingsView, MOTD, sim boot) - FIXED: motdLocked/Prop locked accessors; Snapshot uses motdLocked; SettingsView copies under lock; sim boot reads via Prop. (players.go white-list read was already locked - audit false positive there.)
+2. HIGH live backup ignores quiesce failures - FIXED: quiesceForBackup aborts unless save-off/save-all flush both succeed; non-minecraft-java live backups refused (stop first), matching clone's fail-closed behavior.
+3. HIGH backup/file TOCTOU - FIXED: Server.fsMu RWMutex gate; backups/restores exclusive for their whole window; WriteFile/DeletePath/MkDir/writeProps/SetPluginEnabled/InstallPlugin hold shared through their mutation.
+4. HIGH restore not transactional + EXDEV on adopted trees - FIXED: staging created inside the target dir (same filesystem); installed entries tracked and removed before restoreHeld on mid-install failure (rollbackRestore).
+5. HIGH import ignores persistence failures - FIXED: finishImport errors and rolls back registration; copy failures remove the copied tree and release the port; adopt failures remove only the panel's symlink.
+6. HIGH MCP PBKDF2 CPU amplifier - FIXED: bearer tokens hashed with plain SHA-256 (sha256: prefix marker), constant-time compare; legacy PBKDF2-stored tokens no longer authenticate (logged at load; reissue).
+7. HIGH docker stop failure discarded - FIXED: dockerRunner.Stop reports the docker error and only cancels watchers on success; Stop/Kill workers restore running/failed state and surface the error on the console instead of wedging in stopping.
+8. MEDIUM Create ghost server + ignored Save - FIXED: seed before registration; Save failure rolls back registration and the tree.
+9. MEDIUM port check-then-set - FIXED: changeServerPort is one atomic manager-level operation (registered servers + reservedPorts under m.mu); ApplySettings moves the port before applying any other setting.
+10. MEDIUM PATCH clears omitted booleans - FIXED: updateTask decodes pointer fields and only assigns supplied ones.
+11. LOW !wait atoi silent zero - FIXED: strict strconv.Atoi with an explicit error.
+
+Verification: go build, go vet, full go test ./... and go test -race ./internal/arcade all clean (2026-09-12).

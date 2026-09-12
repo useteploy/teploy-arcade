@@ -796,7 +796,13 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 		}
 		job := newImportJob(sc, mode, name)
 		claimHeld = false // the server now holds the port
-		m.finishImport(job, s, sc, actor)
+		if err := m.finishImport(job, s, sc, actor); err != nil {
+			// Only the panel's own symlink is removed - the operator's tree
+			// was never ours to delete.
+			_ = os.Remove(dst)
+			job.fail(err)
+			return nil, err
+		}
 		view := job.view()
 		return &view, nil
 	}
@@ -819,7 +825,13 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 		// own directory was owned. Match the source: it is the ownership the
 		// game was running with before the panel touched it.
 		chownTreeLike(dst, sc.Path)
-		m.finishImport(job, s, sc, actor)
+		if err := m.finishImport(job, s, sc, actor); err != nil {
+			// The copied tree is the panel's own work product; a registration
+			// that failed persistence must not leave it looking importable.
+			_ = os.RemoveAll(dst)
+			m.releasePort(port)
+			job.fail(err)
+		}
 	}()
 
 	view := job.view()
@@ -853,27 +865,51 @@ func applyImportedProps(s *Server, sc *ImportScan, port int) {
 // Deliberately not Manager.Create: Create seeds a fresh tree - its own
 // server.properties, an empty ops.json, eula.txt - straight over the files that
 // were just imported. Registration is the only part of it an import wants.
-func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, actor string) {
+//
+// A server whose properties could not be written or whose registration could
+// not be persisted is NOT a successful import: the old shape logged and
+// ignored both failures and reported a done job whose server vanished at the
+// next restart, or bound a different port than the panel reported. The caller
+// rolls its own work (copied tree, adopt link, port claim) back when this
+// errors.
+func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, actor string) error {
 	m.mu.Lock()
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)
 	delete(m.reservedPorts, s.Port) // the server itself now holds it
 	m.mu.Unlock()
 
-	if err := m.Save(); err != nil {
-		log.Printf("imported %s but could not persist the server list: %v", s.Name, err)
+	rollbackRegistration := func() {
+		m.mu.Lock()
+		delete(m.servers, s.ID)
+		for i, id := range m.order {
+			if id == s.ID {
+				m.order = append(m.order[:i], m.order[i+1:]...)
+				break
+			}
+		}
+		delete(m.reservedPorts, s.Port)
+		m.mu.Unlock()
 	}
-	// The panel's model now holds the chosen port, but the imported
+
+	// The panel's model holds the chosen port, but the imported
 	// server.properties still carries the source's. Left alone they disagree
 	// until someone happens to save settings, and the game binds the old one.
 	if err := m.writeProps(s); err != nil {
-		log.Printf("imported %s but could not write server.properties: %v", s.Name, err)
+		rollbackRegistration()
+		return fmt.Errorf("could not write the imported server.properties: %w", err)
+	}
+
+	if err := m.Save(); err != nil {
+		rollbackRegistration()
+		return fmt.Errorf("could not persist the imported server: %w", err)
 	}
 
 	m.audit(actor, "server.import", s.ID, fmt.Sprintf("%s from %s (%s, %s)",
 		s.Name, sc.Path, j.mode(), humanSize(sc.SizeBytes)))
 	m.broadcastEvent("server.created", s.ID)
 	j.done(s.ID)
+	return nil
 }
 
 // adoptInPlace points the panel's server directory at the operator's own tree

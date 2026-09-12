@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -400,7 +401,15 @@ func (sc *Scheduler) step(s *Server, step, actor string) error {
 	case "wait":
 		d := 5
 		if len(fields) > 1 {
-			d = atoi(fields[1])
+			// Strict, not atoi: atoi's contract returns 0 for anything it
+			// cannot parse, 0 is a valid wait, and "!wait sixty" in a
+			// restart sequence restarted immediately after announcing a
+			// delay. parseClock got a strict parser for exactly this class.
+			var err error
+			d, err = strconv.Atoi(fields[1])
+			if err != nil {
+				return fmt.Errorf("wait must be a whole number of seconds")
+			}
 		}
 		if d < 0 || d > 900 {
 			return fmt.Errorf("wait must be between 0 and 900 seconds")

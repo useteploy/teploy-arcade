@@ -79,7 +79,7 @@ func (r *simRunner) run(ctx context.Context, s *Server, p *simProc, emit func(Li
 		}},
 		{120 * time.Millisecond, func() { info("Starting minecraft server version %s", s.Version) }},
 		{140 * time.Millisecond, func() { info("Loading properties") }},
-		{130 * time.Millisecond, func() { info("Default game type: %s", strings.ToUpper(s.Props["gamemode"])) }},
+		{130 * time.Millisecond, func() { info("Default game type: %s", strings.ToUpper(s.Prop("gamemode"))) }},
 		{160 * time.Millisecond, func() { info("Generating keypair") }},
 		{150 * time.Millisecond, func() { info("Starting Minecraft server on *:%d", s.Port) }},
 		{140 * time.Millisecond, func() { info("Using default channel type") }},
@@ -1260,8 +1260,13 @@ func (r *dockerRunner) stream(s *Server, stdout io.Reader, emit func(Line), alre
 
 func (r *dockerRunner) Stop(s *Server) error {
 	name := containerPrefix + "-" + s.ID
-	// graceful: let the game flush chunks before the container goes away
-	_ = exec.Command("docker", "stop", "-t", "45", name).Run()
+	// graceful: let the game flush chunks before the container goes away.
+	// Reported, not discarded: the caller cancels its log/wait supervision on
+	// nil, and a discarded failure leaves a live container the panel has
+	// deliberately stopped watching while it shows "stopping" forever.
+	if out, err := exec.Command("docker", "stop", "-t", "45", name).CombinedOutput(); err != nil {
+		return fmt.Errorf("could not stop the container: %w: %s", err, strings.TrimSpace(string(out)))
+	}
 	r.cancelProc(s)
 	return nil
 }

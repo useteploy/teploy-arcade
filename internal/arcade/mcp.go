@@ -1,7 +1,9 @@
 package arcade
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -48,7 +50,33 @@ func newMCPTokens(dataDir string) *mcpTokens {
 			quarantine(t.path, err)
 		}
 	}
+	legacy := 0
+	for _, tok := range t.toks {
+		if !strings.HasPrefix(tok.Hash, mcpHashPrefix) {
+			legacy++
+		}
+	}
+	if legacy > 0 {
+		// Stored under the password KDF (PBKDF2, 120k rounds) these tokens
+		// made every unauthenticated guess expensive on purpose - the right
+		// property for a human password, and a free CPU-exhaustion lever for
+		// a 192-bit random bearer secret nobody guesses. They no longer
+		// authenticate; reissue from the panel's token screen.
+		log.Printf("mcp: %d stored token(s) predate the token-hash upgrade and will not authenticate; revoke and reissue them", legacy)
+	}
 	return t
+}
+
+// mcpHashPrefix marks hashes stored under the token scheme. A bearer token is
+// 192 bits of entropy, not a human password - stretching it with PBKDF2 cost
+// the panel one 120,000-round computation per unauthenticated guess, while
+// adding nothing a fixed-size digest compared in constant time does not
+// already give.
+const mcpHashPrefix = "sha256:"
+
+func hashMCPToken(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return mcpHashPrefix + hex.EncodeToString(sum[:])
 }
 
 func (t *mcpTokens) save() error {
@@ -74,7 +102,7 @@ func (t *mcpTokens) Issue(name string) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.toks = append(t.toks, mcpToken{
-		Name: name, Hash: hashPassword(raw, "mcp"), Created: time.Now().Unix(),
+		Name: name, Hash: hashMCPToken(raw), Created: time.Now().Unix(),
 	})
 	return raw, t.save()
 }
@@ -83,11 +111,16 @@ func (t *mcpTokens) Check(raw string) bool {
 	if raw == "" {
 		return false
 	}
-	h := hashPassword(raw, "mcp")
+	h := hashMCPToken(raw)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now().Unix()
 	for i := range t.toks {
+		// Legacy pre-upgrade hashes carry no prefix and never match; anything
+		// else is compared in constant time, as before.
+		if !strings.HasPrefix(t.toks[i].Hash, mcpHashPrefix) {
+			continue
+		}
 		// Constant-time, like the password path: a plain == returns at the
 		// first differing byte, which tells a caller timing how much of a
 		// guessed token's hash was right.
