@@ -121,9 +121,26 @@ func (c *Conn) trySend(msg []byte) {
 // client is caught up to. buffer_capacity is reported so the UI's "restored the
 // last N lines" is a fact rather than a hardcoded number.
 func (h *Hub) Join(roomID string, c *Conn) (replay []Line, seq int64, capacity int) {
+	// A deleted room must not gain viewers: its deletion pass has already
+	// run, so nothing would ever close a connection attached here or
+	// publish to it. Get-or-create is wrong for joins to dead rooms.
+	if r, ok := h.lookup(roomID); ok {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.dead {
+			return nil, r.seq, ringSize
+		}
+		r.conns[c] = struct{}{}
+		replay = make([]Line, len(r.ring))
+		copy(replay, r.ring)
+		return replay, r.seq, ringSize
+	}
 	r := h.room(roomID)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.dead {
+		return nil, r.seq, ringSize
+	}
 	r.conns[c] = struct{}{}
 	replay = make([]Line, len(r.ring))
 	copy(replay, r.ring)
@@ -182,12 +199,16 @@ func (h *Hub) Publish(roomID string, l Line) Line {
 	for c := range r.conns {
 		conns = append(conns, c)
 	}
-	r.mu.Unlock()
-
+	// Encode and fan out INSIDE the room lock: trySend never blocks (a slow
+	// viewer sheds rather than stalls), so holding r.mu across it is safe,
+	// and it is what makes per-room delivery order match sequence order —
+	// releasing the lock between assignment and delivery let a second
+	// publisher deliver N+1 before this publisher delivered N.
 	msg := mustJSON(map[string]any{"t": "line", "line": l})
 	for _, c := range conns {
 		c.trySend(msg)
 	}
+	r.mu.Unlock()
 	return l
 }
 
@@ -236,7 +257,11 @@ func (h *Hub) DropRoom(roomID string) {
 	r, ok := h.rooms[roomID]
 	h.mu.Unlock()
 	if !ok {
-		return
+		// Record the tombstone even for a room that never existed: a later
+		// Publish to this ID would otherwise get-or-create a fresh live
+		// room, resurrecting a deleted server's console. The dead room is
+		// the deletion record.
+		r = h.room(roomID)
 	}
 	r.mu.Lock()
 	for c := range r.conns {
