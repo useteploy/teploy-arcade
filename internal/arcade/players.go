@@ -113,10 +113,15 @@ func (m *Manager) readList(s *Server, l PlayerList) ([]ListEntry, error) {
 func (m *Manager) writeList(s *Server, l PlayerList, entries []ListEntry) error {
 	// A shared mutation of the server tree like any other: held on the
 	// filesystem gate so a list edit cannot land inside a backup/restore
-	// window.
+	// window. Callers already inside an fsMu read section use
+	// writeListHeld - taking RLock recursively here deadlocked against
+	// Start's fsMu -> lifecycle order.
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	return m.writeListHeld(s, l, entries)
+}
 
+func (m *Manager) writeListHeld(s *Server, l PlayerList, entries []ListEntry) error {
 	name, err := l.file()
 	if err != nil {
 		return err
@@ -196,6 +201,13 @@ func gameCommand(l PlayerList, add bool, who, reason string) string {
 // seconds comes off far better than one whose change disappears with nothing to
 // report.
 func (m *Manager) routeListChange(s *Server, l PlayerList, edit func() error) (viaConsole bool, err error) {
+	// fsMu BEFORE lifecycle - the only legal order. The previous shape took
+	// lifecycle first and reached fsMu through writeList, while Start takes
+	// fsMu first and waits for lifecycle: one list edit plus one start of
+	// the same server deadlocked the whole process (lifecycle is global).
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	m.lifecycle.Lock()
 	defer m.lifecycle.Unlock()
 
@@ -274,7 +286,7 @@ func (m *Manager) applyListAdd(s *Server, l PlayerList, who, reason string) erro
 	if e.Reason == "" && (l == ListBanned || l == ListBannedIPs) {
 		e.Reason = "Banned by an operator"
 	}
-	return m.writeList(s, l, append(entries, e))
+	return m.writeListHeld(s, l, append(entries, e))
 }
 
 func (m *Manager) RemoveFromList(s *Server, l PlayerList, who, actor string) error {
@@ -316,7 +328,7 @@ func (m *Manager) applyListRemove(s *Server, l PlayerList, who string) error {
 	if !found {
 		return fmt.Errorf("%s is not on the %s", who, l.label())
 	}
-	return m.writeList(s, l, out)
+	return m.writeListHeld(s, l, out)
 }
 
 // PlayerLists returns all four lists plus who is online, which is what the

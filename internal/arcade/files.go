@@ -375,12 +375,32 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 			return friendlyFSError(err, rel)
 		}
 	}
-	// server.properties carries the panel's port identity: the candidate port
-	// is validated BEFORE the bytes land, so a conflicting or out-of-range
-	// value never gets written to disk for reloadProps to then refuse.
+	// server.properties carries the panel's port identity. The port move is
+	// COMMITTED before the bytes land: check-only validation left a window
+	// where another request claimed the port between the check and the
+	// write, and then the file published a port the panel had refused.
+	// changeServerPort is atomic against every other claim, and reloadProps
+	// below sees port == current and does not move it again.
 	if path.Base(name) == "server.properties" {
 		if err := m.validatePropsPort(s, content); err != nil {
 			return err
+		}
+		s.mu.Lock()
+		current := s.Port
+		s.mu.Unlock()
+		for _, ln := range strings.Split(content, "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln == "" || strings.HasPrefix(ln, "#") {
+				continue
+			}
+			if k, v, ok := strings.Cut(ln, "="); ok && strings.TrimSpace(k) == "server-port" {
+				if p, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && p > 0 && p != current {
+					if err := m.changeServerPort(s, p); err != nil {
+						return err
+					}
+				}
+				break
+			}
 		}
 	}
 	if err := writeAtomicIn(r, name, []byte(content), 0o644); err != nil {
@@ -390,7 +410,7 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 	// server.properties is the panel's own model too - keep them in step rather
 	// than letting the file and the settings screen disagree.
 	if path.Base(name) == "server.properties" {
-		m.reloadProps(s, content)
+		return m.reloadProps(s, content)
 	}
 	return nil
 }
@@ -472,9 +492,14 @@ func (m *Manager) OpenForDownload(s *Server, rel string) (io.ReadCloser, string,
 func (m *Manager) writeProps(s *Server) error {
 	// A mutation of the server tree like any other: held shared on the
 	// filesystem gate so it cannot land inside a backup's archive window.
+	// Callers already inside an fsMu read section must use writePropsHeld -
+	// recursive RLock deadlocks against a queued writer.
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	return m.writePropsHeld(s)
+}
 
+func (m *Manager) writePropsHeld(s *Server) error {
 	r, err := m.serverRoot(s)
 	if err != nil {
 		return err
@@ -528,15 +553,16 @@ func (m *Manager) validatePropsPort(s *Server, content string) error {
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		candidate := []portBinding{{p, "tcp"}, {p, "udp"}}
 		for _, id := range m.order {
 			other, ok := m.servers[id]
 			if !ok || other.ID == s.ID {
 				continue
 			}
-			other.mu.Lock()
-			taken, name := other.Port == p, other.Name
-			other.mu.Unlock()
-			if taken {
+			if bindingConflict(serverBindingsLocked(other), candidate) {
+				other.mu.Lock()
+				name := other.Name
+				other.mu.Unlock()
 				return fmt.Errorf("port %d is already used by %q", p, name)
 			}
 		}
@@ -549,8 +575,10 @@ func (m *Manager) validatePropsPort(s *Server, content string) error {
 }
 
 // reloadProps parses an edited server.properties back into the panel's model so
-// the settings screen and the file never drift.
-func (m *Manager) reloadProps(s *Server, content string) {
+// the settings screen and the file never drift. The error is the persistence
+// failure: the file HAS landed at that point, and the caller must be able to
+// tell the operator the panel could not record it.
+func (m *Manager) reloadProps(s *Server, content string) error {
 	parsed := map[string]string{}
 	for _, ln := range strings.Split(content, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -603,7 +631,9 @@ func (m *Manager) reloadProps(s *Server, content string) {
 	// edit came back on restart.
 	if err := m.Save(); err != nil {
 		log.Printf("server.properties for %s was applied in memory but not persisted: %v", s.ID, err)
+		return fmt.Errorf("the file was saved, but the panel could not record the change: %w", err)
 	}
+	return nil
 }
 
 // seedServerFiles gives a new server a plausible tree so the file manager has

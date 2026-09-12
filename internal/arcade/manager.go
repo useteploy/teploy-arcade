@@ -152,8 +152,41 @@ func (m *Manager) Load() error {
 	m.mu.Unlock()
 
 	m.backfillVersions()
+	m.recoverInterruptedRestores()
 	m.recoverAfterBoot(wasUp)
 	return nil
+}
+
+// recoverInterruptedRestores finishes or discards restore transactions that
+// were interrupted by process death. A staging directory still holding
+// entries in "old" means the live tree had already been moved aside and the
+// install never completed: the held entries go back, because "the previous
+// world was put back" is the documented contract of every restore failure.
+// An empty "old" means the crash happened before anything moved - the
+// archive is untouched, so the staging tree is simply dropped.
+func (m *Manager) recoverInterruptedRestores() {
+	for _, s := range m.List() {
+		dir := m.serverDir(s)
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), ".arcade-restore-") {
+				continue
+			}
+			staging := filepath.Join(dir, e.Name())
+			held := filepath.Join(staging, "old")
+			if heldEnts, err := os.ReadDir(held); err == nil && len(heldEnts) > 0 {
+				restoreHeld(held, dir)
+				log.Printf("%s: recovered an interrupted restore - the previous world was put back from %s",
+					s.Name, e.Name())
+			} else {
+				log.Printf("%s: discarded an interrupted restore's staging directory %s (nothing had moved)", s.Name, e.Name())
+			}
+			_ = os.RemoveAll(staging)
+		}
+	}
 }
 
 // backfillVersions fills in a version for servers recorded as "unknown".
@@ -734,6 +767,9 @@ func (m *Manager) SetResources(s *Server, memMB int, cpu float64) ([]string, err
 		return nil, fmt.Errorf("nothing to change: pass memory_mb, cpu, or both")
 	}
 
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	s.mu.Lock()
 	changed := []string{}
 	if memMB > 0 && memMB != s.MemoryMB {
@@ -893,11 +929,89 @@ func (m *Manager) List() []*Server {
 
 // claimPort reserves a port for an in-flight import, atomically with the check
 // that nothing else holds it. Returns what holds it when the claim fails.
+// portBinding is one published port: a number and its protocol. Templates
+// declare spans (Valheim wants three consecutive UDP ports) and fixed extras
+// (Geyser's 19132/udp); the old ledger compared only base ports, so two
+// servers could be assigned overlapping spans/extras that only Docker
+// caught, at start time, with an error naming nothing actionable.
+type portBinding struct {
+	port  int
+	proto string
+}
+
+func parseBindingNumber(spec string) (int, string) {
+	p, proto, _ := strings.Cut(spec, "/")
+	if proto == "" {
+		proto = "tcp"
+	}
+	return atoi(p), strings.ToLower(proto)
+}
+
+// serverBindings is every host port a server's container will publish.
+// s.mu must NOT be held by the caller of the locked variants below; this
+// standalone copy takes it itself.
+func serverBindings(s *Server) []portBinding {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return serverBindingsLocked(s)
+}
+
+func serverBindingsLocked(s *Server) []portBinding {
+	protos := s.Protocols
+	if len(protos) == 0 {
+		protos = []string{"tcp"}
+	}
+	var out []portBinding
+	span := s.PortSpan
+	if span < 1 {
+		span = 1
+	}
+	for i := 0; i < span; i++ {
+		for _, pr := range protos {
+			out = append(out, portBinding{s.Port + i, pr})
+		}
+	}
+	for _, extra := range s.ExtraPorts {
+		n, pr := parseBindingNumber(extra)
+		if n > 0 {
+			out = append(out, portBinding{n, pr})
+		}
+	}
+	return out
+}
+
+func bindingConflict(a, b []portBinding) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if x.port == y.port && x.proto == y.proto {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reservedBindings expands the numeric reservation map: a reservation holds
+// exactly the base port (imports/clones have not read a template's span
+// yet, so the conservative check compares the base number on any protocol).
+func reservedConflicts(reserved map[int]string, b []portBinding) string {
+	for _, x := range b {
+		if holder, ok := reserved[x.port]; ok {
+			return holder
+		}
+	}
+	return ""
+}
+
 func (m *Manager) claimPort(port int, who string) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, id := range m.order {
-		if s, ok := m.servers[id]; ok && s.Port == port {
+		s, ok := m.servers[id]
+		if !ok {
+			continue
+		}
+		if bindingConflict(serverBindingsLocked(s), []portBinding{{port, "tcp"}, {port, "udp"}}) {
 			return s.Name, false
 		}
 	}
@@ -927,22 +1041,27 @@ func (m *Manager) NextFreePort(hint int) int {
 	if hint == 0 {
 		hint = 25565
 	}
-	used := map[int]bool{}
+	var occupied []portBinding
 	for _, s := range m.List() {
-		used[s.Port] = true
+		occupied = append(occupied, serverBindings(s)...)
 	}
 	// Reservations count as used. A copy import runs for minutes before its
 	// server is registered, and suggesting the port it is already holding sends
 	// the operator straight into the collision the reservation exists to stop.
 	m.mu.RLock()
-	for p := range m.reservedPorts {
-		used[p] = true
+	reserved := make(map[int]string, len(m.reservedPorts))
+	for p, who := range m.reservedPorts {
+		reserved[p] = who
 	}
 	m.mu.RUnlock()
 	for p := hint; p < hint+400; p++ {
-		if !used[p] {
-			return p
+		if bindingConflict(occupied, []portBinding{{p, "tcp"}, {p, "udp"}}) {
+			continue
 		}
+		if _, taken := reserved[p]; taken {
+			continue
+		}
+		return p
 	}
 	return hint
 }
@@ -1050,11 +1169,17 @@ func (m *Manager) Stop(id string) error {
 	if st := s.State(); st == StatusStopped || st == StatusFailed {
 		return fmt.Errorf("not running")
 	}
+	// A stop is a filesystem transaction: the game's shutdown save writes
+	// the tree, which must not land inside a backup or clone's exclusive
+	// window (the save-on resume would reintroduce writes mid-archive). The
+	// gate is held for the whole stop and released by the worker.
+	s.fsMu.Lock()
 	m.setStatus(s, StatusStopping, 0, "")
 	m.panelLine(s, "info", "Stopping the server gracefully.")
 
 	go func() {
 		defer recoverPanic("stop worker for " + s.ID)
+		defer s.fsMu.Unlock()
 		if err := m.runnerFor(s).Stop(s); err != nil {
 			// The runner only cancels its watchers on success, so a container
 			// that refused to stop is still supervised. Saying "stopping"
@@ -1661,15 +1786,16 @@ func (m *Manager) changeServerPort(s *Server, port int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	candidate := []portBinding{{port, "tcp"}, {port, "udp"}}
 	for _, id := range m.order {
 		other, ok := m.servers[id]
 		if !ok || other.ID == s.ID {
 			continue
 		}
-		other.mu.Lock()
-		taken, name := other.Port == port, other.Name
-		other.mu.Unlock()
-		if taken {
+		if bindingConflict(serverBindingsLocked(other), candidate) {
+			other.mu.Lock()
+			name := other.Name
+			other.mu.Unlock()
 			return fmt.Errorf("port %d is already used by %q", port, name)
 		}
 	}
@@ -1714,6 +1840,13 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 		}
 	}
 
+	// The whole settings mutation is a filesystem read section: without it,
+	// a settings change could interleave with Start's fsMu window and hand
+	// the container a memory/CPU/port configuration that no longer matches
+	// what was just persisted.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	// Everything that touches s.Props happens under the lock. reloadProps
 	// writes the same map from the file-manager path, and Go aborts the whole
 	// process on a concurrent map read/write - it is not a recoverable panic.
@@ -1734,7 +1867,7 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 	if err := m.Save(); err != nil {
 		return nil, err
 	}
-	if err := m.writeProps(s); err != nil {
+	if err := m.writePropsHeld(s); err != nil {
 		return nil, err
 	}
 	m.broadcastEvent("server.updated", s.ID)

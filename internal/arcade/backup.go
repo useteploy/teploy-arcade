@@ -489,7 +489,11 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 
 	// The archive carries its own server.properties; adopt it.
 	if content, err := os.ReadFile(filepath.Join(dir, "server.properties")); err == nil {
-		m.reloadProps(s, string(content))
+		// Best-effort on the restore path: the tree is already installed,
+		// and a persistence failure must not unwind a completed restore.
+		if err := m.reloadProps(s, string(content)); err != nil {
+			log.Printf("%s: restored server.properties applied in memory but not persisted: %v", s.ID, err)
+		}
 	}
 
 	m.audit(actor, "backup.restore", s.ID, backupID)
@@ -575,9 +579,13 @@ func (m *Manager) DeleteBackup(s *Server, backupID, actor string) error {
 
 // tarGz refuses to open an existing dst (O_EXCL). os.Create truncated whatever
 // was already there, so a repeated backup ID destroyed the earlier archive
-// silently; the caller re-stamps the ID on ErrExist instead.
+// silently; the caller re-stamps the ID on ErrExist instead. The archive is
+// assembled under a .part name and renamed only after a clean fsync, so a
+// crash mid-write can never leave a partial file under the final .tar.gz
+// name - where retention would later keep it as if it were valid.
 func tarGz(src, dst string) (int64, error) {
-	f, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	part := dst + ".part"
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return 0, err
 	}
@@ -639,13 +647,22 @@ func tarGz(src, dst string) (int64, error) {
 	// system must never do. Sync before it, so a power loss right after a
 	// "successful" backup cannot leave a holed file either.
 	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(part)
 		return 0, err
 	}
 	info, serr := f.Stat()
 	if serr != nil {
+		f.Close()
+		os.Remove(part)
 		return 0, serr
 	}
 	if err := f.Close(); err != nil {
+		os.Remove(part)
+		return 0, err
+	}
+	if err := os.Rename(part, dst); err != nil {
+		os.Remove(part)
 		return 0, err
 	}
 	return info.Size(), nil

@@ -51,3 +51,19 @@ Verification: go build, go vet, full go test ./... and go test -race ./internal/
 10. HIGH boot sweep deleted any file containing .tmp - FIXED: panel temps carry the reserved ".arcade-tmp-" prefix (writeFileAtomic + writeAtomicIn); the sweep removes only that prefix.
 
 Verification: go build, go vet, go test ./..., go test -race ./internal/arcade - all clean (2026-09-12).
+
+## ChatGPT audit pass 3 (2026-09-12, AUDIT-CHATGPT-3.md) - 10 fixed, 1 refuted
+
+1. HIGH lifecycle->fsMu deadlocks (routeListChange, finishImport) - FIXED: fsMu->lifecycle is the only legal order; writeList/writeProps split into held variants; finishImport and clone write properties BEFORE lifecycle registration.
+2. HIGH Delete accepts stopping - REFUTED: deliberate tested behavior (TestDeleteCancelsARunnerThatIsStillStopping) - delete during stop cancels the runner instead of orphaning it; the stop worker + docker daemon finish the stop regardless of the entry.
+3. HIGH Stop/Restart inside a quiesced backup - FIXED: Stop holds fsMu for the whole stop (worker releases), so the shutdown save cannot land inside a backup/clone window.
+4. HIGH settings racing docker args - FIXED: ApplySettings and SetResources run inside an fsMu read section; Start's exclusive window cannot interleave.
+5. HIGH ledger ignores spans/extras - FIXED: portBinding model (base..span + extra ports with protocols) compared in claimPort, changeServerPort, validatePropsPort and NextFreePort.
+6. MEDIUM validatePropsPort TOCTOU - FIXED: WriteFile commits the port via changeServerPort BEFORE the file bytes land; reloadProps then sees port==current.
+7. HIGH clone provisional exposure - FIXED: registration->Save under lifecycle, properties written first (same shape as import).
+8. HIGH partial archive under final name - FIXED: tarGz assembles under .part and renames after fsync; boot sweep removes stray .part files.
+9. HIGH restore not crash-atomic - FIXED: recoverInterruptedRestores at boot puts held ("old") entries back and drops untouched staging trees.
+10. MEDIUM reloadProps swallows Save failure - FIXED: returns the error; WriteFile surfaces it; RestoreBackup logs it (tree already installed).
+11. HIGH auth mutex across PBKDF2 - FIXED: copy-hash-relock (both derivations outside the mutex, snapshot revalidated under the write lock).
+
+Verification: go build, go vet, go test ./... and go test -race - all clean (2026-09-12).

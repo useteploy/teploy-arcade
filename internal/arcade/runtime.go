@@ -190,7 +190,7 @@ func sweepTempFiles(root string) {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		if strings.HasPrefix(d.Name(), ".arcade-tmp-") {
+		if strings.HasPrefix(d.Name(), ".arcade-tmp-") || strings.HasSuffix(d.Name(), ".tar.gz.part") {
 			if os.Remove(p) == nil {
 				removed++
 			}

@@ -896,11 +896,21 @@ func applyImportedProps(s *Server, sc *ImportScan, port int) {
 // rolls its own work (copied tree, adopt link, port claim) back when this
 // errors.
 func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, actor string) error {
+	// The panel's model holds the chosen port, but the imported
+	// server.properties still carries the source's. Left alone they disagree
+	// until someone happens to save settings, and the game binds the old one.
+	// Written BEFORE registration and BEFORE lifecycle: writeProps takes
+	// fsMu, and taking lifecycle -> fsMu deadlocked against Start's
+	// fsMu -> lifecycle order.
+	if err := m.writeProps(s); err != nil {
+		return fmt.Errorf("could not write the imported server.properties: %w", err)
+	}
+
 	// Provisional registration through persistence, inside the lifecycle
 	// mutex: Start and Delete commit under the same lock, so neither can
-	// observe - let alone claim - a server whose writeProps/Save has not
-	// committed. Rollback can then never yank a tree out from under a
-	// process the panel just started.
+	// observe - let alone claim - a server whose Save has not committed.
+	// Rollback can then never yank a tree out from under a process the panel
+	// just started. No fsMu is reachable from inside this section.
 	m.lifecycle.Lock()
 	defer m.lifecycle.Unlock()
 
@@ -921,14 +931,6 @@ func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, actor st
 		}
 		delete(m.reservedPorts, s.Port)
 		m.mu.Unlock()
-	}
-
-	// The panel's model holds the chosen port, but the imported
-	// server.properties still carries the source's. Left alone they disagree
-	// until someone happens to save settings, and the game binds the old one.
-	if err := m.writeProps(s); err != nil {
-		rollbackRegistration()
-		return fmt.Errorf("could not write the imported server.properties: %w", err)
 	}
 
 	if err := m.Save(); err != nil {

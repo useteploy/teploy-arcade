@@ -474,16 +474,29 @@ func (a *Auth) SetPassword(name, current, next, keepToken string, byAdmin bool) 
 	if len(next) < 8 {
 		return fmt.Errorf("password must be at least 8 characters")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 
-	u, ok := a.users[strings.ToLower(name)]
+	// Both PBKDF2 derivations run OUTSIDE the mutex - the same shape Login
+	// already uses. The old shape held the global write lock across up to
+	// three 120,000-round derivations, so one viewer hammering self-service
+	// password changes stalled every authenticated request in the panel.
+	a.mu.RLock()
+	key := strings.ToLower(name)
+	u, ok := a.users[key]
 	if !ok {
+		a.mu.RUnlock()
 		return fmt.Errorf("no such user")
 	}
+	type snapshot struct {
+		name, salt, hash string
+	}
+	snap := snapshot{u.Name, u.Salt, u.Hash}
+	a.mu.RUnlock()
+
+	var currentOK bool
 	if !byAdmin {
-		want, got := []byte(u.Hash), []byte(hashPassword(current, u.Salt))
-		if subtle.ConstantTimeCompare(want, got) != 1 {
+		got := hashPassword(current, snap.salt)
+		currentOK = subtle.ConstantTimeCompare([]byte(snap.hash), []byte(got)) == 1
+		if !currentOK {
 			return fmt.Errorf("current password is incorrect")
 		}
 		if current == next {
@@ -495,8 +508,23 @@ func (a *Auth) SetPassword(name, current, next, keepToken string, byAdmin bool) 
 	if err != nil {
 		return err
 	}
+	newHash := hashPassword(next, salt)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	u, ok = a.users[key]
+	if !ok {
+		return fmt.Errorf("no such user")
+	}
+	// Revalidate under the write lock: another password change may have
+	// landed while this request hashed, and committing onto a stale
+	// snapshot would silently revert it.
+	if !byAdmin && (u.Salt != snap.salt || u.Hash != snap.hash) {
+		return fmt.Errorf("the password changed underneath this request; try again")
+	}
+
 	u.Salt = salt
-	u.Hash = hashPassword(next, salt)
+	u.Hash = newHash
 	u.MustChange = byAdmin
 
 	for tok, s := range a.sessions {
