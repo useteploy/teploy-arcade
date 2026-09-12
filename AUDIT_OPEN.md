@@ -67,3 +67,16 @@ Verification: go build, go vet, go test ./..., go test -race ./internal/arcade -
 11. HIGH auth mutex across PBKDF2 - FIXED: copy-hash-relock (both derivations outside the mutex, snapshot revalidated under the write lock).
 
 Verification: go build, go vet, go test ./... and go test -race - all clean (2026-09-12).
+
+## ChatGPT audit pass 4 (2026-09-12, AUDIT-CHATGPT-4.md) - all 8 fixed
+
+1. HIGH clone lifecycle leak - FIXED: defer unlock (the error branch returned past the manual unlock).
+2. HIGH settings across docker args - FIXED: the port move runs inside ApplySettings' fsMu read section; SetResources also treats `starting` as restart-pending.
+3. HIGH candidates not expanded - FIXED: candidateBindings() validates range and expands span/extras for Create (from template geometry), changeServerPort and validatePropsPort (from the server's own geometry); claimStart compares full binding sets; claimPortBindings checks reservations against every candidate member.
+4. HIGH boot recovery could destroy the old world - FIXED: restores mirror the in-process rollback (remove staging/new entries from the live dir, then restoreHeld), and a .committed marker distinguishes interrupted installs from completed restores whose cleanup was interrupted.
+5. MEDIUM port publication split - FIXED: WriteFile snapshots the old bytes, writes the new file, then commits the port; any failure restores the old file and reverts the model.
+6. MEDIUM queued second Stop - FIXED: state re-checked under fsMu; a queued stop of an already-stopped server is an idempotent success.
+7. MEDIUM .part rename lost no-overwrite - FIXED: link-then-unlink publication, so an existing final name fails with EEXIST and the re-stamp retry works.
+8. HIGH Login stale-credential mint - FIXED: the salt/hash snapshot is revalidated under the write lock before the session is inserted.
+
+Verification: go build, go vet, go test ./..., go test -race - all clean (2026-09-12).

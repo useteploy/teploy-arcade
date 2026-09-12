@@ -210,6 +210,7 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		// fsMu reachable inside): a provisional clone must never be startable
 		// before its Save commits, or rollback would orphan a running server.
 		m.lifecycle.Lock()
+		defer m.lifecycle.Unlock()
 		m.mu.Lock()
 		m.servers[s.ID] = s
 		m.order = append(m.order, s.ID)
@@ -234,7 +235,6 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 			job.fail(fmt.Errorf("copied the files but could not persist the server list: %v", err))
 			return
 		}
-		m.lifecycle.Unlock()
 
 		m.audit(actor, "server.clone", s.ID, fmt.Sprintf("%s from %s (%s)",
 			s.Name, src.Name, humanSize(size)))

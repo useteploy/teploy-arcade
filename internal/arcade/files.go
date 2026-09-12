@@ -173,6 +173,10 @@ func (m *Manager) rooted(s *Server, rel string) (*os.Root, string, error) {
 //
 // The ".arcade-tmp-" prefix is what the boot sweep keys on: sweeping any name
 // containing ".tmp" deleted legitimate game files that happened to carry it.
+func writePropsFileGuard(r *os.Root, name, content string) error {
+	return writeAtomicIn(r, name, []byte(content), 0o644)
+}
+
 func writeAtomicIn(r *os.Root, name string, data []byte, perm os.FileMode) error {
 	dir := path.Dir(name)
 	if dir == "." {
@@ -375,15 +379,31 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 			return friendlyFSError(err, rel)
 		}
 	}
-	// server.properties carries the panel's port identity. The port move is
-	// COMMITTED before the bytes land: check-only validation left a window
-	// where another request claimed the port between the check and the
-	// write, and then the file published a port the panel had refused.
-	// changeServerPort is atomic against every other claim, and reloadProps
-	// below sees port == current and does not move it again.
+	// server.properties carries the panel's port identity. Order: snapshot
+	// the old bytes, write the new file, THEN commit the port. If the port
+	// commit loses a race for the port, the old file is restored so disk and
+	// model never disagree; the previous shape committed the port first and
+	// left the model moved when a disk failure dropped the write.
 	if path.Base(name) == "server.properties" {
 		if err := m.validatePropsPort(s, content); err != nil {
 			return err
+		}
+		oldBytes, hadOld := func() ([]byte, bool) {
+			if f, err := r.Open(name); err == nil {
+				defer f.Close()
+				b, rerr := io.ReadAll(io.LimitReader(f, maxEditBytes))
+				if rerr == nil {
+					return b, true
+				}
+			}
+			return nil, false
+		}()
+		restoreOld := func() {
+			if hadOld {
+				_ = writeAtomicIn(r, name, oldBytes, 0o644)
+			} else {
+				_ = r.Remove(name)
+			}
 		}
 		s.mu.Lock()
 		current := s.Port
@@ -394,10 +414,19 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 				continue
 			}
 			if k, v, ok := strings.Cut(ln, "="); ok && strings.TrimSpace(k) == "server-port" {
-				if p, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && p > 0 && p != current {
+				if p, cerr := strconv.Atoi(strings.TrimSpace(v)); cerr == nil && p > 0 && p != current {
 					if err := m.changeServerPort(s, p); err != nil {
 						return err
 					}
+					// The write must succeed for the commit to stand; on
+					// failure the old file is restored and the model reverts.
+					if werr := writePropsFileGuard(r, name, content); werr != nil {
+						// put the file back and revert the model
+						restoreOld()
+						_ = m.changeServerPort(s, current)
+						return friendlyFSError(werr, rel)
+					}
+					return m.reloadProps(s, content)
 				}
 				break
 			}
@@ -553,7 +582,15 @@ func (m *Manager) validatePropsPort(s *Server, content string) error {
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		candidate := []portBinding{{p, "tcp"}, {p, "udp"}}
+		protos, span, extras := func() ([]string, int, []string) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			return s.Protocols, s.PortSpan, s.ExtraPorts
+		}()
+		candidate, cerr := candidateBindings(p, protos, span, extras)
+		if cerr != nil {
+			return cerr
+		}
 		for _, id := range m.order {
 			other, ok := m.servers[id]
 			if !ok || other.ID == s.ID {

@@ -177,7 +177,23 @@ func (m *Manager) recoverInterruptedRestores() {
 			}
 			staging := filepath.Join(dir, e.Name())
 			held := filepath.Join(staging, "old")
+			if _, cerr := os.Stat(filepath.Join(staging, ".committed")); cerr == nil {
+				// The install completed; only the cleanup was interrupted.
+				_ = os.RemoveAll(staging)
+				log.Printf("%s: discarded a completed restore's leftover staging directory %s", s.Name, e.Name())
+				continue
+			}
 			if heldEnts, err := os.ReadDir(held); err == nil && len(heldEnts) > 0 {
+				// Mirror the in-process rollback: remove what the interrupted
+				// install placed, THEN put the old world back. restoreHeld
+				// alone cannot rename directories over the new ones, and
+				// blindly deleting the staging tree afterwards would destroy
+				// the only copy of the old world.
+				if newEnts, nerr := os.ReadDir(filepath.Join(staging, "new")); nerr == nil {
+					for _, ne := range newEnts {
+						_ = os.RemoveAll(filepath.Join(dir, ne.Name()))
+					}
+				}
 				restoreHeld(held, dir)
 				log.Printf("%s: recovered an interrupted restore - the previous world was put back from %s",
 					s.Name, e.Name())
@@ -637,7 +653,11 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	// Import and clone have claimed through reservedPorts since the concurrent
 	// import bug; create was the path still doing it the old way, which meant
 	// the reservation could only ever be half-honoured.
-	if holder, ok := m.claimPort(port, name); !ok {
+	cand, err := candidateBindings(port, t.Protocols, t.PortSpan, t.ExtraPorts)
+	if err != nil {
+		return nil, err
+	}
+	if holder, ok := m.claimPortBindings(cand, name); !ok {
 		return nil, fmt.Errorf("port %d is already used by %q", port, holder)
 	}
 	claimHeld := true
@@ -780,7 +800,9 @@ func (m *Manager) SetResources(s *Server, memMB int, cpu float64) ([]string, err
 		s.CPU = cpu
 		changed = append(changed, "CPU")
 	}
-	running := s.Status == StatusRunning
+	// Starting counts too: docker run has already returned with the OLD
+	// limits by the time the status flips, and "applied" would be a lie.
+	running := s.Status == StatusRunning || s.Status == StatusStarting
 	if len(changed) > 0 && running {
 		// Merged rather than replaced: a settings change may already be waiting
 		// on the same restart, and dropping it would tell the operator their
@@ -1003,7 +1025,39 @@ func reservedConflicts(reserved map[int]string, b []portBinding) string {
 	return ""
 }
 
-func (m *Manager) claimPort(port int, who string) (string, bool) {
+// candidateBindings expands a would-be server's full publishing set from
+// its template geometry. Candidates must be expanded exactly like existing
+// servers: a Palworld at 8212 with fixed 27015/udp used to pass admission
+// while another server already held 27015/udp, and Docker caught it at start
+// with an error naming nothing actionable. Every member must be in range.
+func candidateBindings(base int, protos []string, span int, extras []string) ([]portBinding, error) {
+	if len(protos) == 0 {
+		protos = []string{"tcp"}
+	}
+	if span < 1 {
+		span = 1
+	}
+	var out []portBinding
+	for i := 0; i < span; i++ {
+		p := base + i
+		if p < 1 || p > 65535 {
+			return nil, fmt.Errorf("port %d (base %d + span offset %d) is out of range", p, base, i)
+		}
+		for _, pr := range protos {
+			out = append(out, portBinding{p, pr})
+		}
+	}
+	for _, extra := range extras {
+		n, pr := parseBindingNumber(extra)
+		if n < 1 || n > 65535 {
+			return nil, fmt.Errorf("extra port %q is out of range", extra)
+		}
+		out = append(out, portBinding{n, pr})
+	}
+	return out, nil
+}
+
+func (m *Manager) claimPortBindings(cand []portBinding, who string) (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, id := range m.order {
@@ -1011,15 +1065,26 @@ func (m *Manager) claimPort(port int, who string) (string, bool) {
 		if !ok {
 			continue
 		}
-		if bindingConflict(serverBindingsLocked(s), []portBinding{{port, "tcp"}, {port, "udp"}}) {
+		if bindingConflict(serverBindingsLocked(s), cand) {
 			return s.Name, false
 		}
 	}
-	if holder, taken := m.reservedPorts[port]; taken {
-		return holder + " (import in progress)", false
+	for _, b := range cand {
+		if holder, taken := m.reservedPorts[b.port]; taken {
+			return holder + " (import in progress)", false
+		}
 	}
-	m.reservedPorts[port] = who
+	base := cand[0].port
+	m.reservedPorts[base] = who
 	return "", true
+}
+
+func (m *Manager) claimPort(port int, who string) (string, bool) {
+	cand, err := candidateBindings(port, nil, 1, nil)
+	if err != nil {
+		return err.Error(), false
+	}
+	return m.claimPortBindings(cand, who)
 }
 
 func (m *Manager) releasePort(port int) {
@@ -1142,13 +1207,19 @@ func (m *Manager) claimStart(s *Server) error {
 			maxRestarts)
 	}
 	// The port is checked at create time, but server.properties can be edited
-	// by hand. Catching it here beats letting Docker fail the bind.
+	// by hand. Catching it here beats letting Docker fail the bind. Compared
+	// at full binding-set level: spans and fixed extras collide here exactly
+	// like they do at admission.
+	mine := serverBindings(s)
 	for _, other := range m.List() {
-		if other.ID == s.ID || other.Port != s.Port {
+		if other.ID == s.ID {
+			continue
+		}
+		if !bindingConflict(serverBindings(other), mine) {
 			continue
 		}
 		if st := other.State(); st == StatusRunning || st == StatusStarting {
-			return fmt.Errorf("port %d is already in use by %q", s.Port, other.Name)
+			return fmt.Errorf("port %d is already in use by %q (spans and fixed ports included)", s.Port, other.Name)
 		}
 	}
 
@@ -1174,6 +1245,13 @@ func (m *Manager) Stop(id string) error {
 	// window (the save-on resume would reintroduce writes mid-archive). The
 	// gate is held for the whole stop and released by the worker.
 	s.fsMu.Lock()
+	// Re-checked under the gate: a queued second Stop waited here while the
+	// first finished, and would otherwise flip the already-stopped server
+	// back to stopping and fail against a gone container.
+	if st := s.State(); st == StatusStopped || st == StatusFailed {
+		s.fsMu.Unlock()
+		return nil
+	}
 	m.setStatus(s, StatusStopping, 0, "")
 	m.panelLine(s, "info", "Stopping the server gracefully.")
 
@@ -1786,7 +1864,17 @@ func (m *Manager) changeServerPort(s *Server, port int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	candidate := []portBinding{{port, "tcp"}, {port, "udp"}}
+	// The candidate is THIS server's full geometry (span + extras) with the
+	// new base - a port move relocates the whole binding set.
+	protos, span, extras := func() ([]string, int, []string) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.Protocols, s.PortSpan, s.ExtraPorts
+	}()
+	candidate, err := candidateBindings(port, protos, span, extras)
+	if err != nil {
+		return err
+	}
 	for _, id := range m.order {
 		other, ok := m.servers[id]
 		if !ok || other.ID == s.ID {
@@ -1832,6 +1920,14 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 		}
 	}
 
+	// The whole settings mutation is a filesystem read section: without it,
+	// a settings change could interleave with Start's fsMu window and hand
+	// the container a memory/CPU/port configuration that no longer matches
+	// what was just persisted. The port move happens INSIDE it - outside,
+	// Start could read the old port for -p and the new one for SERVER_PORT.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	// The port moves first and atomically. If it is taken, the whole request
 	// is refused before any other setting has been applied.
 	if newPort > 0 {
@@ -1840,12 +1936,6 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 		}
 	}
 
-	// The whole settings mutation is a filesystem read section: without it,
-	// a settings change could interleave with Start's fsMu window and hand
-	// the container a memory/CPU/port configuration that no longer matches
-	// what was just persisted.
-	s.fsMu.RLock()
-	defer s.fsMu.RUnlock()
 
 	// Everything that touches s.Props happens under the lock. reloadProps
 	// writes the same map from the file-manager path, and Go aborts the whole

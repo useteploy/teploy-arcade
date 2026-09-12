@@ -480,6 +480,13 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		}
 		installed = append(installed, e.Name())
 	}
+	// Commit marker: boot recovery cannot otherwise distinguish an
+	// interrupted install (old must go back) from a completed restore whose
+	// staging cleanup was itself interrupted (new stays, staging goes).
+	if err := os.WriteFile(filepath.Join(staging, ".committed"), []byte("1"), 0o644); err != nil {
+		rollbackRestore(installed, held, dir)
+		return fmt.Errorf("restore installed but could not be marked committed; the previous world was put back: %w", err)
+	}
 
 	// Extracted by root into staging and moved in, so every restored file is
 	// root's while the game runs as uid 1000 - a restore would hand back a
@@ -661,10 +668,15 @@ func tarGz(src, dst string) (int64, error) {
 		os.Remove(part)
 		return 0, err
 	}
-	if err := os.Rename(part, dst); err != nil {
+	// Link-then-unlink instead of rename: rename silently REPLACES an
+	// existing dst, which lost the no-overwrite guarantee the O_EXCL open
+	// used to provide. link() fails with EEXIST, so the caller's re-stamp
+	// retry works again.
+	if err := os.Link(part, dst); err != nil {
 		os.Remove(part)
 		return 0, err
 	}
+	os.Remove(part)
 	return info.Size(), nil
 }
 

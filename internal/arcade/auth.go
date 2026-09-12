@@ -402,10 +402,19 @@ func (a *Auth) Login(name, password string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{Token: tok, User: uname, Role: role,
-		Expires: time.Now().Add(sessionTTL)}
 
 	a.mu.Lock()
+	// Revalidate before minting: the PBKDF2 above ran unlocked for hundreds
+	// of milliseconds, and a password change or account deletion landing in
+	// that window would otherwise be rolled back by a fresh session minted
+	// from the revoked credentials.
+	u2, ok := a.users[strings.ToLower(name)]
+	if !ok || u2.Salt != salt || u2.Hash != hash {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("invalid credentials")
+	}
+	s := &Session{Token: tok, User: uname, Role: role,
+		Expires: time.Now().Add(sessionTTL)}
 	a.sessions[s.Token] = s
 	a.mu.Unlock()
 	return s, nil
