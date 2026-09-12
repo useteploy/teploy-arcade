@@ -344,13 +344,15 @@ func (m *Manager) SetBackupKeep(s *Server, keep int, actor string) error {
 // server must be stopped: restoring under a running game would have the process
 // writing into a tree being replaced beneath it.
 func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
+	// The filesystem gate comes BEFORE the state check: Start commits under
+	// the same gate, so with the check first a server could launch between
+	// the two and the restore would swap files under a live game.
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
+
 	if st := s.State(); st != StatusStopped && st != StatusFailed {
 		return fmt.Errorf("stop the server before restoring a backup")
 	}
-	// Same filesystem gate as CreateBackup: the swap of the live tree is
-	// exclusive against file and plugin mutations.
-	s.fsMu.Lock()
-	defer s.fsMu.Unlock()
 
 	if !m.lockBackup(s.ID) {
 		return fmt.Errorf("a backup is already running for this server")
@@ -370,6 +372,15 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		return fmt.Errorf("no such backup")
 	}
 
+	// The server dir resolves first: for an adopted-in-place server the tree
+	// lives on the operator's filesystem, and the free-space guard must
+	// measure the disk the archive is actually about to expand onto - not
+	// the panel's.
+	dir, err := m.ensureServerDir(s)
+	if err != nil {
+		return err
+	}
+
 	// A restore extracts into a staging directory on the same filesystem before
 	// anything live is touched, so running out of room part way through cannot
 	// damage the world - the staging tree is removed and the server directory
@@ -377,16 +388,11 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	// the panel from spending ten minutes filling a shared disk, and taking
 	// every other server on the host down with it, to reach that conclusion.
 	if need := uncompressedSize(archive, st.Size()); need > 0 {
-		if free, err := diskFree(m.dataDir); err == nil && free < need+importFreeMargin {
+		if free, err := diskFree(dir); err == nil && free < need+importFreeMargin {
 			return fmt.Errorf(
-				"restoring this backup needs about %s free and only %s is left on the panel's disk",
+				"restoring this backup needs about %s free and only %s is left on the server's filesystem",
 				humanSize(need+importFreeMargin), humanSize(free))
 		}
-	}
-
-	dir, err := m.ensureServerDir(s)
-	if err != nil {
-		return err
 	}
 
 	// Restore the directory's CONTENTS, never the directory itself.
@@ -405,6 +411,11 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	// and every rename below crosses between the target and the staging area -
 	// a staging dir on the panel's own volume made restore fail with EXDEV on
 	// the very first entry for exactly that layout.
+	//
+	// Extracted data and transaction bookkeeping live in SEPARATE siblings
+	// ("new" and "old"): the archive namespace is the server's own, and a
+	// legitimate top-level ".previous" entry used to collide with the holding
+	// directory and silently never be installed.
 	staging, err := os.MkdirTemp(dir, ".arcade-restore-")
 	if err != nil {
 		return err
@@ -412,16 +423,31 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	defer os.RemoveAll(staging)
 	stagingName := filepath.Base(staging)
 
-	if err := untarGz(archive, staging); err != nil {
+	extracted := filepath.Join(staging, "new")
+	held := filepath.Join(staging, "old")
+	if err := os.Mkdir(extracted, 0o700); err != nil {
+		return err
+	}
+	if err := os.Mkdir(held, 0o700); err != nil {
+		return err
+	}
+
+	if err := untarGz(archive, extracted); err != nil {
 		return fmt.Errorf("restore failed, the live world was not touched: %w", err)
+	}
+
+	// The staged tree's server.properties is validated BEFORE anything live
+	// moves: an archive carrying a port another server owns would otherwise
+	// be installed first and rejected by reloadProps afterwards, leaving disk
+	// and the panel's model disagreeing about the port.
+	if content, err := os.ReadFile(filepath.Join(extracted, "server.properties")); err == nil {
+		if err := m.validatePropsPort(s, string(content)); err != nil {
+			return err
+		}
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return err
-	}
-	held := filepath.Join(staging, ".previous")
-	if err := os.MkdirAll(held, 0o700); err != nil {
 		return err
 	}
 	for _, e := range entries {
@@ -442,16 +468,13 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	// old/new world behind an error message claiming the previous world was
 	// put back.
 	var installed []string
-	staged, err := os.ReadDir(staging)
+	staged, err := os.ReadDir(extracted)
 	if err != nil {
 		rollbackRestore(installed, held, dir)
 		return err
 	}
 	for _, e := range staged {
-		if e.Name() == ".previous" {
-			continue
-		}
-		if err := os.Rename(filepath.Join(staging, e.Name()), filepath.Join(dir, e.Name())); err != nil {
+		if err := os.Rename(filepath.Join(extracted, e.Name()), filepath.Join(dir, e.Name())); err != nil {
 			rollbackRestore(installed, held, dir)
 			return fmt.Errorf("restore failed part way, the previous world was put back: %w", err)
 		}

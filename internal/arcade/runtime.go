@@ -53,7 +53,10 @@ func recoverPanic(what string) {
 // rename consumes it, and the second fails ENOENT having saved nothing. Most of
 // those callers discard the error, so the state change was simply lost.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp")
+	// ".arcade-tmp-" is the panel's reserved prefix; the boot sweep removes
+	// only files carrying it, so nothing with a merely .tmp-ish name that a
+	// game or plugin legitimately owns gets deleted at startup.
+	f, err := os.CreateTemp(filepath.Dir(path), ".arcade-tmp-*")
 	if err != nil {
 		return err
 	}
@@ -179,12 +182,15 @@ func fileOwner(path string) (int, int, bool) {
 // the per-server lists it accumulated inside the directory the file manager
 // shows the operator. Called once at boot, when nothing is mid-write.
 func sweepTempFiles(root string) {
+	// Only the panel's reserved prefix: a name merely containing ".tmp" is
+	// not evidence of panel ownership - game data (cache.tmp, world.tmp.dat)
+	// was being deleted on every boot.
 	var removed int
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		if i := strings.Index(d.Name(), ".tmp"); i > 0 {
+		if strings.HasPrefix(d.Name(), ".arcade-tmp-") {
 			if os.Remove(p) == nil {
 				removed++
 			}
@@ -192,7 +198,7 @@ func sweepTempFiles(root string) {
 		return nil
 	})
 	if removed > 0 {
-		log.Printf("cleaned up %d temp file(s) left by an interrupted write", removed)
+		log.Printf("cleaned up %d panel temp file(s) left by an interrupted write", removed)
 	}
 }
 

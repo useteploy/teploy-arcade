@@ -36,3 +36,18 @@ Open items: 1 P2 improvement (1 total)
 11. LOW !wait atoi silent zero - FIXED: strict strconv.Atoi with an explicit error.
 
 Verification: go build, go vet, full go test ./... and go test -race ./internal/arcade all clean (2026-09-12).
+
+## ChatGPT audit pass 2 (2026-09-12, AUDIT-CHATGPT-2.md) - all 10 findings verified and fixed
+
+1. HIGH concurrent Save deadlock + stale rename - FIXED: Manager.saveMu serialises snapshot through atomic rename.
+2. CRITICAL Start/Delete bypass fsMu; restore state-check raced Start - FIXED: Start holds fsMu around claim+launch; Delete takes fsMu before lifecycle; RestoreBackup locks fsMu BEFORE the state check. Lock order: fsMu -> lifecycle.
+3. HIGH clone + player-list writes missed the fs gate - FIXED: clone is an exclusive snapshot transaction (fsMu + quiesceForBackup); writeList holds fsMu shared.
+4. HIGH Create/import rollback could delete a started server - FIXED: provisional registration through persistence now runs under the lifecycle mutex.
+5. HIGH failed adopt import left the operator's server.properties modified - FIXED: external file snapshotted before adoption and restored on every post-write failure.
+6. MEDIUM restore measured the panel's disk - FIXED: server dir resolved first, diskFree(dir).
+7. MEDIUM staging/.previous collided with the archive namespace - FIXED: extracted data and held entries live in staging/new and staging/old siblings.
+8. MEDIUM reloadProps bypassed changeServerPort - FIXED: reloadProps commits port changes through changeServerPort and refuses (model AND disk stay consistent); WriteFile and RestoreBackup validate the staged port before any bytes land.
+9. LOW pointer PATCH allowed blank name/commands - FIXED: validateTask enforced by both Add and Update with rollback.
+10. HIGH boot sweep deleted any file containing .tmp - FIXED: panel temps carry the reserved ".arcade-tmp-" prefix (writeFileAtomic + writeAtomicIn); the sweep removes only that prefix.
+
+Verification: go build, go vet, go test ./..., go test -race ./internal/arcade - all clean (2026-09-12).

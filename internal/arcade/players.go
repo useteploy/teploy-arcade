@@ -111,6 +111,12 @@ func (m *Manager) readList(s *Server, l PlayerList) ([]ListEntry, error) {
 }
 
 func (m *Manager) writeList(s *Server, l PlayerList, entries []ListEntry) error {
+	// A shared mutation of the server tree like any other: held on the
+	// filesystem gate so a list edit cannot land inside a backup/restore
+	// window.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+
 	name, err := l.file()
 	if err != nil {
 		return err

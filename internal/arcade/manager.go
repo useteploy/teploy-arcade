@@ -22,6 +22,13 @@ type Manager struct {
 	servers map[string]*Server
 	order   []string
 
+	// saveMu serialises the whole persistence transaction - snapshot through
+	// atomic rename. The s.mu acquisition order follows m.order, which
+	// Reorder can change between two concurrent saves' snapshots, so without
+	// this two saves could lock the same servers in opposite orders and
+	// deadlock; it also stops an older snapshot from winning the final rename.
+	saveMu sync.Mutex
+
 	hub     *Hub
 	dataDir string
 
@@ -335,6 +342,9 @@ func (m *Manager) reconcile() {
 }
 
 func (m *Manager) Save() error {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+
 	m.mu.RLock()
 	list := make([]*Server, 0, len(m.order))
 	for _, id := range m.order {
@@ -666,6 +676,12 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 		chownTree(dir, containerRunUID, containerRunGID)
 	}
 
+	// Provisional registration through persistence, inside the lifecycle
+	// mutex: Start and Delete commit their transitions under the same lock,
+	// so neither can observe - let alone claim - a server whose Save has not
+	// committed. Rollback can then never yank a tree out from under a
+	// process the panel just started.
+	m.lifecycle.Lock()
 	m.mu.Lock()
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)
@@ -687,9 +703,11 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 			}
 		}
 		m.mu.Unlock()
+		m.lifecycle.Unlock()
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("could not persist the new server: %w", err)
 	}
+	m.lifecycle.Unlock()
 
 	m.broadcastEvent("server.created", s.ID)
 	return s, nil
@@ -798,14 +816,20 @@ func (m *Manager) Reorder(ids []string) error {
 }
 
 func (m *Manager) Delete(id string) error {
+	// fsMu first, then lifecycle: a stopped server deleted while a backup or
+	// restore owns the exclusive filesystem gate would have its tree (or an
+	// adopted server's operator-owned tree) removed or swapped underneath
+	// that transaction.
+	s := m.Get(id)
+	if s == nil {
+		return fmt.Errorf("no such server")
+	}
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
+
 	// Held from the state check through the map mutation, so a Start cannot
 	// slip between them and leave a runner attached to a deleted server.
 	m.lifecycle.Lock()
-	s := m.Get(id)
-	if s == nil {
-		m.lifecycle.Unlock()
-		return fmt.Errorf("no such server")
-	}
 	if st := s.State(); st == StatusRunning || st == StatusStarting {
 		m.lifecycle.Unlock()
 		return fmt.Errorf("stop the server before deleting it")
@@ -951,6 +975,14 @@ func (m *Manager) Start(id string) error {
 			m.pullImage(s)
 		}
 	}
+
+	// The filesystem gate makes Start a transaction against backup/restore:
+	// a backup that observed this server stopped would otherwise archive a
+	// tree the container is writing into, and a restore could swap files
+	// under a game that just launched. Lock order is fsMu -> lifecycle
+	// (claimStart), the order Delete and the backup paths use too.
+	s.fsMu.Lock()
+	defer s.fsMu.Unlock()
 
 	if err := m.claimStart(s); err != nil {
 		return err

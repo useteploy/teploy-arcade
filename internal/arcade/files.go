@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -169,6 +170,9 @@ func (m *Manager) rooted(s *Server, rel string) (*os.Root, string, error) {
 // file both used it, so one removed the other's temp and the loser failed with
 // ENOENT. O_CREATE|O_EXCL refuses an existing path of any kind, symlink
 // included, which closes both.
+//
+// The ".arcade-tmp-" prefix is what the boot sweep keys on: sweeping any name
+// containing ".tmp" deleted legitimate game files that happened to carry it.
 func writeAtomicIn(r *os.Root, name string, data []byte, perm os.FileMode) error {
 	dir := path.Dir(name)
 	if dir == "." {
@@ -178,7 +182,7 @@ func writeAtomicIn(r *os.Root, name string, data []byte, perm os.FileMode) error
 	if err != nil {
 		return err
 	}
-	tmp := path.Join(dir, "."+path.Base(name)+"."+suffix+".tmp")
+	tmp := path.Join(dir, ".arcade-tmp-"+suffix)
 
 	f, err := r.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
 	if err != nil {
@@ -371,6 +375,14 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 			return friendlyFSError(err, rel)
 		}
 	}
+	// server.properties carries the panel's port identity: the candidate port
+	// is validated BEFORE the bytes land, so a conflicting or out-of-range
+	// value never gets written to disk for reloadProps to then refuse.
+	if path.Base(name) == "server.properties" {
+		if err := m.validatePropsPort(s, content); err != nil {
+			return err
+		}
+	}
 	if err := writeAtomicIn(r, name, []byte(content), 0o644); err != nil {
 		return friendlyFSError(err, rel)
 	}
@@ -490,28 +502,99 @@ func (m *Manager) writeProps(s *Server) error {
 	return writeAtomicIn(r, "server.properties", []byte(b.String()), 0o644)
 }
 
-// reloadProps parses an edited server.properties back into the panel's model so
-// the settings screen and the file never drift.
-func (m *Manager) reloadProps(s *Server, content string) {
-	s.mu.Lock()
+// validatePropsPort checks a properties file's server-port the way
+// changeServerPort would, without committing anything: paths about to publish
+// new properties bytes (a restore's staged archive) call this first so a
+// conflict is refused BEFORE the tree is swapped, not after.
+func (m *Manager) validatePropsPort(s *Server, content string) error {
 	for _, ln := range strings.Split(content, "\n") {
 		ln = strings.TrimSpace(ln)
 		if ln == "" || strings.HasPrefix(ln, "#") {
 			continue
 		}
 		k, v, ok := strings.Cut(ln, "=")
-		if !ok {
+		if !ok || strings.TrimSpace(k) != "server-port" {
 			continue
 		}
-		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		p, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || p < 1 || p > 65535 {
+			return fmt.Errorf("server-port %q is out of range", v)
+		}
+		s.mu.Lock()
+		current := s.Port
+		s.mu.Unlock()
+		if p == current {
+			return nil
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, id := range m.order {
+			other, ok := m.servers[id]
+			if !ok || other.ID == s.ID {
+				continue
+			}
+			other.mu.Lock()
+			taken, name := other.Port == p, other.Name
+			other.mu.Unlock()
+			if taken {
+				return fmt.Errorf("port %d is already used by %q", p, name)
+			}
+		}
+		if _, held := m.reservedPorts[p]; held {
+			return fmt.Errorf("port %d is reserved by an import or create in progress", p)
+		}
+		return nil
+	}
+	return nil
+}
+
+// reloadProps parses an edited server.properties back into the panel's model so
+// the settings screen and the file never drift.
+func (m *Manager) reloadProps(s *Server, content string) {
+	parsed := map[string]string{}
+	for _, ln := range strings.Split(content, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(ln, "="); ok {
+			parsed[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+
+	// Every port adoption goes through the manager-level transaction: the
+	// old shape assigned s.Port directly here, letting an edited or restored
+	// file reintroduce duplicate port ownership or an out-of-range value the
+	// settings path had just been fixed to refuse.
+	if raw, ok := parsed["server-port"]; ok {
+		s.mu.Lock()
+		current := s.Port
+		s.mu.Unlock()
+		p, convErr := strconv.Atoi(raw)
+		var err error
+		if convErr != nil || p < 1 || p > 65535 {
+			err = fmt.Errorf("server-port %q is out of range", raw)
+		} else if p != current {
+			err = m.changeServerPort(s, p)
+		}
+		if err != nil {
+			// The refused value never reaches the model either: Props and
+			// Port must not disagree with each other.
+			log.Printf("%s: refusing the edited server-port from server.properties: %v", s.ID, err)
+			s.mu.Lock()
+			s.Props["server-port"] = itoa(s.Port)
+			s.mu.Unlock()
+			delete(parsed, "server-port")
+		}
+	}
+
+	s.mu.Lock()
+	for k, v := range parsed {
 		if _, known := s.Props[k]; known {
 			s.Props[k] = v
 		}
 	}
-	if p := atoi(s.Props["server-port"]); p > 0 {
-		s.Port = p
-	}
-	if mp := atoi(s.Props["max-players"]); mp > 0 {
+	if mp := atoi(parsed["max-players"]); mp > 0 {
 		s.MaxPlayers = mp
 	}
 	s.mu.Unlock()

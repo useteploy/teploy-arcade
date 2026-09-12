@@ -789,6 +789,24 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	}
 
 	if mode == ImportAdopt {
+		// finishImport's writeProps rewrites the operator's OWN
+		// server.properties with the panel's chosen port. If persistence
+		// then fails, the external file must go back exactly as it was -
+		// leaving it modified breaks the server under its previous
+		// controller, on the next start, with nothing connecting the two.
+		propsPath := filepath.Join(sc.Path, "server.properties")
+		oldProps, readErr := os.ReadFile(propsPath)
+		oldExists := readErr == nil
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return nil, readErr
+		}
+		oldPerm := os.FileMode(0o644)
+		if oldExists {
+			if fi, err := os.Stat(propsPath); err == nil {
+				oldPerm = fi.Mode().Perm()
+			}
+		}
+
 		// One symlink, so it finishes inside the request. It still reports a job
 		// so the UI has one flow for both modes rather than two.
 		if err := adoptInPlace(dst, sc.Path); err != nil {
@@ -797,6 +815,11 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 		job := newImportJob(sc, mode, name)
 		claimHeld = false // the server now holds the port
 		if err := m.finishImport(job, s, sc, actor); err != nil {
+			if oldExists {
+				_ = writeFileAtomic(propsPath, oldProps, oldPerm)
+			} else {
+				_ = os.Remove(propsPath)
+			}
 			// Only the panel's own symlink is removed - the operator's tree
 			// was never ours to delete.
 			_ = os.Remove(dst)
@@ -873,6 +896,14 @@ func applyImportedProps(s *Server, sc *ImportScan, port int) {
 // rolls its own work (copied tree, adopt link, port claim) back when this
 // errors.
 func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, actor string) error {
+	// Provisional registration through persistence, inside the lifecycle
+	// mutex: Start and Delete commit under the same lock, so neither can
+	// observe - let alone claim - a server whose writeProps/Save has not
+	// committed. Rollback can then never yank a tree out from under a
+	// process the panel just started.
+	m.lifecycle.Lock()
+	defer m.lifecycle.Unlock()
+
 	m.mu.Lock()
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)

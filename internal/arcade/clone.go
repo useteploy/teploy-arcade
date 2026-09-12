@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // Cloning a server: the same tree, a new identity.
@@ -155,41 +154,32 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 	go func() {
 		defer recoverPanic("clone of " + src.Name)
 
+		// A clone is a snapshot transaction: exclusive on the source's
+		// filesystem gate, so settings writes, file edits and restores
+		// cannot interleave generations into the copy. For a stopped source
+		// the old shape took no gate at all.
+		src.fsMu.Lock()
+		defer src.fsMu.Unlock()
+
+		if !m.lockBackup(src.ID) {
+			m.releasePort(port)
+			job.fail(fmt.Errorf("a snapshot operation is running for %s; try again when it finishes", src.Name))
+			return
+		}
+		defer m.unlockBackup(src.ID)
+
 		// A running source is quiesced exactly the way a backup quiesces it.
 		// Copying a live world without pausing saves reads region files mid
 		// write, and the clone boots on a torn world - which looks like
-		// corruption in the copy rather than a bad copy.
-		wasRunning := src.State() == StatusRunning
-		if wasRunning {
-			if !m.lockBackup(src.ID) {
-				m.releasePort(port)
-				job.fail(fmt.Errorf("a backup is running for %s; try again when it finishes", src.Name))
-				return
-			}
-			defer m.unlockBackup(src.ID)
-			m.panelLine(src, "info", "Cloning - pausing world saves and flushing to disk.")
-			runner := m.runnerFor(src)
-			// A quiesce command that cannot be delivered means the source's
-			// saves cannot be paused or flushed, and the copy would read
-			// region files mid-write - a clone that boots on a torn world.
-			// Abort instead; no bytes have been copied yet, so there is
-			// nothing to clean up but the claim and the lock.
-			if err := runner.Send(src, "save-off"); err != nil {
-				m.releasePort(port)
-				job.fail(fmt.Errorf("could not pause world saves on %s: %v", src.Name, err))
-				return
-			}
-			defer func() {
-				_ = runner.Send(src, "save-on")
-				m.panelLine(src, "info", "Clone finished - world saves resumed.")
-			}()
-			if err := runner.Send(src, "save-all flush"); err != nil {
-				m.releasePort(port)
-				job.fail(fmt.Errorf("could not flush %s's world to disk, so the clone was aborted rather than copy a torn world: %v", src.Name, err))
-				return
-			}
-			time.Sleep(1500 * time.Millisecond)
+		// corruption in the copy rather than a bad copy. A quiesce that
+		// cannot be delivered aborts the clone before any bytes are copied.
+		resume, err := m.quiesceForBackup(src)
+		if err != nil {
+			m.releasePort(port)
+			job.fail(fmt.Errorf("could not quiesce %s for cloning: %v", src.Name, err))
+			return
 		}
+		defer resume()
 
 		if err := copyTreeFiltered(srcDir, dst, job, cloneSkip); err != nil {
 			// A half-copied tree is a server that boots on a truncated world.

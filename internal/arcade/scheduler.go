@@ -120,14 +120,21 @@ func (sc *Scheduler) List(serverID string) []*Task {
 	return out
 }
 
-func (sc *Scheduler) Add(t *Task) (*Task, error) {
+// validateTask is the single rule set every write path enforces, so Add and
+// Update cannot drift apart again.
+func validateTask(t *Task) error {
 	if strings.TrimSpace(t.Name) == "" {
-		return nil, fmt.Errorf("a task name is required")
+		return fmt.Errorf("a task name is required")
 	}
 	if strings.TrimSpace(t.Commands) == "" {
-		return nil, fmt.Errorf("at least one command is required")
+		return fmt.Errorf("at least one command is required")
 	}
-	if _, err := parseClock(t.Time); err != nil {
+	_, err := parseClock(t.Time)
+	return err
+}
+
+func (sc *Scheduler) Add(t *Task) (*Task, error) {
+	if err := validateTask(t); err != nil {
 		return nil, err
 	}
 	if sc.mgr.Get(t.ServerID) == nil {
@@ -150,10 +157,12 @@ func (sc *Scheduler) Update(id string, fn func(*Task)) (*Task, error) {
 		if t.ID == id {
 			before := *t
 			fn(t)
-			if _, err := parseClock(t.Time); err != nil {
-				// A rejected edit must not survive in memory. Leaving the bad
-				// time on the live task would stop the loop firing a task the
-				// operator was just told was left unchanged.
+			if err := validateTask(t); err != nil {
+				// A rejected edit must not survive in memory. Leaving a bad
+				// task on the live schedule would keep firing a task the
+				// operator was just told was left unchanged - and the pointer
+				// PATCH fix made blank names/commands reachable, which used
+				// to record successful runs of nothing.
 				*t = before
 				return nil, err
 			}
