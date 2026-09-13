@@ -80,3 +80,13 @@ Verification: go build, go vet, go test ./... and go test -race - all clean (202
 8. HIGH Login stale-credential mint - FIXED: the salt/hash snapshot is revalidated under the write lock before the session is inserted.
 
 Verification: go build, go vet, go test ./..., go test -race - all clean (2026-09-12).
+
+## ChatGPT audit pass 5 (2026-09-12, AUDIT-CHATGPT-5.md) - all 5 fixed
+
+1. HIGH live port change released the container's binding - FIXED: Server.BindPort records the port the live container was created with (set in claimStart, cleared in stopped/fail); serverBindings returns the UNION of live and desired binding sets during a transition, so the old host port stays held until the restart that actually recreates the container. ApplySettings' restart-pending snapshot is read under fsMu after any wait and includes `starting`.
+2. HIGH reservations/admissions base-only - FIXED: every candidate member (span + extras) is written to reservedPorts; releasePort drops the holder's whole reservation; clone and import claim with their template's full geometry (candidateBindings), so a Valheim clone at 65535 is refused at admission; changeServerPort/validatePropsPort check every candidate member against reservations.
+3. HIGH Geyser dynamic port absent - FIXED: dynamicBindings() probes the server tree (Geyser's Bedrock UDP) at claimStart OUTSIDE the manager lock and stores it on Server.DynamicBindings; serverBindings and the claimStart conflict check include it while the container is live.
+4. HIGH boot recovery removed the wrong entries - FIXED: at swap time every live entry had been moved to old/, so recovery now removes ALL live entries (except staging) and then restores old/ - the installed set, not staging/new's not-yet-installed remainder. The .committed marker is written LAST, after ownership repair and props reload; a marker write failure logs loudly instead of failing a finished restore into a boot-time undo.
+5. MEDIUM port publication split - FIXED: WriteFile writes the new file FIRST and commits the port SECOND (a failed write never moves the model; a failed commit only restores the old bytes - the silently-dropped model revert is gone). RestoreBackup republishes the model's port via writePropsHeld when the restored file's port was refused, so a raced restore can no longer report success with disk naming another server's port.
+
+Verification: go build, go vet, go test ./..., go test -race - all clean (2026-09-12).

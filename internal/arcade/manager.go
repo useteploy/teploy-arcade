@@ -41,8 +41,10 @@ type Manager struct {
 	// Ports claimed by an import that has not registered its server yet. A
 	// copy import runs for minutes on a background goroutine, so without a
 	// reservation every concurrent import passes the same portOwner check and
-	// they all land on one port.
+	// they all land on one port. Every member of a claimed binding set is
+	// reserved (spans and extras), not just the base.
 	reservedPorts map[int]string
+	reservedByWho map[string][]int
 
 	sim    Runner
 	docker Runner
@@ -89,6 +91,7 @@ func NewManager(dataDir string, hub *Hub) *Manager {
 		mcp:     newMCPTokens(dataDir),
 	}
 	m.reservedPorts = map[int]string{}
+	m.reservedByWho = map[string][]int{}
 	m.dirSizes = map[string]int64{}
 	m.sched = newScheduler(dataDir, m)
 	m.sim = &simRunner{mgr: m}
@@ -184,14 +187,19 @@ func (m *Manager) recoverInterruptedRestores() {
 				continue
 			}
 			if heldEnts, err := os.ReadDir(held); err == nil && len(heldEnts) > 0 {
-				// Mirror the in-process rollback: remove what the interrupted
-				// install placed, THEN put the old world back. restoreHeld
-				// alone cannot rename directories over the new ones, and
-				// blindly deleting the staging tree afterwards would destroy
-				// the only copy of the old world.
-				if newEnts, nerr := os.ReadDir(filepath.Join(staging, "new")); nerr == nil {
-					for _, ne := range newEnts {
-						_ = os.RemoveAll(filepath.Join(dir, ne.Name()))
+				// At swap time EVERY live entry had been moved into old/, so
+				// anything now in the live directory was placed there by the
+				// interrupted install. (Enumerating staging/new instead
+				// removed exactly the NOT-yet-installed entries and left the
+				// installed ones blocking the old world's return.) Remove
+				// all live entries except the staging tree itself, then put
+				// the old world back.
+				if liveEnts, lerr := os.ReadDir(dir); lerr == nil {
+					for _, le := range liveEnts {
+						if le.Name() == e.Name() {
+							continue
+						}
+						_ = os.RemoveAll(filepath.Join(dir, le.Name()))
 					}
 				}
 				restoreHeld(held, dir)
@@ -979,26 +987,41 @@ func serverBindings(s *Server) []portBinding {
 }
 
 func serverBindingsLocked(s *Server) []portBinding {
-	protos := s.Protocols
-	if len(protos) == 0 {
-		protos = []string{"tcp"}
+	build := func(base int) []portBinding {
+		protos := s.Protocols
+		if len(protos) == 0 {
+			protos = []string{"tcp"}
+		}
+		var out []portBinding
+		span := s.PortSpan
+		if span < 1 {
+			span = 1
+		}
+		for i := 0; i < span; i++ {
+			if base+i > 65535 {
+				break
+			}
+			for _, pr := range protos {
+				out = append(out, portBinding{base + i, pr})
+			}
+		}
+		for _, extra := range s.ExtraPorts {
+			n, pr := parseBindingNumber(extra)
+			if n > 0 {
+				out = append(out, portBinding{n, pr})
+			}
+		}
+		return out
 	}
 	var out []portBinding
-	span := s.PortSpan
-	if span < 1 {
-		span = 1
+	// While a container is live, the port it was CREATED with stays bound
+	// until the restart that applies s.Port actually recreates it - the
+	// ledger holds both sides of the transition.
+	if s.BindPort > 0 && s.BindPort != s.Port {
+		out = append(out, build(s.BindPort)...)
 	}
-	for i := 0; i < span; i++ {
-		for _, pr := range protos {
-			out = append(out, portBinding{s.Port + i, pr})
-		}
-	}
-	for _, extra := range s.ExtraPorts {
-		n, pr := parseBindingNumber(extra)
-		if n > 0 {
-			out = append(out, portBinding{n, pr})
-		}
-	}
+	out = append(out, build(s.Port)...)
+	out = append(out, s.DynamicBindings...)
 	return out
 }
 
@@ -1074,9 +1097,31 @@ func (m *Manager) claimPortBindings(cand []portBinding, who string) (string, boo
 			return holder + " (import in progress)", false
 		}
 	}
-	base := cand[0].port
-	m.reservedPorts[base] = who
+	for _, b := range cand {
+		m.reservedPorts[b.port] = who
+	}
+	m.reservedByWho[who] = append(m.reservedByWho[who], portsOf(cand)...)
 	return "", true
+}
+
+// dynamicBindings probes the server tree for runtime-derived ports (the
+// Geyser Bedrock UDP port today) at launch time, so claimStart can admit
+// them into the ledger from pure state afterwards. Runs OUTSIDE the manager
+// lock - it reads disk.
+func dynamicBindings(dataDir, serverID string) []portBinding {
+	var out []portBinding
+	if port, ok := geyserPort(filepath.Join(dataDir, "servers", serverID)); ok {
+		out = append(out, portBinding{port, "udp"})
+	}
+	return out
+}
+
+func portsOf(cand []portBinding) []int {
+	out := make([]int, 0, len(cand))
+	for _, b := range cand {
+		out = append(out, b.port)
+	}
+	return out
 }
 
 func (m *Manager) claimPort(port int, who string) (string, bool) {
@@ -1089,7 +1134,14 @@ func (m *Manager) claimPort(port int, who string) (string, bool) {
 
 func (m *Manager) releasePort(port int) {
 	m.mu.Lock()
-	delete(m.reservedPorts, port)
+	who := m.reservedPorts[port]
+	// Release the WHOLE reservation this port belongs to: spans and extras
+	// were reserved together, and dropping only the base left phantom holds
+	// on the remaining members.
+	for _, p := range m.reservedByWho[who] {
+		delete(m.reservedPorts, p)
+	}
+	delete(m.reservedByWho, who)
 	m.mu.Unlock()
 }
 
@@ -1206,6 +1258,15 @@ func (m *Manager) claimStart(s *Server) error {
 		return fmt.Errorf("this server failed %d times in a row; clear the failure count before starting it again",
 			maxRestarts)
 	}
+	// Runtime-derived bindings (Geyser's Bedrock UDP port and anything else
+	// the launch path discovers in the server tree) join the ledger here,
+	// from pure state, so the conflict check below sees them without any IO
+	// under the manager lock.
+	s.mu.Lock()
+	s.BindPort = s.Port
+	s.DynamicBindings = dynamicBindings(m.dataDir, s.ID)
+	s.mu.Unlock()
+
 	// The port is checked at create time, but server.properties can be edited
 	// by hand. Catching it here beats letting Docker fail the bind. Compared
 	// at full binding-set level: spans and fixed extras collide here exactly
@@ -1422,6 +1483,10 @@ func (m *Manager) stopped(s *Server) {
 	s.memMB = 0
 	proc := s.proc
 	s.proc = nil
+	// The container is gone: its created-with port and dynamic bindings no
+	// longer occupy anything.
+	s.BindPort = 0
+	s.DynamicBindings = nil
 	s.mu.Unlock()
 	// Dropping the handle is not the same as cancelling the runner: the
 	// simulator's goroutine only ends when its context does, and until then it
@@ -1469,6 +1534,8 @@ func (m *Manager) fail(s *Server, code int, reason string) {
 	s.memMB = 0
 	proc := s.proc
 	s.proc = nil
+	s.BindPort = 0
+	s.DynamicBindings = nil
 	s.Restarts++
 	if s.FirstFailure.IsZero() || time.Since(s.FirstFailure) > failWindow {
 		s.FirstFailure = time.Now()
@@ -1887,8 +1954,10 @@ func (m *Manager) changeServerPort(s *Server, port int) error {
 			return fmt.Errorf("port %d is already used by %q", port, name)
 		}
 	}
-	if holder, ok := m.reservedPorts[port]; ok {
-		return fmt.Errorf("port %d is reserved by %q (an import or create in progress)", port, holder)
+	for _, b := range candidate {
+		if holder, ok := m.reservedPorts[b.port]; ok {
+			return fmt.Errorf("port %d is reserved by %q (an import or create in progress)", b.port, holder)
+		}
 	}
 
 	s.mu.Lock()
@@ -1904,7 +1973,6 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 
 	// Validate before taking the lock: a rejected change must not have
 	// half-applied.
-	running := s.State() == StatusRunning
 	newPort := 0
 	for k, v := range changes {
 		meta := propMetaFor(k)
@@ -1940,6 +2008,14 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 	// Everything that touches s.Props happens under the lock. reloadProps
 	// writes the same map from the file-manager path, and Go aborts the whole
 	// process on a concurrent map read/write - it is not a recoverable panic.
+	// Read under the gate and AFTER any wait: `starting` counts too - the
+	// container already exists with the old inputs, and a stale snapshot
+	// taken before waiting reported "applied" for a change that cannot be.
+	running := func() bool {
+		st := s.State()
+		return st == StatusRunning || st == StatusStarting
+	}()
+
 	s.mu.Lock()
 	for k, v := range changes {
 		if s.Props[k] != v && propMetaFor(k).Applies == "next_restart" && running {

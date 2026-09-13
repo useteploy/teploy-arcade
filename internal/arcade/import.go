@@ -721,7 +721,14 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	// Claimed, not merely checked: a copy import registers its server minutes
 	// later on a background goroutine, so a bare check let concurrent imports
 	// all pass and land on the same port.
-	if holder, ok := m.claimPort(port, strings.TrimSpace(req.Name)); !ok {
+	// Claimed with the template's FULL geometry (span + fixed extras), not
+	// just the base: an imported Valheim needs three consecutive ports and a
+	// base-only reservation let overlapping imports through.
+	importCand, cerr := candidateBindings(port, tpl.Protocols, tpl.PortSpan, tpl.ExtraPorts)
+	if cerr != nil {
+		return nil, cerr
+	}
+	if holder, ok := m.claimPortBindings(importCand, strings.TrimSpace(req.Name)); !ok {
 		return nil, fmt.Errorf("port %d is already used by %q; give a different port to import this server", port, holder)
 	}
 	// Validation continues below and can still refuse the import. Hand the

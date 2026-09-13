@@ -480,13 +480,7 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		}
 		installed = append(installed, e.Name())
 	}
-	// Commit marker: boot recovery cannot otherwise distinguish an
-	// interrupted install (old must go back) from a completed restore whose
-	// staging cleanup was itself interrupted (new stays, staging goes).
-	if err := os.WriteFile(filepath.Join(staging, ".committed"), []byte("1"), 0o644); err != nil {
-		rollbackRestore(installed, held, dir)
-		return fmt.Errorf("restore installed but could not be marked committed; the previous world was put back: %w", err)
-	}
+
 
 	// Extracted by root into staging and moved in, so every restored file is
 	// root's while the game runs as uid 1000 - a restore would hand back a
@@ -501,6 +495,32 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		if err := m.reloadProps(s, string(content)); err != nil {
 			log.Printf("%s: restored server.properties applied in memory but not persisted: %v", s.ID, err)
 		}
+		// If the restored port was refused (another server claimed it in the
+		// window between the pre-swap validation and this commit), the model
+		// kept the old port while the file names the refused one - republish
+		// the model's port so disk and panel agree.
+		s.mu.Lock()
+		modelPort := s.Props["server-port"]
+		s.mu.Unlock()
+		if modelPort != "" && !hasPortLine(string(content), modelPort) {
+			log.Printf("%s: restored server.properties names a port the panel refused; republishing the panel's port %s",
+				s.ID, modelPort)
+			if err := m.writePropsHeld(s); err != nil {
+				log.Printf("%s: could not republish the panel's port after a refused restore: %v", s.ID, err)
+			}
+		}
+	}
+
+	// Commit marker LAST - after ownership repair and props reload: a marker
+	// written earlier let boot recovery treat a restore as complete when
+	// only the renames had finished. Crash before this point and recovery
+	// puts the previous world back; crash after it and recovery only drops
+	// the staging tree.
+	if err := os.WriteFile(filepath.Join(staging, ".committed"), []byte("1"), 0o644); err != nil {
+		// The world IS restored; failing the request now would roll nothing
+		// back but leave the marker missing, so boot recovery would undo a
+		// finished restore. Log loudly instead.
+		log.Printf("%s: restore completed but its commit marker could not be written: %v", s.Name, err)
 	}
 
 	m.audit(actor, "backup.restore", s.ID, backupID)
@@ -817,6 +837,18 @@ func restoreHeld(held, dir string) {
 	for _, e := range entries {
 		_ = os.Rename(filepath.Join(held, e.Name()), filepath.Join(dir, e.Name()))
 	}
+}
+
+// hasPortLine reports whether the properties text already carries the given
+// port as its server-port value.
+func hasPortLine(content, port string) bool {
+	for _, ln := range strings.Split(content, "\n") {
+		ln = strings.TrimSpace(ln)
+		if k, v, ok := strings.Cut(ln, "="); ok && strings.TrimSpace(k) == "server-port" {
+			return strings.TrimSpace(v) == port
+		}
+	}
+	return false
 }
 
 func humanSize(n int64) string {

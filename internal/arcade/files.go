@@ -415,16 +415,18 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 			}
 			if k, v, ok := strings.Cut(ln, "="); ok && strings.TrimSpace(k) == "server-port" {
 				if p, cerr := strconv.Atoi(strings.TrimSpace(v)); cerr == nil && p > 0 && p != current {
-					if err := m.changeServerPort(s, p); err != nil {
-						return err
-					}
-					// The write must succeed for the commit to stand; on
-					// failure the old file is restored and the model reverts.
+					// WRITE FIRST, COMMIT SECOND: with this order a failed
+					// write never moves the model (no revert exists to
+					// fail), and a failed commit only has to restore the
+					// old bytes. The previous shape committed first and
+					// needed a model revert whose own failure was silently
+					// dropped, stranding disk and model on different ports.
 					if werr := writePropsFileGuard(r, name, content); werr != nil {
-						// put the file back and revert the model
-						restoreOld()
-						_ = m.changeServerPort(s, current)
 						return friendlyFSError(werr, rel)
+					}
+					if err := m.changeServerPort(s, p); err != nil {
+						restoreOld()
+						return err
 					}
 					return m.reloadProps(s, content)
 				}
@@ -603,8 +605,10 @@ func (m *Manager) validatePropsPort(s *Server, content string) error {
 				return fmt.Errorf("port %d is already used by %q", p, name)
 			}
 		}
-		if _, held := m.reservedPorts[p]; held {
-			return fmt.Errorf("port %d is reserved by an import or create in progress", p)
+		for _, b := range candidate {
+			if _, held := m.reservedPorts[b.port]; held {
+				return fmt.Errorf("port %d is reserved by an import or create in progress", b.port)
+			}
 		}
 		return nil
 	}

@@ -98,7 +98,14 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 	// Claimed rather than checked, for the same reason import claims: the copy
 	// finishes minutes later on a goroutine, and two clones started together
 	// would otherwise both pass a bare check and land on one port.
-	if holder, ok := m.claimPort(port, name); !ok {
+	// Claimed with the template's FULL geometry: the clone inherits the
+	// source's span and fixed extras, and a base-only claim let a Valheim
+	// clone at 65535 pass admission only for Start to publish 65537.
+	cloneCand, err := candidateBindings(port, tpl.Protocols, tpl.PortSpan, tpl.ExtraPorts)
+	if err != nil {
+		return nil, err
+	}
+	if holder, ok := m.claimPortBindings(cloneCand, name); !ok {
 		return nil, fmt.Errorf("port %d is already used by %q; give a different port", port, holder)
 	}
 	claimHeld := true

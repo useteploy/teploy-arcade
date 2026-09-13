@@ -91,6 +91,18 @@ type Server struct {
 	// pass its check and land mid-archive - so this is the lock that actually
 	// enforces the invariant the checks only report.
 	fsMu sync.RWMutex
+	// BindPort is the base port the LIVE container was created with. A port
+	// change on a running server moves s.Port immediately, but Docker's
+	// published binding stays on BindPort until the restart actually
+	// recreates the container - the ledger must hold BOTH during the
+	// transition or another server gets admitted onto a port that is still
+	// bound. Cleared when the container is gone. Not persisted: no container
+	// survives a panel restart.
+	BindPort int `json:"-"`
+	// DynamicBindings are runtime-derived ports the launch path adds beyond
+	// the template's static geometry (Geyser's Bedrock UDP port). Captured
+	// at Start so admission conflicts are checkable from pure state.
+	DynamicBindings []portBinding `json:"-"`
 	// While set, the panel is mid-query on this server's RCON and the console
 	// churn that produces is its own, not the operator's. Not persisted: it
 	// describes the next second, not the server.
