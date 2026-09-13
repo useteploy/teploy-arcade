@@ -19,7 +19,7 @@ has not been.
 | **Templates exercised** | velocity, paper, forge, fabric, vanilla, spigot, purpur, terraria, bedrock |
 | **Templates never run** | bedrock, rust, valheim — all three now publish UDP and know their own ready banner, none has been booted since |
 | **Templates** | 14 |
-| **Tests** | 222 Go + a frontend guard, race-clean |
+| **Tests** | 245 Go + a frontend guard + real-core/desktop smoke pattern, race-clean |
 | **Repo** | `Tyler/teploy-arcade` on Forgejo (`origin`) + `useteploy/teploy-arcade` on GitHub (`github`), both private |
 
 Proven end to end: import from another panel, container lifecycle, detached

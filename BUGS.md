@@ -667,3 +667,21 @@ These four depend on `manager.go` (`Save`, `Create`) and the `files.go` op bodie
 4. H7 (newline injection) + H6 (Actor forgery) + H10 (`.tmp` symlink) — small, high-value security fixes.
 5. H2/M1/M5 (cancellation leaks) — the sync/desync class.
 6. Everything else.
+
+---
+
+## 2026-09-12 — the five-pass ChatGPT audit loop (116 findings, 113 fixed)
+
+`AUDIT_OPEN.md` is the register; the per-pass reports (`AUDIT-CHATGPT*.md`)
+carry the full detail. Headline defects caught by the loop, in the layers a
+self-review had already "finished": the backup filesystem gate vs lifecycle
+lock order (two real deadlocks), the port ledger ignoring spans/fixed
+ports/live container bindings, boot-time restore recovery removing the wrong
+entries, the auth lock held across PBKDF2, and legacy credentials minting
+sessions after revocation. Loop converged 49 → 31 → 26 → 21 → 13 → 0 open.
+
+Runtime smoke (2026-09-12, sim runtime, local): boot, admin login, server
+list, start to `running` with player data, console command, quiesced live
+backup, file list/read, stop, restore, port-conflict refusal, task
+validation, MCP token issue + tools/call + bad-token rejection, delete,
+panel restart recovery — zero panics.
