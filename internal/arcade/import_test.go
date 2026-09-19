@@ -510,7 +510,7 @@ func TestImportAdoptInPlaceLinksInsteadOfCopying(t *testing.T) {
 	}
 
 	// The panel's own file API has to see the operator's files through it.
-	entries, err := mgr.ListFiles(s, "")
+	entries, _, err := mgr.ListFiles(s, "")
 	if err != nil {
 		t.Fatal(err)
 	}

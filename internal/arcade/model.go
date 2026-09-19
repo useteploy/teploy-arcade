@@ -91,6 +91,14 @@ type Server struct {
 	// pass its check and land mid-archive - so this is the lock that actually
 	// enforces the invariant the checks only report.
 	fsMu sync.RWMutex
+	// editMu serializes cooperating configuration mutations with each other.
+	// fsMu shared sections exclude backups and restores but permit multiple
+	// writers, so two settings edits (or a plugin toggle against a file write)
+	// could interleave their publish/model-commit phases, and a failed edit's
+	// rollback could overwrite a newer successful one. Lock order is always
+	// fsMu -> editMu; sections holding fsMu exclusively need no editMu because
+	// they already exclude every shared holder.
+	editMu sync.Mutex
 	// BindPort is the base port the LIVE container was created with. A port
 	// change on a running server moves s.Port immediately, but Docker's
 	// published binding stays on BindPort until the restart actually

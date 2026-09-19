@@ -1142,45 +1142,85 @@ func (r *dockerRunner) watchReady(ctx context.Context, s *Server, name string) {
 // watchExit reports the container stopping. `docker logs -f` exiting is not a
 // reliable signal (it also ends if the daemon hiccups), so block on
 // `docker wait`, which yields the real exit code.
+//
+// A transport failure from `docker wait` is NOT a container death. The daemon
+// being unreachable used to be reported through processExited as a game
+// crash - the panel cleared the server's process and bindings while the
+// container sat there perfectly alive. On a wait error the container is
+// inspected: still running means keep waiting (with backoff), gone means the
+// exit is real, and only a confirmed stop ever moves the server on.
 func (r *dockerRunner) watchExit(ctx context.Context, s *Server, name string) {
 	defer recoverPanic("exit watcher for " + s.ID)
 
-	out, err := exec.CommandContext(ctx, "docker", "wait", name).Output()
-	if err != nil {
-		if ctx.Err() != nil {
-			// We tore it down ourselves, so the kill is not a container
-			// failure - but "we cancelled" is not the same as "someone else
-			// will report this". Stop cancels immediately after `docker stop`
-			// returns, and that cancel kills this `docker wait` before it can
-			// print the exit code. Nothing else moves the server on, so it sat
-			// in "stopping" permanently: Start refuses it ("still stopping"),
-			// Kill returns 200 and changes nothing, and reconcile skips it
-			// because its container is not running. The only way out was a
-			// panel restart, which clears the status on load.
-			//
-			// If the container is gone, the server has stopped. Say so.
-			if !containerRunning(s.ID) {
-				r.mgr.processExited(s, nil)
+	backoff := time.Second
+	for {
+		out, err := exec.CommandContext(ctx, "docker", "wait", name).Output()
+		if err != nil {
+			if ctx.Err() != nil {
+				// We tore it down ourselves, so the kill is not a container
+				// failure - but "we cancelled" is not the same as "someone else
+				// will report this". Stop cancels immediately after `docker stop`
+				// returns, and that cancel kills this `docker wait` before it can
+				// print the exit code. Nothing else moves the server on, so it sat
+				// in "stopping" permanently: Start refuses it ("still stopping"),
+				// Kill returns 200 and changes nothing, and reconcile skips it
+				// because its container is not running. The only way out was a
+				// panel restart, which clears the status on load.
+				//
+				// If the container is gone, the server has stopped. Say so.
+				if !containerRunning(s.ID) {
+					r.mgr.processExited(s, nil)
+				}
+				return
 			}
+			if containerRunning(s.ID) {
+				// Transport error with a live container: supervision
+				// continues. The watcher's job is to outlast daemon hiccups,
+				// not to interpret them as exits.
+				log.Printf("%s: docker wait failed but the container is running; watching again in %s (%v)",
+					s.ID, backoff, err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				continue
+			}
+			r.mgr.processExited(s, err)
 			return
 		}
-		r.mgr.processExited(s, err)
+		// An exit code that actually arrived is authoritative even if the context
+		// has since been cancelled: Stop cancels right after `docker stop` returns,
+		// and dropping the report in that window would strand the server in
+		// "stopping" with nothing left to move it on.
+		code := atoi(strings.TrimSpace(string(out)))
+		if code == 0 {
+			r.mgr.processExited(s, nil)
+			return
+		}
+		reason := "exited"
+		if code == 137 && containerOOMKilled(s.ID) {
+			// 137 means SIGKILL, and only the daemon's own OOMKilled flag says
+			// the kernel did it for memory. A manual `docker kill` and an OOM
+			// used to be reported as the same thing.
+			reason = "OOM"
+		}
+		r.mgr.fail(s, code, reason)
 		return
 	}
-	// An exit code that actually arrived is authoritative even if the context
-	// has since been cancelled: Stop cancels right after `docker stop` returns,
-	// and dropping the report in that window would strand the server in
-	// "stopping" with nothing left to move it on.
-	code := atoi(strings.TrimSpace(string(out)))
-	if code == 0 {
-		r.mgr.processExited(s, nil)
-		return
-	}
-	reason := "exited"
-	if code == 137 {
-		reason = "OOM"
-	}
-	r.mgr.fail(s, code, reason)
+}
+
+// containerOOMKilled asks the daemon whether the container was killed for
+// memory. Absent or unreadable state answers false rather than guessing.
+var containerOOMKilled = func(id string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.OOMKilled}}",
+		containerPrefix+"-"+id).Output()
+	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
 func (r *dockerRunner) pollStats(ctx context.Context, s *Server, name string) {
@@ -1216,15 +1256,60 @@ func (r *dockerRunner) pollStats(ctx context.Context, s *Server, name string) {
 	}
 }
 
+// logLineLimit bounds one console line the panel will buffer. Lines longer
+// than this are truncated in place, with the overflow drained, rather than
+// ending the read: bufio.Scanner's fixed buffer used to make an oversized
+// line stop the reader silently while the log child kept producing output
+// nobody consumed - a wedged console that looked like a quiet server.
+const logLineLimit = 1 << 20
+
+// readLogLine reads one line of at most limit bytes, consuming and discarding
+// any overflow so the stream stays in step, and reporting whether the line was
+// cut short.
+func readLogLine(r *bufio.Reader, limit int) (line []byte, truncated bool, err error) {
+	for {
+		fragment, more, readErr := r.ReadLine()
+		room := limit - len(line)
+		if room > 0 {
+			n := min(room, len(fragment))
+			line = append(line, fragment[:n]...)
+		}
+		if len(fragment) > max(0, room) {
+			truncated = true
+		}
+		if readErr != nil {
+			return line, truncated, readErr
+		}
+		if !more {
+			return line, truncated, nil
+		}
+	}
+}
+
 // stream turns container output into console lines. alreadyReady is set when
 // adopting: the "Done" banner scrolled past before we attached.
 func (r *dockerRunner) stream(s *Server, stdout io.Reader, emit func(Line), alreadyReady bool) {
 	defer recoverPanic("docker stream for " + s.ID)
-	sc := bufio.NewScanner(stdout)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	br := bufio.NewReaderSize(stdout, 64*1024)
 	ready := alreadyReady
-	for sc.Scan() {
-		text := sc.Text()
+	for {
+		raw, truncated, err := readLogLine(br, logLineLimit)
+		if truncated {
+			emit(Line{Level: "warn", Source: "panel",
+				Text: "a console line over " + humanSize(logLineLimit) + " was truncated"})
+		}
+		if len(raw) == 0 {
+			if err != nil {
+				if err != io.EOF {
+					// A log-transport failure is not a game exit; say why the
+					// stream stopped instead of leaving a mute console.
+					log.Printf("%s: the docker log stream ended: %v", s.ID, err)
+				}
+				return
+			}
+			continue
+		}
+		text := string(raw)
 
 		// Transport churn is never worth showing. The middle line - the command
 		// echo - is kept when an operator typed it and dropped when the panel
@@ -1255,6 +1340,12 @@ func (r *dockerRunner) stream(s *Server, stdout io.Reader, emit func(Line), alre
 			r.mgr.setStatus(s, StatusRunning, 0, "")
 		}
 		emit(Line{Level: classify(text), Source: src, Text: text})
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("%s: the docker log stream ended: %v", s.ID, err)
+			}
+			return
+		}
 	}
 }
 
@@ -1272,9 +1363,18 @@ func (r *dockerRunner) Stop(s *Server) error {
 }
 
 func (r *dockerRunner) Kill(s *Server) error {
-	err := exec.Command("docker", "kill", containerPrefix+"-"+s.ID).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "kill", containerPrefix+"-"+s.ID).CombinedOutput()
+	if err != nil {
+		// Supervision is retained on failure, exactly as Stop retains it: the
+		// container may still be running, and cancelling the watchers of a
+		// live container orphans it - the panel shows it dead while the game
+		// keeps serving.
+		return fmt.Errorf("could not kill the container: %w: %s", err, strings.TrimSpace(string(out)))
+	}
 	r.cancelProc(s)
-	return err
+	return nil
 }
 
 // cancelProc tears down the goroutines attached to this server's container, the

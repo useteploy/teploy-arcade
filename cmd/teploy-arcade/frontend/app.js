@@ -43,7 +43,14 @@ function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + '
 const HEADS_KEY = 'arcade.heads';
 const HEADS_URL = 'https://mc-heads.net/avatar';
 
-function headsEnabled() { return localStorage.getItem(HEADS_KEY) !== 'off'; }
+// Opt-in, not opt-out: sending player names to a third-party avatar service
+// is a privacy decision the operator makes explicitly. A fresh browser has no
+// stored preference, and `!== 'off'` used to treat that silence as consent -
+// every player name left the LAN by default. Blocked storage (private mode)
+// also reads as off rather than crashing the row renderer.
+function headsEnabled() {
+  try { return localStorage.getItem(HEADS_KEY) === 'on'; } catch { return false; }
+}
 
 function skinHue(name) {
   return [...name].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
@@ -63,8 +70,9 @@ function skinMarkup(name, cls) {
   const span = `<span class="${cls || 'skin'}" style="${bg}">`;
   if (!headsEnabled()) return `${span}</span>`;
   // onerror removes the img rather than swapping a placeholder in: the gradient
-  // underneath is already the placeholder.
-  return `${span}<img src="${HEADS_URL}/${encodeURIComponent(name)}/32" alt="" loading="lazy" onerror="this.remove()"></span>`;
+  // underneath is already the placeholder. no-referrer so the avatar service
+  // never learns which panel asked.
+  return `${span}<img src="${HEADS_URL}/${encodeURIComponent(name)}/32" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()"></span>`;
 }
 
 // "paper unknown" was the header on four deployed servers. The word is a
@@ -355,7 +363,16 @@ function wireHeaderActions(root, id) {
     btn.addEventListener('click', async () => {
       const act = btn.dataset.act;
       if (act === 'delete') {
-        if (!confirm('Delete this server? Its state is removed from the panel.')) return;
+        // The endpoint is destructive beyond the panel's own state: it removes
+        // the managed server directory AND every panel backup for the server.
+        // The confirmation has to say exactly what is going away. An adopted
+        // external directory is the one thing it does not touch, and saying so
+        // matters just as much.
+        if (!confirm(
+          'Permanently delete this server?\n\n' +
+          'This removes its managed server directory and ALL of its panel backups.\n' +
+          'A directory adopted from elsewhere is NOT deleted - only its panel entry.\n' +
+          'There is no undo. Copy out any backup you still need first.')) return;
         try { await api(`/api/servers/${id}`, { method: 'DELETE' }); toast('Server deleted'); location.hash = '#/servers'; }
         catch (e) { toast(e.message, 'err'); }
         return;

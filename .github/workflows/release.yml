@@ -9,7 +9,16 @@ permissions:
   packages: write
 
 jobs:
+  # A tag must publish only a verified commit: the release and image jobs used
+  # to run independently of every check main enforces, so a tagged commit that
+  # failed vet, the race suite or the frontend test shipped anyway.
+  verify:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   release:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +38,7 @@ jobs:
   # image has never existed. Either the doc was wrong or this job was missing;
   # this is the half that makes the doc true.
   image:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -47,7 +57,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            # `latest` only for stable releases: a v1.2.3-rc1 used to move the
+            # tag every operator's pull command resolves to. is_prerelease is
+            # derived from the semver tag itself.
+            type=raw,value=latest,enable=!is_prerelease
       - uses: docker/build-push-action@v6
         with:
           context: .

@@ -550,7 +550,7 @@ func TestCreateClaimsItsPort(t *testing.T) {
 	}
 
 	held := 25999
-	if _, ok := mgr.claimPort(held, "an import"); !ok {
+	if _, _, ok := mgr.claimPort(held, "an import"); !ok {
 		t.Fatal("could not take a reservation to test against")
 	}
 	if _, err := mgr.Create("clash", "vanilla", "1.20.4", held, 0, 0, RuntimeSim); err == nil {

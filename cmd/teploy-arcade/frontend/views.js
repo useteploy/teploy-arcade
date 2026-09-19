@@ -381,8 +381,8 @@ async function viewAdmin() {
           <button type="button" data-heads="off">Gradients</button>
         </div>
         <span class="spacer"></span>
-        <span class="muted" style="font-size:11.5px">Heads load from mc-heads.net in your browser, by player name. A name with no
-          premium account gets the default skin. Stored in this browser.</span>
+        <span class="muted" style="font-size:11.5px">Off by default. When shown, heads load from mc-heads.net in your browser, by player
+          name. A name with no premium account gets the default skin. Stored in this browser.</span>
       </div>
     </div>
 

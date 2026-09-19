@@ -1,7 +1,9 @@
 package arcade
 
 import (
+	"archive/zip"
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -216,7 +218,28 @@ func TestPluginDeleteRefusesATraversalPath(t *testing.T) {
 	}
 }
 
-func jarBytes(payload string) []byte { return append([]byte(zipMagic), []byte(payload)...) }
+// jarBytes builds a real (minimal) zip archive: since validation checks the
+// archive structure and entry CRCs, a bare "PK\x03\x04" prefix is no longer
+// a convincing jar.
+func jarBytes(payload string) []byte {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("plugin.yml")
+	if err != nil {
+		panic(err)
+	}
+	if _, err := w.Write([]byte("name: " + payload)); err != nil {
+		panic(err)
+	}
+	if err := zw.Close(); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+// truncatedJarBytes carries the zip magic and then stops, which is exactly the
+// payload the old four-byte check accepted.
+func truncatedJarBytes() []byte { return []byte("PK\x03\x04" + "truncated nonsense") }
 
 // The download is the one place the panel fetches something a user named, so
 // each guard is tested for what it prevents: an arbitrary local read, an
@@ -236,6 +259,9 @@ func TestPluginInstallRefusesEverythingThatIsNotAJarDownload(t *testing.T) {
 	mux.HandleFunc("/login.jar", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("<html>sign in to download</html>"))
 	})
+	mux.HandleFunc("/truncated.jar", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(truncatedJarBytes())
+	})
 	mux.HandleFunc("/away.jar", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "file:///etc/passwd", http.StatusFound)
 	})
@@ -251,8 +277,14 @@ func TestPluginInstallRefusesEverythingThatIsNotAJarDownload(t *testing.T) {
 	})
 	// Sends more than the cap without declaring anything, which is what a
 	// hostile server would do. Chunked, so Content-Length cannot catch it.
+	// Incompressible bytes, so the size cap sees the real length regardless
+	// of any later zip validation.
 	mux.HandleFunc("/flood.jar", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(jarBytes(strings.Repeat("A", 8192)))
+		junk := make([]byte, 8192)
+		for i := range junk {
+			junk[i] = byte(i*31 + i/251)
+		}
+		_, _ = w.Write(junk)
 	})
 	origin := httptest.NewServer(mux)
 	defer origin.Close()
@@ -275,11 +307,13 @@ func TestPluginInstallRefusesEverythingThatIsNotAJarDownload(t *testing.T) {
 			"Content-Length is a claim the far end can simply omit"},
 		{"not a jar at all", origin.URL + "/login.jar",
 			"an HTML error page saved as a .jar fails at the game's next boot, not here"},
+		{"zip magic but truncated", origin.URL + "/truncated.jar",
+			"four header bytes used to be the entire integrity check"},
 		{"error response", origin.URL + "/missing.jar",
 			"a 404 body would land as a plugin"},
 	}
 	for _, c := range refused {
-		if _, err := mgr.InstallPlugin(s, c.url); err == nil {
+		if _, err := mgr.InstallPlugin(context.Background(), s, c.url, ""); err == nil {
 			t.Errorf("InstallPlugin(%s) succeeded: %s", c.name, c.why)
 		}
 		if names := dirNames(t, dir); len(names) != 0 {
@@ -291,7 +325,7 @@ func TestPluginInstallRefusesEverythingThatIsNotAJarDownload(t *testing.T) {
 		}
 	}
 
-	e, err := mgr.InstallPlugin(s, origin.URL+"/good.jar")
+	e, err := mgr.InstallPlugin(context.Background(), s, origin.URL+"/good.jar", "")
 	if err != nil {
 		t.Fatalf("a real jar was refused: %v", err)
 	}
@@ -308,7 +342,7 @@ func TestPluginInstallRefusesEverythingThatIsNotAJarDownload(t *testing.T) {
 
 	// A silent overwrite destroys the version that was working and is
 	// indistinguishable from a fresh install afterwards.
-	if _, err := mgr.InstallPlugin(s, origin.URL+"/good.jar"); err == nil {
+	if _, err := mgr.InstallPlugin(context.Background(), s, origin.URL+"/good.jar", ""); err == nil {
 		t.Error("installing over an existing plugin was allowed")
 	}
 }

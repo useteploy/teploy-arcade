@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -89,6 +90,15 @@ type Auth struct {
 	// refuses regardless of token.
 	bootstrapToken  string
 	bootstrapExpiry time.Time
+	// setupGate is armed by BeginSetup on a panel with no accounts. Before it
+	// existed, "no users" and "-no-auth" both meant !Enabled(), and the gate
+	// below let every protected route through - so a freshly installed,
+	// reachable panel exposed server creation, file access and MCP-token
+	// issuance to anyone before the operator finished setup. While the gate is
+	// armed and no account exists, protected routes answer 503; only health,
+	// login-status and the token-gated setup route stay open. -no-auth (forced)
+	// never arms it.
+	setupGate bool
 }
 
 // bootstrapTokenTTL bounds how long a printed setup token stays valid. Long
@@ -109,16 +119,66 @@ func NewAuth(dataDir string) *Auth {
 func (a *Auth) usersPath() string { return filepath.Join(a.dataDir, "users.json") }
 func (a *Auth) auditPath() string { return filepath.Join(a.dataDir, "audit.json") }
 
+// validateUserRecord rejects the records a syntactically valid JSON file can
+// still hold: null elements, unknown roles, and credentials that cannot be the
+// shape hashPassword writes. Loading used to dereference whatever decoded,
+// so `[null]` in users.json panicked the panel at boot.
+func validateUserRecord(u *User, i int) error {
+	if u == nil {
+		return fmt.Errorf("null user at index %d", i)
+	}
+	if strings.TrimSpace(u.Name) == "" {
+		return fmt.Errorf("user at index %d has no name", i)
+	}
+	if _, ok := roleRank[u.Role]; !ok {
+		return fmt.Errorf("user %q has unknown role %q", u.Name, u.Role)
+	}
+	salt, err1 := hex.DecodeString(u.Salt)
+	hash, err2 := hex.DecodeString(u.Hash)
+	if err1 != nil || err2 != nil || len(salt) != 16 || len(hash) != 32 {
+		return fmt.Errorf("user %q has malformed stored credentials", u.Name)
+	}
+	return nil
+}
+
 func (a *Auth) Load() error {
-	if b, err := os.ReadFile(a.usersPath()); err == nil {
-		var list []*User
-		if err := json.Unmarshal(b, &list); err != nil {
-			// Quarantine rather than refuse to boot. Note this leaves the panel
-			// open until an admin is recreated, which the startup banner says.
+	if b, err := os.ReadFile(a.usersPath()); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			// Unreadable is not the same as absent. Absent means a fresh
+			// install; unreadable means the file exists and the panel cannot
+			// know who it describes, which is a repair-it-yourself state, not
+			// a pretend-fresh one.
 			quarantine(a.usersPath(), err)
+			return fmt.Errorf("users file exists but cannot be read; repair %s: %w", a.usersPath(), err)
 		}
-		for _, u := range list {
-			a.users[strings.ToLower(u.Name)] = u
+	} else {
+		var list []*User
+		bad := json.Unmarshal(b, &list) != nil
+		if !bad {
+			seen := map[string]bool{}
+			for i, u := range list {
+				if err := validateUserRecord(u, i); err != nil {
+					bad = true
+					break
+				}
+				key := strings.ToLower(u.Name)
+				if seen[key] {
+					bad = true
+					break
+				}
+				seen[key] = true
+			}
+		}
+		if bad {
+			// Quarantine rather than refuse to boot - but the empty user set
+			// this leaves is NOT an open panel: BeginSetup arms the setup
+			// gate, so every operational route stays closed until an admin is
+			// claimed through the machine-local bootstrap token.
+			quarantine(a.usersPath(), errors.New("invalid user records"))
+		} else {
+			for _, u := range list {
+				a.users[strings.ToLower(u.Name)] = u
+			}
 		}
 	}
 	if b, err := os.ReadFile(a.auditPath()); err == nil {
@@ -160,7 +220,10 @@ func (a *Auth) EnsureAdmin(name, password string) (bool, error) {
 }
 
 // BeginSetup mints the token that gates first-run account creation, when the
-// panel still has no accounts. A no-op once one exists.
+// panel still has no accounts. A no-op once one exists. Arming the setup gate
+// here is what turns "unclaimed" from an open panel into a closed one: Run
+// always calls this (or provisions an admin, or was told --no-auth), so a
+// production panel never serves operational routes before it is claimed.
 func (a *Auth) BeginSetup() error {
 	a.mu.RLock()
 	n := len(a.users)
@@ -177,11 +240,23 @@ func (a *Auth) BeginSetup() error {
 	a.mu.Lock()
 	a.bootstrapToken = tok
 	a.bootstrapExpiry = time.Now().Add(bootstrapTokenTTL)
+	a.setupGate = true
 	a.mu.Unlock()
 	log.Printf("First-run setup required. Bootstrap token (valid %s): %s", bootstrapTokenTTL, tok)
 	log.Printf("No accounts yet - this panel is unclaimed. Provision credentials with")
 	log.Printf("-admin-user/-admin-password (or TEPLOY_ARCADE_ADMIN_USER/PASSWORD) to skip this.")
+	log.Printf("Until an account is created, every other route answers 503.")
 	return nil
+}
+
+// SetupRequired reports whether the panel is unclaimed with the setup gate
+// armed: no accounts exist and setup has not been bypassed with --no-auth.
+// Callers use it to refuse operational work (including MCP dispatch) rather
+// than treating an unclaimed panel as a free-for-all.
+func (a *Auth) SetupRequired() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.setupGate && !a.forced && len(a.users) == 0
 }
 
 // CheckBootstrapToken reports whether supplied is the live, unexpired token.
@@ -206,18 +281,6 @@ func (a *Auth) BootstrapExpired() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.bootstrapToken != "" && time.Now().After(a.bootstrapExpiry)
-}
-
-func (a *Auth) saveUsers() error {
-	list := make([]*User, 0, len(a.users))
-	for _, u := range a.users {
-		list = append(list, u)
-	}
-	b, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(a.usersPath(), b, 0o600)
 }
 
 // Disable turns auth off for a development run (--no-auth). It does not delete
@@ -317,9 +380,17 @@ func (a *Auth) CreateUser(name, password, role string) (*User, error) {
 	if err := checkNewUser(name, password, role); err != nil {
 		return nil, err
 	}
+	// Hashing runs before the lock, like Login: createLocked used to run its
+	// 120,000 PBKDF2 rounds with a.mu held for writing, stalling every
+	// authenticated request for the duration.
+	salt, err := randomHex(16)
+	if err != nil {
+		return nil, err
+	}
+	hash := hashPassword(password, salt)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.createLocked(name, password, role, false)
+	return a.createLocked(name, role, salt, hash, false)
 }
 
 // CreateFirstUser creates the first admin and refuses once anyone exists. The
@@ -331,34 +402,67 @@ func (a *Auth) CreateFirstUser(name, password string) (*User, error) {
 	if err := checkNewUser(name, password, RoleAdmin); err != nil {
 		return nil, err
 	}
+	salt, err := randomHex(16)
+	if err != nil {
+		return nil, err
+	}
+	hash := hashPassword(password, salt)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if len(a.users) > 0 {
 		return nil, fmt.Errorf("this panel already has users; sign in instead")
 	}
-	return a.createLocked(name, password, RoleAdmin, true)
+	return a.createLocked(name, RoleAdmin, salt, hash, true)
 }
 
-// createLocked must be called with a.mu held.
-func (a *Auth) createLocked(name, password, role string, first bool) (*User, error) {
+// createLocked must be called with a.mu held. Salt and hash arrive
+// pre-computed so no KDF work happens inside the lock.
+func (a *Auth) createLocked(name, role, salt, hash string, first bool) (*User, error) {
 	key := strings.ToLower(name)
 	if _, exists := a.users[key]; exists {
 		return nil, fmt.Errorf("user %q already exists", name)
 	}
-	salt, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
 	u := &User{Name: name, Role: role, Salt: salt,
-		Hash: hashPassword(password, salt), CreatedAt: time.Now().Unix(),
+		Hash: hash, CreatedAt: time.Now().Unix(),
 		// The first admin picks their own password at setup and so is exempt;
 		// createLocked's other caller is an admin creating someone else.
 		MustChange: !first}
-	a.users[key] = u
-	if !a.forced {
-		a.enabled = true
+	next := make(map[string]*User, len(a.users)+1)
+	for k, v := range a.users {
+		cp := *v
+		next[k] = &cp
 	}
-	return u, a.saveUsers()
+	next[key] = u
+	if err := a.commitUsersLocked(next); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// commitUsersLocked persists a prospective user set and only then publishes it
+// in memory. The old shape mutated a.users (or the pointed-to record) first
+// and saved second, so a failed save left the panel acting on credentials the
+// disk never got - a "failed" password change that actually changed it for
+// this process, a "failed" user creation that exists until restart.
+// Callers must hold a.mu.
+func (a *Auth) commitUsersLocked(next map[string]*User) error {
+	list := make([]*User, 0, len(next))
+	for _, u := range next {
+		list = append(list, u)
+	}
+	b, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(a.usersPath(), b, 0o600); err != nil {
+		return err
+	}
+	a.users = next
+	a.enabled = !a.forced && len(next) > 0
+	if len(next) > 0 {
+		a.setupGate = false
+	}
+	return nil
 }
 
 // Login verifies a password and issues a session.
@@ -532,16 +636,24 @@ func (a *Auth) SetPassword(name, current, next, keepToken string, byAdmin bool) 
 		return fmt.Errorf("the password changed underneath this request; try again")
 	}
 
-	u.Salt = salt
-	u.Hash = newHash
-	u.MustChange = byAdmin
+	nextUsers := make(map[string]*User, len(a.users))
+	for k, v := range a.users {
+		cp := *v
+		nextUsers[k] = &cp
+	}
+	nextUsers[key].Salt = salt
+	nextUsers[key].Hash = newHash
+	nextUsers[key].MustChange = byAdmin
+	if err := a.commitUsersLocked(nextUsers); err != nil {
+		return err
+	}
 
 	for tok, s := range a.sessions {
 		if strings.EqualFold(s.User, u.Name) && tok != keepToken {
 			delete(a.sessions, tok)
 		}
 	}
-	return a.saveUsers()
+	return nil
 }
 
 // MustChangePassword reports whether this account is holding a password
@@ -572,13 +684,27 @@ func (a *Auth) DeleteUser(name string) error {
 			return fmt.Errorf("refusing to delete the last admin")
 		}
 	}
-	delete(a.users, key)
+	// Persist the prospective set before revoking anything: a failed save
+	// used to delete the account in memory while the disk kept it, so the
+	// "deleted" user simply returned after a restart - but their sessions
+	// were already gone in this process, the worst of both outcomes.
+	next := make(map[string]*User, len(a.users))
+	for k, v := range a.users {
+		if k == key {
+			continue
+		}
+		cp := *v
+		next[k] = &cp
+	}
+	if err := a.commitUsersLocked(next); err != nil {
+		return err
+	}
 	for tok, s := range a.sessions {
 		if strings.EqualFold(s.User, name) {
 			delete(a.sessions, tok)
 		}
 	}
-	return a.saveUsers()
+	return nil
 }
 
 // ---------------------------------------------------------------- audit
@@ -658,6 +784,16 @@ func (a *Auth) requireEvenLockedOut(role string, next http.HandlerFunc) http.Han
 func (a *Auth) gate(role string, lockout bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !a.Enabled() {
+			if a.SetupRequired() {
+				// Unclaimed, not development: the only routes that stay open
+				// are the ones registered without this gate. Everything else
+				// waits for the first admin, because "no users" must not mean
+				// "administrator is whoever connected".
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"error": "initial administrator setup is required before the panel can be used",
+				})
+				return
+			}
 			next(w, r)
 			return
 		}

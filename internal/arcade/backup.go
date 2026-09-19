@@ -135,15 +135,23 @@ func (m *Manager) ListBackups(s *Server) ([]Backup, error) {
 // quiesceForBackup pauses world saves on a running server so an archive cannot
 // catch a half-written chunk, and returns the func that resumes them.
 //
-// Every command must succeed: the old shape discarded both errors, slept, and
-// archived anyway - so an RCON hiccup or a still-starting server produced a
-// "successful quiesced backup" of a world being written under it. Clone
-// already treats an undeliverable quiesce as fatal; backup is now consistent
-// with it. Only Minecraft's save commands have known semantics here, so for
-// every other game a live backup is refused rather than guessed at.
-func (m *Manager) quiesceForBackup(s *Server) (func(), error) {
-	if s.State() != StatusRunning {
-		return func() {}, nil
+// States are classified explicitly, because "not running" and "not writing"
+// are different facts. A `starting` server is already generating its world,
+// and the old shape treated every non-running state as safe to archive.
+func (m *Manager) quiesceForBackup(s *Server) (func() error, error) {
+	switch s.State() {
+	case StatusRunning:
+		// Quiesce below.
+	case StatusStopped, StatusFailed:
+		// The panel believes the game is down. For a Docker server the
+		// container is the truth, and a still-running container means the
+		// tree is being written under whatever the panel believes.
+		if s.Runtime == RuntimeDocker && containerRunning(s.ID) {
+			return nil, fmt.Errorf("this server's container is still running; stop it before backing it up")
+		}
+		return func() error { return nil }, nil
+	default:
+		return nil, fmt.Errorf("wait until this server finishes starting or stopping before backing it up")
 	}
 	if s.Game != "minecraft-java" {
 		return nil, fmt.Errorf(
@@ -151,17 +159,27 @@ func (m *Manager) quiesceForBackup(s *Server) (func(), error) {
 	}
 
 	r := m.runnerFor(s)
-	if err := r.Send(s, "save-off"); err != nil {
+	// Ask through query where the runner supports it, so a command the game
+	// rejected is a failure instead of a silent success: plain Send used to
+	// discard the reply, and delivery of the bytes was all "verified" meant.
+	sendQuiesce := func(cmd string) error {
+		if dr, ok := r.(*dockerRunner); ok {
+			_, err := dr.query(s, cmd)
+			return err
+		}
+		return r.Send(s, cmd)
+	}
+	if err := sendQuiesce("save-off"); err != nil {
 		return nil, fmt.Errorf("could not pause world saves, backup aborted (the world is untouched): %w", err)
 	}
-	resume := func() {
-		if err := r.Send(s, "save-on"); err != nil {
-			log.Printf("%s: could not resume world saves after backup: %v", s.Name, err)
-			m.panelLine(s, "warn", "Backup finished, but world saves could not be resumed - run save-on if the server stays slow.")
+	resume := func() error {
+		if err := sendQuiesce("save-on"); err != nil {
+			return fmt.Errorf("world saves could not be resumed: %w", err)
 		}
+		return nil
 	}
-	if err := r.Send(s, "save-all flush"); err != nil {
-		resume()
+	if err := sendQuiesce("save-all flush"); err != nil {
+		_ = resume()
 		return nil, fmt.Errorf("could not flush the world, backup aborted (the world is untouched): %w", err)
 	}
 	// Give the game a moment to actually flush before we read the tree.
@@ -170,7 +188,7 @@ func (m *Manager) quiesceForBackup(s *Server) (func(), error) {
 }
 
 // CreateBackup runs the full quiesce -> archive -> resume cycle.
-func (m *Manager) CreateBackup(s *Server, note, actor string) (*Backup, error) {
+func (m *Manager) CreateBackup(s *Server, note, actor string) (b *Backup, retErr error) {
 	// The whole archive window is exclusive on the server's filesystem gate:
 	// file and plugin mutations hold it shared from before their backup-state
 	// check through their completed write, so nothing can pass the check and
@@ -179,6 +197,9 @@ func (m *Manager) CreateBackup(s *Server, note, actor string) (*Backup, error) {
 	s.fsMu.Lock()
 	defer s.fsMu.Unlock()
 
+	if err := m.requireRegistered(s); err != nil {
+		return nil, err
+	}
 	if !m.lockBackup(s.ID) {
 		return nil, fmt.Errorf("a backup is already running for this server")
 	}
@@ -229,21 +250,29 @@ func (m *Manager) CreateBackup(s *Server, note, actor string) (*Backup, error) {
 		return nil, err
 	}
 	// Resume saves no matter how the archive goes - a server left with
-	// save-off is a far worse outcome than a failed backup.
+	// save-off is a far worse outcome than a failed backup. But a resume that
+	// FAILS is no longer reported as one that succeeded: the response and the
+	// console both say saves are still off, because reporting a verified
+	// snapshot with saves resumed was a lie exactly when it mattered.
 	defer func() {
-		if wasRunning {
-			resume()
-			m.panelLine(s, "info", "Backup finished - world saves resumed.")
+		if !wasRunning {
+			return
 		}
+		if rerr := resume(); rerr != nil {
+			m.panelLine(s, "error", "Backup finished, but world saves could NOT be resumed - run save-on from the console.")
+			retErr = errors.Join(retErr, fmt.Errorf("the archive was created, but %s", rerr))
+			return
+		}
+		m.panelLine(s, "info", "Backup finished - world saves resumed.")
 	}()
 
 	// The ID used to be second-resolution, so two backups of one server inside
 	// the same second produced the same name: the second os.Create truncated
 	// the first archive and its .note, and the operator who asked for two
 	// backups silently ended up with one. Milliseconds separate them, and
-	// tarGz's O_EXCL is what makes a clash impossible rather than merely
-	// unlikely - a name already on disk is never reopened for writing. The
-	// retry re-stamps instead of failing a backup over a name.
+	// tarGz's no-replace publication is what makes a clash impossible rather
+	// than merely unlikely - a name already on disk is never written through.
+	// The retry re-stamps instead of failing a backup over a name.
 	var (
 		id   string
 		dst  string
@@ -263,7 +292,6 @@ func (m *Manager) CreateBackup(s *Server, note, actor string) (*Backup, error) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	if err != nil {
-		_ = os.Remove(dst) // never leave a half-written archive that looks valid
 		return nil, friendlyFSError(err, "the backup archive")
 	}
 	if note != "" {
@@ -387,6 +415,9 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	// is untouched. This check is not what makes that safe; it is what stops
 	// the panel from spending ten minutes filling a shared disk, and taking
 	// every other server on the host down with it, to reach that conclusion.
+	//
+	// The estimate is only an admission heuristic (the gzip size trailer wraps
+	// modulo 4 GiB); extraction re-checks real free space per entry.
 	if need := uncompressedSize(archive, st.Size()); need > 0 {
 		if free, err := diskFree(dir); err == nil && free < need+importFreeMargin {
 			return fmt.Errorf(
@@ -416,11 +447,21 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	// ("new" and "old"): the archive namespace is the server's own, and a
 	// legitimate top-level ".previous" entry used to collide with the holding
 	// directory and silently never be installed.
+	//
+	// keepStaging gates the cleanup: a rollback that could not finish leaves
+	// the original world held inside staging, and deleting it would destroy
+	// the only remaining copy. The unconditional defer used to do exactly
+	// that.
 	staging, err := os.MkdirTemp(dir, ".arcade-restore-")
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(staging)
+	keepStaging := false
+	defer func() {
+		if !keepStaging {
+			_ = os.RemoveAll(staging)
+		}
+	}()
 	stagingName := filepath.Base(staging)
 
 	extracted := filepath.Join(staging, "new")
@@ -455,8 +496,12 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 			continue
 		}
 		if err := os.Rename(filepath.Join(dir, e.Name()), filepath.Join(held, e.Name())); err != nil {
-			// Put back whatever moved, so a partial failure is not a wipe.
-			restoreHeld(held, dir)
+			// Put back whatever moved. If even that fails, the staging tree
+			// is RETAINED - it holds the only copies of what moved out.
+			if rerr := restoreHeld(held, dir); rerr != nil {
+				keepStaging = true
+				return fmt.Errorf("could not clear the live world, and the previous world is retained at %s: %w", staging, rerr)
+			}
 			return fmt.Errorf("could not clear the live world, nothing was changed: %w", err)
 		}
 	}
@@ -470,17 +515,22 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	var installed []string
 	staged, err := os.ReadDir(extracted)
 	if err != nil {
-		rollbackRestore(installed, held, dir)
+		if rerr := rollbackRestore(installed, held, dir); rerr != nil {
+			keepStaging = true
+			return fmt.Errorf("restore failed and the previous world is retained at %s: %w", staging, rerr)
+		}
 		return err
 	}
 	for _, e := range staged {
 		if err := os.Rename(filepath.Join(extracted, e.Name()), filepath.Join(dir, e.Name())); err != nil {
-			rollbackRestore(installed, held, dir)
+			if rerr := rollbackRestore(installed, held, dir); rerr != nil {
+				keepStaging = true
+				return fmt.Errorf("restore failed part way, and the previous world is retained at %s: %w", staging, rerr)
+			}
 			return fmt.Errorf("restore failed part way, the previous world was put back: %w", err)
 		}
 		installed = append(installed, e.Name())
 	}
-
 
 	// Extracted by root into staging and moved in, so every restored file is
 	// root's while the game runs as uid 1000 - a restore would hand back a
@@ -604,59 +654,98 @@ func (m *Manager) DeleteBackup(s *Server, backupID, actor string) error {
 
 // ---------------------------------------------------------------- archive
 
-// tarGz refuses to open an existing dst (O_EXCL). os.Create truncated whatever
-// was already there, so a repeated backup ID destroyed the earlier archive
-// silently; the caller re-stamps the ID on ErrExist instead. The archive is
-// assembled under a .part name and renamed only after a clean fsync, so a
-// crash mid-write can never leave a partial file under the final .tar.gz
-// name - where retention would later keep it as if it were valid.
+// tarGz refuses to publish over an existing dst. The archive is assembled in
+// a uniquely-named temp file (the fixed "<dst>.part" name was both predictable
+// - a symlink planted on it redirected the archive write - and leaked on every
+// early error), published with link-then-unlink so an existing final name
+// fails with EEXIST instead of being silently replaced, and cleaned up on
+// every path by the defer that follows creation.
+//
+// The whole walk is confined to an os.Root held for the archive's duration:
+// the game and its plugins can replace entries between a stat and an open, and
+// an unconfined walk used to reopen each path by name - a swapped symlink
+// could feed the archiver a file from outside the server tree, and a special
+// file could block it forever. Files are opened nonblocking and must be
+// regular.
 func tarGz(src, dst string) (int64, error) {
-	part := dst + ".part"
-	f, err := os.OpenFile(part, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	root, err := os.OpenRoot(src)
 	if err != nil {
 		return 0, err
 	}
-	// Kept for the panic and early-error paths; the success path closes
-	// explicitly below and checks the error. A double Close is harmless.
-	defer f.Close()
+	defer root.Close()
+
+	f, err := os.CreateTemp(filepath.Dir(dst), ".arcade-tmp-backup-*")
+	if err != nil {
+		return 0, err
+	}
+	part := f.Name()
+	// Every path from here cleans up after itself; only a completed, synced,
+	// published archive survives this function.
+	defer func() { _ = f.Close(); _ = os.Remove(part) }()
 
 	gz := gzip.NewWriter(f)
 	tw := tar.NewWriter(gz)
 
-	err = filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+	var walk func(rel string) error
+	walk = func(rel string) error {
+		d, err := root.Open(rel)
 		if err != nil {
 			return err
 		}
-		// Never archive a symlink's target; skip links entirely.
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
-		rel, err := filepath.Rel(src, path)
+		ents, err := d.ReadDir(-1)
+		d.Close()
 		if err != nil {
 			return err
 		}
-		if rel == "." {
-			return nil
+		for _, e := range ents {
+			child := e.Name()
+			if rel != "." {
+				child = rel + "/" + e.Name()
+			}
+			fi, err := root.Lstat(child)
+			if err != nil {
+				return err
+			}
+			// Never archive a symlink's target; skip links entirely.
+			if fi.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			if !fi.IsDir() && !fi.Mode().IsRegular() {
+				return fmt.Errorf("%s is not a regular file; refusing to archive it", child)
+			}
+			hdr, err := tar.FileInfoHeader(fi, "")
+			if err != nil {
+				return err
+			}
+			hdr.Name = filepath.ToSlash(child)
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
+			if fi.IsDir() {
+				if err := walk(child); err != nil {
+					return err
+				}
+				continue
+			}
+			// Metadata comes from the descriptor this archive actually reads,
+			// not from the walk's earlier stat of the name.
+			in, st, err := openRegularIn(root, child)
+			if err != nil {
+				return err
+			}
+			if !st.Mode().IsRegular() {
+				in.Close()
+				return fmt.Errorf("%s changed under the archive into a non-regular file", child)
+			}
+			_, err = io.Copy(tw, in)
+			in.Close()
+			if err != nil {
+				return err
+			}
 		}
-		hdr, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return err
-		}
-		hdr.Name = filepath.ToSlash(rel)
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		in, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer in.Close()
-		_, err = io.Copy(tw, in)
-		return err
-	})
+		return nil
+	}
+	err = walk(".")
 
 	if cerr := tw.Close(); err == nil {
 		err = cerr
@@ -674,29 +763,27 @@ func tarGz(src, dst string) (int64, error) {
 	// system must never do. Sync before it, so a power loss right after a
 	// "successful" backup cannot leave a holed file either.
 	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(part)
 		return 0, err
 	}
 	info, serr := f.Stat()
 	if serr != nil {
-		f.Close()
-		os.Remove(part)
 		return 0, serr
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(part)
 		return 0, err
 	}
 	// Link-then-unlink instead of rename: rename silently REPLACES an
-	// existing dst, which lost the no-overwrite guarantee the O_EXCL open
-	// used to provide. link() fails with EEXIST, so the caller's re-stamp
-	// retry works again.
+	// existing dst, which lost the no-overwrite guarantee. link() fails with
+	// EEXIST, so the caller's re-stamp retry works.
 	if err := os.Link(part, dst); err != nil {
-		os.Remove(part)
 		return 0, err
 	}
-	os.Remove(part)
+	// The directory entry for the published name is durable before the
+	// function reports success.
+	if parent, perr := os.Open(filepath.Dir(dst)); perr == nil {
+		_ = parent.Sync()
+		_ = parent.Close()
+	}
 	return info.Size(), nil
 }
 
@@ -761,7 +848,21 @@ func untarGzLimited(archive, dst string, lim restoreLimits) error {
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
-			return nil
+			// tar's end is not gzip's end. The trailer holding the checksum
+			// and length is only read by draining the gzip stream, so a
+			// corrupt archive used to pass validation the moment the tar
+			// records stopped - and its checksum failure surfaced nowhere.
+			// The drain is bounded: an archive with a second member or junk
+			// padding after the tar end is refused, not decompressed.
+			const maxTail = int64(1 << 20)
+			n, drainErr := io.Copy(io.Discard, io.LimitReader(gz, maxTail+1))
+			if drainErr != nil {
+				return fmt.Errorf("gzip integrity check failed: %w", drainErr)
+			}
+			if n > maxTail {
+				return fmt.Errorf("archive carries data after the tar end marker")
+			}
+			return gz.Close()
 		}
 		if err != nil {
 			return err
@@ -780,7 +881,7 @@ func untarGzLimited(archive, dst string, lim restoreLimits) error {
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
+			if err := os.MkdirAll(target, os.FileMode(hdr.Mode).Perm()); err != nil {
 				return err
 			}
 		case tar.TypeReg:
@@ -794,22 +895,40 @@ func untarGzLimited(archive, dst string, lim restoreLimits) error {
 				return fmt.Errorf("archive expands to more than %s; refusing to restore it",
 					humanSize(lim.totalBytes))
 			}
+			// Free space is re-checked per entry against the filesystem being
+			// written, not estimated once up front: the gzip ISIZE trailer the
+			// admission check relies on wraps modulo 4 GiB and can understate
+			// a large archive by exactly that much, and other processes can
+			// consume the space after admission anyway.
+			if free, ferr := diskFree(root); ferr == nil && free-importFreeMargin < hdr.Size {
+				return fmt.Errorf("the destination does not have %s free for %s; refusing mid-archive rather than filling the disk",
+					humanSize(hdr.Size+importFreeMargin), hdr.Name)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+			// Executable bits travel with the archive; setuid, setgid and
+			// sticky deliberately do not.
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode).Perm())
 			if err != nil {
 				return err
 			}
-			// LimitReader rather than a bare io.Copy: the cap is only a cap if
-			// the write cannot outrun the size the header was vetted on.
-			n, err := io.Copy(out, io.LimitReader(tr, hdr.Size))
+			// CopyN rather than a bare io.Copy: the cap is only a cap if the
+			// write cannot outrun the size the header was vetted on, and a
+			// short stream is an error rather than a silently truncated file.
+			n, err := io.CopyN(out, tr, hdr.Size)
 			total += n
-			if err != nil {
-				out.Close()
-				return err
+			if err == nil && n != hdr.Size {
+				err = io.ErrUnexpectedEOF
 			}
-			out.Close()
+			var syncErr error
+			if err == nil {
+				syncErr = out.Sync()
+			}
+			closeErr := out.Close()
+			if err := errors.Join(err, syncErr, closeErr); err != nil {
+				return fmt.Errorf("extract %q: %w", hdr.Name, err)
+			}
 		default:
 			// symlinks and devices are deliberately not restored
 		}
@@ -818,25 +937,37 @@ func untarGzLimited(archive, dst string, lim restoreLimits) error {
 
 // rollbackRestore undoes a half-installed restore: the newly-installed entries
 // are removed first so restoreHeld's renames back into place cannot collide
-// with them. Best effort, like restoreHeld - the alternative to a partial
-// recovery is none at all.
-func rollbackRestore(installed []string, held, dir string) {
+// with them. Errors are returned: the caller must keep the staging tree when
+// rollback could not finish, because it holds the only remaining copy of the
+// original world.
+func rollbackRestore(installed []string, held, dir string) error {
 	for _, name := range installed {
-		_ = os.RemoveAll(filepath.Join(dir, name))
+		if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("could not remove the half-installed %s: %w", name, err)
+		}
 	}
-	restoreHeld(held, dir)
+	return restoreHeld(held, dir)
 }
 
-// restoreHeld puts the previous contents back after a failed restore. Best
-// effort by design: the alternative to a partial recovery is none at all.
-func restoreHeld(held, dir string) {
+// restoreHeld puts the previous contents back after a failed restore. Errors
+// are returned rather than discarded: a silently failed rename left originals
+// stranded in old/ while the caller's cleanup deleted the staging tree - the
+// only remaining copy - and reported the previous world restored.
+func restoreHeld(held, dir string) error {
 	entries, err := os.ReadDir(held)
 	if err != nil {
-		return
+		return fmt.Errorf("could not enumerate the held originals in %s: %w", held, err)
 	}
+	var failed []string
 	for _, e := range entries {
-		_ = os.Rename(filepath.Join(held, e.Name()), filepath.Join(dir, e.Name()))
+		if err := os.Rename(filepath.Join(held, e.Name()), filepath.Join(dir, e.Name())); err != nil {
+			failed = append(failed, e.Name())
+		}
 	}
+	if len(failed) > 0 {
+		return fmt.Errorf("could not restore %s; they remain held in %s", strings.Join(failed, ", "), held)
+	}
+	return nil
 }
 
 // hasPortLine reports whether the properties text already carries the given

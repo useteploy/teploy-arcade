@@ -728,7 +728,13 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	if cerr != nil {
 		return nil, cerr
 	}
-	if holder, ok := m.claimPortBindings(importCand, strings.TrimSpace(req.Name)); !ok {
+	// Claimed under a unique lease, never the display name: two same-named
+	// imports used to be able to release each other's reservation.
+	lease, holder, ok := m.claimPortBindings(importCand, strings.TrimSpace(req.Name))
+	if !ok {
+		if holder == "" {
+			return nil, fmt.Errorf("could not allocate a port reservation")
+		}
 		return nil, fmt.Errorf("port %d is already used by %q; give a different port to import this server", port, holder)
 	}
 	// Validation continues below and can still refuse the import. Hand the
@@ -738,7 +744,7 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	claimHeld := true
 	defer func() {
 		if claimHeld {
-			m.releasePort(port)
+			m.releaseReservation(lease)
 		}
 	}()
 
@@ -821,7 +827,7 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 		}
 		job := newImportJob(sc, mode, name)
 		claimHeld = false // the server now holds the port
-		if err := m.finishImport(job, s, sc, actor); err != nil {
+		if err := m.finishImport(job, s, sc, lease, actor); err != nil {
 			if oldExists {
 				_ = writeFileAtomic(propsPath, oldProps, oldPerm)
 			} else {
@@ -847,7 +853,7 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 			_ = os.RemoveAll(dst)
 			// Release the claim, or a failed import blocks that port until the
 			// panel restarts.
-			m.releasePort(port)
+			m.releaseReservation(lease)
 			job.fail(friendlyFSError(err, "the imported server"))
 			return
 		}
@@ -855,11 +861,11 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 		// own directory was owned. Match the source: it is the ownership the
 		// game was running with before the panel touched it.
 		chownTreeLike(dst, sc.Path)
-		if err := m.finishImport(job, s, sc, actor); err != nil {
+		if err := m.finishImport(job, s, sc, lease, actor); err != nil {
 			// The copied tree is the panel's own work product; a registration
 			// that failed persistence must not leave it looking importable.
 			_ = os.RemoveAll(dst)
-			m.releasePort(port)
+			m.releaseReservation(lease)
 			job.fail(err)
 		}
 	}()
@@ -902,7 +908,7 @@ func applyImportedProps(s *Server, sc *ImportScan, port int) {
 // next restart, or bound a different port than the panel reported. The caller
 // rolls its own work (copied tree, adopt link, port claim) back when this
 // errors.
-func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, actor string) error {
+func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, lease string, actor string) error {
 	// The panel's model holds the chosen port, but the imported
 	// server.properties still carries the source's. Left alone they disagree
 	// until someone happens to save settings, and the game binds the old one.
@@ -924,7 +930,9 @@ func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, actor st
 	m.mu.Lock()
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)
-	delete(m.reservedPorts, s.Port) // the server itself now holds it
+	// The whole lease, dropped atomically with the registration: the server
+	// itself now holds the binding set.
+	m.releaseReservationLocked(lease)
 	m.mu.Unlock()
 
 	rollbackRegistration := func() {
@@ -936,7 +944,6 @@ func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, actor st
 				break
 			}
 		}
-		delete(m.reservedPorts, s.Port)
 		m.mu.Unlock()
 	}
 

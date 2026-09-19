@@ -1,10 +1,17 @@
 package arcade
 
 import (
+	"archive/zip"
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,9 +39,6 @@ import (
 const (
 	jarExt      = ".jar"
 	disabledExt = ".jar.disabled"
-
-	// A jar is a zip, so every real one starts with the local file header magic.
-	zipMagic = "PK\x03\x04"
 )
 
 // maxPluginBytes caps one download. A var rather than a const so the oversize
@@ -207,7 +211,15 @@ func (m *Manager) SetPluginEnabled(s *Server, file string, enable bool) (PluginE
 	// check alone left a window for a rename to land mid-archive.
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	// Serialized against install publication and file writes: the existence
+	// checks below and the rename used to be two steps, and two shared-section
+	// writers could pass the same check and overwrite each other's result.
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
 
+	if err := m.requireRegistered(s); err != nil {
+		return PluginEntry{}, err
+	}
 	dir, _, err := pluginDirFor(s)
 	if err != nil {
 		return PluginEntry{}, err
@@ -247,13 +259,18 @@ func (m *Manager) SetPluginEnabled(s *Server, file string, enable bool) (PluginE
 		}
 		return PluginEntry{}, fmt.Errorf("%s is not installed", base+jarExt)
 	}
-	// os.Rename replaces the destination without a word, so a stale
-	// "x.jar.disabled" beside a live "x.jar" would silently eat one of them.
-	if _, err := r.Lstat(nameTo); err == nil {
-		return PluginEntry{}, fmt.Errorf("%s already exists; remove it first", to)
-	}
-	if err := r.Rename(nameFrom, nameTo); err != nil {
+	// link-then-unlink rather than rename: rename replaces the destination
+	// without a word, so a stale "x.jar.disabled" beside a live "x.jar" used
+	// to be silently eaten - and the check-then-rename pair was racy against
+	// another toggle. Link refuses an existing destination atomically.
+	if err := r.Link(nameFrom, nameTo); err != nil {
+		if os.IsExist(err) {
+			return PluginEntry{}, fmt.Errorf("%s already exists; remove it first", to)
+		}
 		return PluginEntry{}, friendlyFSError(err, path.Join(dir, to))
+	}
+	if err := r.Remove(nameFrom); err != nil {
+		return PluginEntry{}, fmt.Errorf("%s was moved to %s but the original could not be removed: %w", from, to, err)
 	}
 	return m.statPlugin(r, nameTo, to, enable)
 }
@@ -299,6 +316,52 @@ func checkDownloadScheme(u *url.URL) error {
 	return fmt.Errorf("only http and https downloads are allowed, not %q", u.Scheme)
 }
 
+// validateJar verifies the download is an intact zip archive, not four magic
+// bytes: a truncated or corrupt jar used to pass on the local-header prefix
+// alone and fail inside the game's classloader at next start. Entry CRCs are
+// checked by reading every entry, under a decompression budget so a zip bomb
+// cannot turn validation into the thing it was guarding against. An expected
+// SHA-256, when supplied, is verified in constant time.
+func validateJar(data []byte, expectedSHA256 string) error {
+	if expected, err := hex.DecodeString(strings.TrimSpace(expectedSHA256)); err == nil && len(expected) == sha256.Size {
+		actual := sha256.Sum256(data)
+		if subtle.ConstantTimeCompare(expected, actual[:]) != 1 {
+			return fmt.Errorf("the download's SHA-256 does not match the expected digest")
+		}
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("not a readable jar archive: %w", err)
+	}
+	if len(zr.File) == 0 || len(zr.File) > 50000 {
+		return fmt.Errorf("the jar holds %d entries, which is not a plugin", len(zr.File))
+	}
+	const budget = int64(512 << 20)
+	remaining := budget
+	for _, entry := range zr.File {
+		if entry.FileInfo().IsDir() {
+			continue
+		}
+		if entry.UncompressedSize64 > uint64(remaining) {
+			return fmt.Errorf("the jar expands beyond the validation budget")
+		}
+		rc, err := entry.Open()
+		if err != nil {
+			return err
+		}
+		n, readErr := io.Copy(io.Discard, io.LimitReader(rc, remaining+1))
+		closeErr := rc.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return fmt.Errorf("jar entry %q failed its integrity check: %w", entry.Name, err)
+		}
+		if n > remaining {
+			return fmt.Errorf("the jar expands beyond the validation budget")
+		}
+		remaining -= n
+	}
+	return nil
+}
+
 // InstallPlugin downloads one jar into the server's plugin directory.
 //
 // This is the only place the panel fetches something a user named, so every
@@ -307,7 +370,14 @@ func checkDownloadScheme(u *url.URL) error {
 // trusted with the console, which is strictly more powerful - but it does stop
 // a link turning into an arbitrary write, an arbitrary local read, or a full
 // disk.
-func (m *Manager) InstallPlugin(s *Server, rawURL string) (PluginEntry, error) {
+//
+// The download and validation run BEFORE the filesystem gates are taken: the
+// gate used to be held across a download that can take five minutes, locking
+// out backups and edits the whole time. Publication is a short checked
+// transaction, and it refuses to land if the request context has died - so an
+// installation whose client timed out and went away cannot complete
+// unobserved after the fact.
+func (m *Manager) InstallPlugin(ctx context.Context, s *Server, rawURL, expectedSHA256 string) (PluginEntry, error) {
 	dir, _, err := pluginDirFor(s)
 	if err != nil {
 		return PluginEntry{}, err
@@ -329,40 +399,9 @@ func (m *Manager) InstallPlugin(s *Server, rawURL string) (PluginEntry, error) {
 	if err := validPluginFile(name); err != nil || !strings.HasSuffix(name, jarExt) {
 		return PluginEntry{}, fmt.Errorf("the URL must point at a .jar file (it ends in %q)", path.Base(u.Path))
 	}
-
-	r, err := m.serverRoot(s)
-	if err != nil {
-		return PluginEntry{}, err
-	}
-	defer r.Close()
-	dirName, err := cleanRel(dir)
-	if err != nil {
-		return PluginEntry{}, err
-	}
-	// Shared hold from the first tree mutation (the plugin dir below) through
-	// the final rename: the backup check used to run before a download that
-	// can take minutes, and the write landed however long after the check.
-	// Holding the gate across the download is deliberate - an install is a
-	// rare operator action, and a backup of a half-installed jar helps nobody.
-	s.fsMu.RLock()
-	defer s.fsMu.RUnlock()
-	if err := r.MkdirAll(dirName, 0o755); err != nil {
-		return PluginEntry{}, err
-	}
 	target, err := cleanRel(path.Join(dir, name))
 	if err != nil {
 		return PluginEntry{}, err
-	}
-	if m.backupLocked(s.ID) {
-		return PluginEntry{}, fmt.Errorf("a backup is in progress; writes are blocked until it finishes")
-	}
-	// Refused rather than overwritten: an overwrite is indistinguishable from a
-	// fresh install afterwards, and it destroys the version that was working
-	// while the game may still have the old one mapped.
-	for _, p := range []string{target, target + ".disabled"} {
-		if _, err := r.Lstat(p); err == nil {
-			return PluginEntry{}, fmt.Errorf("%s is already installed; delete it first", name)
-		}
 	}
 
 	client := &http.Client{
@@ -381,7 +420,11 @@ func (m *Manager) InstallPlugin(s *Server, rawURL string) (PluginEntry, error) {
 			return checkDownloadScheme(req.URL)
 		},
 	}
-	resp, err := client.Get(u.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return PluginEntry{}, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return PluginEntry{}, fmt.Errorf("could not download %s: %w", u.Redacted(), err)
 	}
@@ -407,16 +450,96 @@ func (m *Manager) InstallPlugin(s *Server, rawURL string) (PluginEntry, error) {
 	}
 	// A 200 that carries an HTML login page or an error document would otherwise
 	// land as a plausible .jar, and the game then fails to boot with a stack
-	// trace that points at the plugin rather than at the download.
-	if !bytes.HasPrefix(body, []byte(zipMagic)) {
-		return PluginEntry{}, fmt.Errorf("%s did not return a jar file", u.Redacted())
+	// trace that points at the plugin rather than at the download. Four magic
+	// bytes proved nothing; the whole archive is validated.
+	if err := validateJar(body, expectedSHA256); err != nil {
+		return PluginEntry{}, fmt.Errorf("%s did not return a valid jar file: %w", u.Redacted(), err)
 	}
 
-	// Temp file then rename. A half-written jar is still a jar as far as the
-	// loader is concerned: it would be opened on the next start and fail there
-	// instead of here.
-	if err := writeAtomicIn(r, target, body, 0o644); err != nil {
+	// The client may have gone away while the download ran; a publication
+	// after that point is work nobody is waiting for and the operator cannot
+	// see. Checked before the gates, and again just before the link.
+	if err := ctx.Err(); err != nil {
+		return PluginEntry{}, fmt.Errorf("the install was cancelled: %w", err)
+	}
+
+	// Publication: a short transaction under the shared filesystem gate and
+	// the edit mutex, rechecking everything the download invalidated.
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+
+	if err := m.requireRegistered(s); err != nil {
+		return PluginEntry{}, err
+	}
+	if m.backupLocked(s.ID) {
+		return PluginEntry{}, fmt.Errorf("a backup is in progress; writes are blocked until it finishes")
+	}
+
+	r, err := m.serverRoot(s)
+	if err != nil {
+		return PluginEntry{}, err
+	}
+	defer r.Close()
+	dirName, err := cleanRel(dir)
+	if err != nil {
+		return PluginEntry{}, err
+	}
+	if err := r.MkdirAll(dirName, 0o755); err != nil {
+		return PluginEntry{}, err
+	}
+	// Refused rather than overwritten: an overwrite is indistinguishable from a
+	// fresh install afterwards, and it destroys the version that was working
+	// while the game may still have the old one mapped. The link-based publish
+	// below enforces this atomically - two installs racing past this check
+	// cannot both land, which the old stat-then-rename pair allowed.
+	for _, p := range []string{target, target + ".disabled"} {
+		if _, err := r.Lstat(p); err == nil {
+			return PluginEntry{}, fmt.Errorf("%s is already installed; delete it first", name)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return PluginEntry{}, fmt.Errorf("the install was cancelled: %w", err)
+	}
+
+	// Staged through a unique temp and published with link-then-unlink, so the
+	// target name is never opened for writing and can never be replaced - a
+	// half-written or racing jar cannot take an installed plugin's place.
+	suffix, err := randomHex(8)
+	if err != nil {
+		return PluginEntry{}, err
+	}
+	tmp := path.Join(dirName, ".arcade-tmp-plugin-"+suffix)
+	f, err := r.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return PluginEntry{}, err
+	}
+	if _, err := f.Write(body); err != nil {
+		f.Close()
+		_ = r.Remove(tmp)
+		return PluginEntry{}, err
+	}
+	if err := errors.Join(f.Sync(), f.Close()); err != nil {
+		_ = r.Remove(tmp)
+		return PluginEntry{}, err
+	}
+	if err := r.Link(tmp, target); err != nil {
+		_ = r.Remove(tmp)
+		if os.IsExist(err) {
+			return PluginEntry{}, fmt.Errorf("%s is already installed; delete it first", name)
+		}
 		return PluginEntry{}, friendlyFSError(err, path.Join(dir, name))
+	}
+	// The published name's durability and the temp's removal are both
+	// best-effort from here: the plugin IS installed, and failing the request
+	// would invite a retry that "installs" it a second time.
+	if err := r.Remove(tmp); err != nil {
+		log.Printf("plugin published but its temp file could not be removed: %v", err)
+	}
+	if parent, perr := r.Open(dirName); perr == nil {
+		_ = parent.Sync()
+		_ = parent.Close()
 	}
 	return m.statPlugin(r, target, name, true)
 }
@@ -504,13 +627,19 @@ func (a *API) installPlugin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		URL string `json:"url"`
+		URL    string `json:"url"`
+		SHA256 string `json:"sha256"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	e, err := a.mgr.InstallPlugin(s, body.URL)
+	// The request's context bounds the download: a client that disconnects
+	// (or a reverse proxy that gave up) cancels it, instead of the panel
+	// finishing a five-minute fetch whose answer nobody will read.
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
+	defer cancel()
+	e, err := a.mgr.InstallPlugin(ctx, s, body.URL, body.SHA256)
 	if err != nil {
 		writeErr(w, 400, err)
 		return

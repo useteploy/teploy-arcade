@@ -87,9 +87,31 @@ func (t *mcpTokens) save() error {
 	return writeFileAtomic(t.path, b, 0o600)
 }
 
+// Revoke removes every token carrying this name. It used to remove only the
+// first match, so a legacy store holding duplicates kept a working credential
+// behind the name the operator believed they had revoked.
+func (t *mcpTokens) Revoke(name string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	next := make([]mcpToken, 0, len(t.toks))
+	for _, token := range t.toks {
+		if strings.TrimSpace(token.Name) != strings.TrimSpace(name) {
+			next = append(next, token)
+		}
+	}
+	if len(next) == len(t.toks) {
+		return fmt.Errorf("no such token")
+	}
+	return t.persistLocked(next)
+}
+
 func (t *mcpTokens) Issue(name string) (string, error) {
-	if strings.TrimSpace(name) == "" {
+	name = strings.TrimSpace(name)
+	if name == "" {
 		return "", fmt.Errorf("name is required")
+	}
+	if len(name) > 64 {
+		return "", fmt.Errorf("name must be at most 64 characters")
 	}
 	// Fail closed rather than issue "tpa_" with an empty random half: that token
 	// would be stored as a valid hash, so anyone who guessed the bare prefix
@@ -101,10 +123,41 @@ func (t *mcpTokens) Issue(name string) (string, error) {
 	raw := "tpa_" + suffix
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.toks = append(t.toks, mcpToken{
+	// Duplicate names are refused: names are how tokens are listed and
+	// revoked, and a second token under a live name used to hide behind it -
+	// revoking the name removed whichever record came first, and the other
+	// credential kept working.
+	for _, x := range t.toks {
+		if strings.TrimSpace(x.Name) == name {
+			return "", fmt.Errorf("a token named %q already exists; revoke it or choose another name", name)
+		}
+	}
+	// Persist before publish, matching every other credential store here: a
+	// failed save used to leave a working token in memory that no restart
+	// would ever know about.
+	next := make([]mcpToken, 0, len(t.toks)+1)
+	next = append(next, t.toks...)
+	next = append(next, mcpToken{
 		Name: name, Hash: hashMCPToken(raw), Created: time.Now().Unix(),
 	})
-	return raw, t.save()
+	if err := t.persistLocked(next); err != nil {
+		return "", err
+	}
+	return raw, nil
+}
+
+// persistLocked writes a prospective token list and publishes it only when
+// the write commits. Callers hold t.mu.
+func (t *mcpTokens) persistLocked(next []mcpToken) error {
+	b, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(t.path, b, 0o600); err != nil {
+		return err
+	}
+	t.toks = next
+	return nil
 }
 
 func (t *mcpTokens) Check(raw string) bool {
@@ -150,18 +203,6 @@ func (t *mcpTokens) List() []map[string]any {
 		})
 	}
 	return out
-}
-
-func (t *mcpTokens) Revoke(name string) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for i, x := range t.toks {
-		if x.Name == name {
-			t.toks = append(t.toks[:i], t.toks[i+1:]...)
-			return t.save()
-		}
-	}
-	return fmt.Errorf("no such token")
 }
 
 // ---------------------------------------------------------------- backend
@@ -214,6 +255,11 @@ func (b mcpBackend) ConsoleTail(id string, lines int) (string, error) {
 // of its commands back from the console, and console output is written by
 // players, plugins and the MOTD - so a chat line asking for op must not be able
 // to travel back out as an op command.
+//
+// This remains a denylist, and a denylist is not a capability boundary: plugin
+// aliases and wrappers can reach the same operations under other names. It
+// stops the straightforward spellings; the durable fix is typed tools with
+// scoped capabilities (see AUDIT_OPEN).
 var mcpBlockedVerbs = map[string]bool{
 	"op": true, "deop": true, "ban": true, "ban-ip": true,
 	"pardon": true, "pardon-ip": true, "whitelist": true, "stop": true,
@@ -221,11 +267,17 @@ var mcpBlockedVerbs = map[string]bool{
 
 // consoleVerb pulls the command word out of a console line. The leading slash
 // is tolerated because a model will type one however the tool is described,
-// and the verb check has to see the same command the game will.
+// and a namespace prefix (`minecraft:op`, a plugin's `essentials:ban`) is
+// stripped because Paper-ecosystem servers dispatch those as the plain verb -
+// the check has to see the command the game will run, not the first token of
+// the line.
 func consoleVerb(text string) string {
 	v := strings.TrimPrefix(strings.TrimSpace(text), "/")
 	if i := strings.IndexAny(v, " \t"); i >= 0 {
 		v = v[:i]
+	}
+	if i := strings.LastIndex(v, ":"); i >= 0 {
+		v = v[i+1:]
 	}
 	return strings.ToLower(v)
 }
@@ -302,7 +354,16 @@ func (b mcpBackend) HostStatus() (string, error) { return b.js(b.m.Host()) }
 // ------------------------------------------------------------------ routes
 
 func (a *API) mcpRoutes(mux *http.ServeMux) {
-	h := &mcp.Handler{Backend: mcpBackend{m: a.mgr}, Check: a.mgr.mcp.Check}
+	// An unclaimed panel refuses MCP dispatch outright: no token can be
+	// legitimately issued before the first admin exists (the minting route is
+	// gated), and honouring a pre-setup token here would let a credential
+	// minted during the open window outlive the setup it preceded.
+	h := &mcp.Handler{Backend: mcpBackend{m: a.mgr}, Check: func(raw string) bool {
+		if a.mgr.auth.SetupRequired() {
+			return false
+		}
+		return a.mgr.mcp.Check(raw)
+	}}
 	mux.Handle("/api/mcp", h)
 
 	auth := a.mgr.auth

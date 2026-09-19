@@ -71,7 +71,7 @@ func TestSchedulerRunIsNotReentrant(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs <- mgr.sched.Run(task.ID, "tester")
+			errs <- mgr.sched.Run("", task.ID, "tester")
 		}()
 	}
 	wg.Wait()
@@ -116,7 +116,7 @@ func TestSchedulerRecordsARunWhenTheStoredClockIsGarbage(t *testing.T) {
 	}
 	mgr.sched.mu.Unlock()
 
-	if err := mgr.sched.Run(task.ID, "tester"); err != nil {
+	if err := mgr.sched.Run("", task.ID, "tester"); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	got := mgr.sched.Get(task.ID)
@@ -141,7 +141,7 @@ func TestSchedulerRejectedTimeEditDoesNotSurviveInMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if _, err := mgr.sched.Update(task.ID, func(t *Task) { t.Time = "99:99" }); err == nil {
+	if _, err := mgr.sched.Update(task.ServerID, task.ID, func(t *Task) { t.Time = "99:99" }); err == nil {
 		t.Fatal("an invalid time was accepted")
 	}
 	if got := mgr.sched.Get(task.ID).Time; got != "04:00" {

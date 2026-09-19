@@ -148,8 +148,12 @@ func (a *API) patchServer(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	a.mgr.audit(actorOf(r), "server.resources", s.ID,
-		fmt.Sprintf("memory=%dMB cpu=%g", s.MemoryMB, s.CPU))
+	// Snapshot under the lock: SetResources has already released it, and the
+	// audit message used to read the fields bare - racing the next update.
+	s.mu.Lock()
+	detail := fmt.Sprintf("memory=%dMB cpu=%g", s.MemoryMB, s.CPU)
+	s.mu.Unlock()
+	a.mgr.audit(actorOf(r), "server.resources", s.ID, detail)
 	writeJSON(w, 200, map[string]any{
 		"server": s.Snapshot(), "pending_restart": pending,
 	})
@@ -268,11 +272,33 @@ func (a *API) patchSettings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// streamAuthorized re-resolves the caller's RIGHT to read, now, from the
+// cookie the request carried. Long-lived connections used to authorize once
+// at connect and keep streaming after the session was revoked, the account
+// deleted, or the password reset - a sacked operator kept full read access
+// until they happened to disconnect.
+func (a *API) streamAuthorized(r *http.Request) bool {
+	auth := a.mgr.auth
+	if !auth.Enabled() {
+		return true
+	}
+	c, err := r.Cookie("gss_session")
+	if err != nil {
+		return false
+	}
+	sess := auth.Session(c.Value)
+	if sess == nil {
+		return false
+	}
+	return roleRank[sess.Role] >= roleRank[RoleViewer] && !auth.MustChangePassword(sess.User)
+}
+
 // events is the panel-wide SSE feed: status transitions and metric samples, so
 // the server list updates without polling.
 func (a *API) events(w http.ResponseWriter, r *http.Request) {
-	fl, ok := w.(http.Flusher)
-	if !ok {
+	// A stream needs a flusher; the ResponseController below surfaces the
+	// same capability per write.
+	if _, ok := w.(http.Flusher); !ok {
 		writeErr(w, 500, fmt.Errorf("streaming unsupported"))
 		return
 	}
@@ -286,7 +312,9 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 	}
 	defer a.mgr.Unsubscribe(ch)
 
-	// This response never ends, so the server's write deadline has to go.
+	// This response never ends, so the server's absolute write deadline has to
+	// go - but every write below re-arms a rolling one, so a client that stops
+	// reading releases its goroutine instead of holding it forever.
 	clearStreamDeadlines(w)
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -294,10 +322,23 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(200)
 
-	fmt.Fprintf(w, "data: %s\n\n", mustJSON(map[string]any{
+	rc := http.NewResponseController(w)
+	// send writes one SSE frame under a fresh write deadline. A stalled
+	// reader fails the write and ends the stream rather than blocking the
+	// fan-out for the life of the process.
+	send := func(format string, args ...any) bool {
+		_ = rc.SetWriteDeadline(time.Now().Add(20 * time.Second))
+		if _, err := fmt.Fprintf(w, format, args...); err != nil {
+			return false
+		}
+		return rc.Flush() == nil
+	}
+
+	if !send("data: %s\n\n", mustJSON(map[string]any{
 		"event": "hello", "servers": a.mgr.listSnapshot(),
-	}))
-	fl.Flush()
+	})) {
+		return
+	}
 
 	ping := time.NewTicker(20 * time.Second)
 	defer ping.Stop()
@@ -310,11 +351,20 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			fmt.Fprintf(w, "data: %s\n\n", msg)
-			fl.Flush()
+			// Authorized on every frame, not just at connect.
+			if !a.streamAuthorized(r) {
+				return
+			}
+			if !send("data: %s\n\n", msg) {
+				return
+			}
 		case <-ping.C:
-			fmt.Fprint(w, ": ping\n\n")
-			fl.Flush()
+			if !a.streamAuthorized(r) {
+				return
+			}
+			if !send(": ping\n\n") {
+				return
+			}
 		}
 	}
 }
@@ -381,8 +431,18 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 	replay, seq, capacity := a.hub.Join(id, conn)
 	defer a.hub.Leave(id, conn)
 
+	// writeConsole bounds every payload write: the writer goroutine used to
+	// use the unbounded connection context, so a client that stopped reading
+	// pinned it forever - and the ping ticker sharing that goroutine could
+	// never fire to detect the stall.
+	writeConsole := func(payload []byte) error {
+		wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
+		defer wcancel()
+		return c.Write(wctx, websocket.MessageText, payload)
+	}
+
 	// Replay first so a refresh never lands on a blank console.
-	_ = c.Write(ctx, websocket.MessageText, mustJSON(map[string]any{
+	_ = writeConsole(mustJSON(map[string]any{
 		"t": "replay", "lines": replay, "count": len(replay),
 		"buffer_capacity": capacity, "seq": seq,
 		"server": s.Snapshot(),
@@ -419,6 +479,24 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-t.C:
+				// Reauthorized on every pass: the reader rechecks each command,
+				// but the writer used to keep streaming console output to a
+				// revoked session until it happened to disconnect.
+				if a.mgr.auth.Enabled() && !a.streamAuthorized(r) {
+					_ = c.Close(websocket.StatusPolicyViolation, "session no longer authorized")
+					return
+				}
+				if d := conn.Dropped(); d > lastDropped {
+					n := d - lastDropped
+					lastDropped = d
+					if err := writeConsole(mustJSON(map[string]any{
+						"t": "dropped", "count": n, "total": d,
+						"ts": time.Now().Format("15:04:05"),
+					})); err != nil {
+						return
+					}
+				}
 			case <-ping.C:
 				// Bounded: Ping waits for the pong, and a peer that never
 				// answers must not block this goroutine for the life of the
@@ -433,17 +511,8 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 				if !ok {
 					return
 				}
-				if err := c.Write(ctx, websocket.MessageText, msg); err != nil {
+				if err := writeConsole(msg); err != nil {
 					return
-				}
-			case <-t.C:
-				if d := conn.Dropped(); d > lastDropped {
-					n := d - lastDropped
-					lastDropped = d
-					_ = c.Write(ctx, websocket.MessageText, mustJSON(map[string]any{
-						"t": "dropped", "count": n, "total": d,
-						"ts": time.Now().Format("15:04:05"),
-					}))
 				}
 			}
 		}
@@ -480,7 +549,7 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 		// happened to disconnect.
 		if a.mgr.auth.Enabled() {
 			if sess = a.liveSession(r); sess == nil {
-				_ = c.Write(ctx, websocket.MessageText, mustJSON(map[string]any{
+				_ = writeConsole(mustJSON(map[string]any{
 					"t": "command_ack", "id": in.ID, "accepted": false,
 					"error": "your session is no longer valid; sign in again",
 				}))
@@ -491,7 +560,7 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 		if sess != nil {
 			actor = sess.User
 			if roleRank[sess.Role] < roleRank[RoleOperator] {
-				_ = c.Write(ctx, websocket.MessageText, mustJSON(map[string]any{
+				_ = writeConsole(mustJSON(map[string]any{
 					"t": "command_ack", "id": in.ID, "accepted": false,
 					"error": "the viewer role cannot run console commands",
 				}))
@@ -509,6 +578,6 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			ack["error"] = err.Error()
 		}
-		_ = c.Write(ctx, websocket.MessageText, mustJSON(ack))
+		_ = writeConsole(mustJSON(ack))
 	}
 }

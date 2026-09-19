@@ -46,24 +46,57 @@ type Scheduler struct {
 	path  string
 	tasks []*Task
 	mgr   *Manager
-	seq   int
 
 	// Separate from mu because a run holds it for the whole task — minutes, if
 	// the task waits — while mu is taken and released repeatedly underneath.
 	runMu   sync.Mutex
 	running map[string]bool
+
+	// slots bounds how many distinct tasks may execute at once. The loop
+	// starts one goroutine per due task, and nothing capped how many could
+	// pile up - a panel restarted into a backlog of due tasks launched them
+	// all simultaneously against servers sharing one host.
+	slots chan struct{}
 }
 
+// maxConcurrentTaskRuns is deliberately small: scheduled work is restarts,
+// backups and command sequences, all of which contend for the same disks and
+// CPUs the games do.
+const maxConcurrentTaskRuns = 4
+
 func newScheduler(dataDir string, m *Manager) *Scheduler {
-	s := &Scheduler{path: filepath.Join(dataDir, "tasks.json"), mgr: m, running: map[string]bool{}}
+	s := &Scheduler{path: filepath.Join(dataDir, "tasks.json"), mgr: m, running: map[string]bool{},
+		slots: make(chan struct{}, maxConcurrentTaskRuns)}
 	if b, err := os.ReadFile(s.path); err == nil {
 		if err := json.Unmarshal(b, &s.tasks); err != nil {
 			quarantine(s.path, err) // losing every task silently is worse
 		}
+		// A `[null]` element decodes successfully and panics the loop the
+		// first time it dereferences the record; so does a task whose clock
+		// is garbage (fired at midnight every night instead of being refused,
+		// per the clockField note below). Invalid records are dropped loudly
+		// rather than taking the scheduler down.
+		kept := s.tasks[:0]
+		for i, t := range s.tasks {
+			if t == nil {
+				log.Printf("scheduler: dropped a null task record at index %d", i)
+				continue
+			}
+			if err := validateTask(t); err != nil {
+				log.Printf("scheduler: dropped task %q (%s): %v", t.Name, t.ID, err)
+				continue
+			}
+			kept = append(kept, t)
+		}
+		s.tasks = kept
 	}
 	return s
 }
 
+// save persists the current task list. Retained for DropServer; Add, Update,
+// Delete and record build a prospective slice and publish only after the
+// write commits, so a failed save cannot leave memory and disk disagreeing
+// about which tasks exist.
 func (sc *Scheduler) save() error {
 	b, err := json.MarshalIndent(sc.tasks, "", "  ")
 	if err != nil {
@@ -133,6 +166,14 @@ func validateTask(t *Task) error {
 	return err
 }
 
+// Add validates and stores a new task built from the caller's fields.
+//
+// The caller's pointer is copied, never stored: the HTTP handler used to
+// decode the request body straight into a Task, so a client could seed
+// Runs/LastRun/LastErr bookkeeping, and the returned pointer stayed live
+// while the scheduler mutated it. IDs are random and checked for uniqueness -
+// the old `unix%100000 + seq%100` collided after 100 tasks in the same
+// second, and again after every restart.
 func (sc *Scheduler) Add(t *Task) (*Task, error) {
 	if err := validateTask(t); err != nil {
 		return nil, err
@@ -141,34 +182,96 @@ func (sc *Scheduler) Add(t *Task) (*Task, error) {
 		return nil, fmt.Errorf("no such server")
 	}
 
+	created := *t
+	created.Runs, created.LastRun, created.LastErr = 0, 0, ""
+
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	sc.seq++
-	t.ID = fmt.Sprintf("t%d%02d", time.Now().Unix()%100000, sc.seq%100)
-	t.Enabled = true
-	sc.tasks = append(sc.tasks, t)
-	return t, sc.save()
+	newID, err := func() (string, error) {
+		for attempt := 0; attempt < 20; attempt++ {
+			suffix, err := randomHex(8)
+			if err != nil {
+				return "", err
+			}
+			id := "t" + suffix
+			if !sc.idTakenLocked(id) {
+				return id, nil
+			}
+		}
+		return "", fmt.Errorf("could not allocate a unique task id")
+	}()
+	if err != nil {
+		return nil, err
+	}
+	created.ID = newID
+	// Persist the prospective list before publishing it: a failed save used
+	// to leave the task scheduled in memory while the caller was told it was
+	// rejected - an "uncreated" task that ran anyway, until restart.
+	next := make([]*Task, 0, len(sc.tasks)+1)
+	for _, existing := range sc.tasks {
+		next = append(next, existing)
+	}
+	next = append(next, &created)
+	if err := sc.persist(next); err != nil {
+		return nil, err
+	}
+	sc.tasks = next
+	cp := created
+	return &cp, nil
 }
 
-func (sc *Scheduler) Update(id string, fn func(*Task)) (*Task, error) {
+// idTakenLocked reports whether a task ID is in use. Callers hold sc.mu.
+func (sc *Scheduler) idTakenLocked(id string) bool {
+	for _, t := range sc.tasks {
+		if t.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// persist writes a prospective task list atomically. Callers hold sc.mu and
+// publish sc.tasks = next only when this returns nil.
+func (sc *Scheduler) persist(next []*Task) error {
+	b, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(sc.path, b, 0o644)
+}
+
+// Update applies fn to the task identified by (serverID, id). Both must match:
+// the HTTP routes carry a server ID in their URL, and the old lookup ignored
+// it - a stale or mistaken URL edited a different server's task and attributed
+// the change to the wrong server in the audit log.
+func (sc *Scheduler) Update(serverID, id string, fn func(*Task)) (*Task, error) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	for _, t := range sc.tasks {
-		if t.ID == id {
-			before := *t
-			fn(t)
-			if err := validateTask(t); err != nil {
-				// A rejected edit must not survive in memory. Leaving a bad
-				// task on the live schedule would keep firing a task the
-				// operator was just told was left unchanged - and the pointer
-				// PATCH fix made blank names/commands reachable, which used
-				// to record successful runs of nothing.
-				*t = before
-				return nil, err
-			}
-			cp := *t
-			return &cp, sc.save()
+		if t.ID != id || t.ServerID != serverID {
+			continue
 		}
+		before := *t
+		fn(t)
+		if err := validateTask(t); err != nil {
+			// A rejected edit must not survive in memory. Leaving a bad
+			// task on the live schedule would keep firing a task the
+			// operator was just told was left unchanged - and the pointer
+			// PATCH fix made blank names/commands reachable, which used
+			// to record successful runs of nothing.
+			*t = before
+			return nil, err
+		}
+		next := make([]*Task, 0, len(sc.tasks))
+		for _, existing := range sc.tasks {
+			next = append(next, existing)
+		}
+		if err := sc.persist(next); err != nil {
+			*t = before
+			return nil, err
+		}
+		cp := *t
+		return &cp, nil
 	}
 	return nil, fmt.Errorf("no such task")
 }
@@ -183,20 +286,33 @@ func (sc *Scheduler) record(id string, fn func(*Task)) error {
 	for _, t := range sc.tasks {
 		if t.ID == id {
 			fn(t)
-			return sc.save()
+			next := make([]*Task, 0, len(sc.tasks))
+			for _, existing := range sc.tasks {
+				next = append(next, existing)
+			}
+			return sc.persist(next)
 		}
 	}
 	return fmt.Errorf("no such task")
 }
 
-func (sc *Scheduler) Delete(id string) error {
+// Delete removes the task identified by (serverID, id); both must match, for
+// the same reason Update checks both.
+func (sc *Scheduler) Delete(serverID, id string) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	for i, t := range sc.tasks {
-		if t.ID == id {
-			sc.tasks = append(sc.tasks[:i], sc.tasks[i+1:]...)
-			return sc.save()
+		if t.ID != id || t.ServerID != serverID {
+			continue
 		}
+		next := make([]*Task, 0, len(sc.tasks)-1)
+		next = append(next, sc.tasks[:i]...)
+		next = append(next, sc.tasks[i+1:]...)
+		if err := sc.persist(next); err != nil {
+			return err
+		}
+		sc.tasks = next
+		return nil
 	}
 	return fmt.Errorf("no such task")
 }
@@ -252,25 +368,42 @@ func (sc *Scheduler) Get(id string) *Task {
 }
 
 // NextRun reports when a task will next fire, for the UI.
+//
+// Built with time.Date on the civil fields, not midnight-plus-duration: on a
+// daylight-saving day the clock jumps, and midnight+3h30 landed on 04:30 when
+// the task says 03:30 - the preview disagreed with the loop, which compares
+// wall-clock time, on exactly the days people schedule restarts around.
 func (t *Task) NextRun(now time.Time) time.Time {
 	secs, err := parseClock(t.Time)
 	if err != nil {
 		return time.Time{}
 	}
-	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	next := midnight.Add(time.Duration(secs) * time.Second)
+	h, m, s := secs/3600, (secs%3600)/60, secs%60
+	loc := now.Location()
+	next := time.Date(now.Year(), now.Month(), now.Day(), h, m, s, 0, loc)
 	if !next.After(now) {
 		if !t.Repeat {
 			return time.Time{} // one-shot whose moment has passed today
 		}
-		next = next.Add(24 * time.Hour)
+		tomorrow := now.AddDate(0, 0, 1)
+		next = time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), h, m, s, 0, loc)
 	}
 	return next
 }
 
+// sameLocalDate reports whether two moments fall on the same local calendar
+// day. This is the occurrence identity the loop suppresses repeats with: on
+// the fall-back day the same local hour happens twice, and a "not run in the
+// last two minutes" check let a 01:30 task fire in both of them.
+func sameLocalDate(a, b time.Time) bool {
+	a, b = a.Local(), b.Local()
+	return a.Year() == b.Year() && a.YearDay() == b.YearDay()
+}
+
 // loop fires due tasks. It ticks every 20s and fires anything whose time has
-// passed and that has not already run in this same minute, so a restarted panel
-// does not re-fire a task it already ran, and a slow tick cannot skip one.
+// passed and that has not already run on this local date, so a restarted panel
+// does not re-fire a task it already ran, a slow tick cannot skip one, and a
+// repeated hour at a daylight transition does not double-fire one.
 func (sc *Scheduler) loop() {
 	defer recoverPanic("scheduler loop")
 	t := time.NewTicker(20 * time.Second)
@@ -293,8 +426,7 @@ func (sc *Scheduler) loop() {
 			if secsNow < at || secsNow > at+59 {
 				continue
 			}
-			last := time.Unix(task.LastRun, 0)
-			if task.LastRun > 0 && now.Sub(last) < 2*time.Minute {
+			if task.LastRun > 0 && sameLocalDate(time.Unix(task.LastRun, 0), now) {
 				continue
 			}
 			due = append(due, task)
@@ -302,9 +434,20 @@ func (sc *Scheduler) loop() {
 		sc.mu.RUnlock()
 
 		for _, task := range due {
+			// Admission before the goroutine: without it a panel restarting
+			// into a pile of due tasks spawned one goroutine per task, all
+			// waiting (and then all running) at once.
+			select {
+			case sc.slots <- struct{}{}:
+			default:
+				log.Printf("scheduler: %d task runs are already executing; skipping %q this occurrence",
+					maxConcurrentTaskRuns, task.Name)
+				continue
+			}
 			go func(id string) {
 				defer recoverPanic("scheduled task " + id)
-				_ = sc.Run(id, "scheduler")
+				defer func() { <-sc.slots }()
+				_ = sc.Run("", id, "scheduler")
 			}(task.ID)
 		}
 	}
@@ -312,7 +455,10 @@ func (sc *Scheduler) loop() {
 
 // Run executes a task now. Also used by the "Run now" button, which is the only
 // honest way to let someone test a nightly restart without waiting for night.
-func (sc *Scheduler) Run(id, actor string) error {
+// serverID may be empty to mean "the task's own server"; routes that carry a
+// server ID in their URL pass it so a mismatched URL cannot drive another
+// server's task.
+func (sc *Scheduler) Run(serverID, id, actor string) error {
 	// The loop decides a task is due before LastRun is written back at the end of
 	// the run, so "Run now" landing in that window would execute a second copy:
 	// two lifecycle calls on one server, or two interleaved
@@ -332,6 +478,9 @@ func (sc *Scheduler) Run(id, actor string) error {
 
 	task := sc.Get(id)
 	if task == nil {
+		return fmt.Errorf("no such task")
+	}
+	if serverID != "" && task.ServerID != serverID {
 		return fmt.Errorf("no such task")
 	}
 	s := sc.mgr.Get(task.ServerID)

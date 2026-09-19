@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -70,6 +72,13 @@ func Run(cfg Config) error {
 		log.Printf("created the first admin from startup credentials; setup is not required")
 	}
 	if cfg.NoAuth {
+		// --no-auth is a development switch, and the container default binds
+		// 0.0.0.0. Refusing the combination is the only honest reading of
+		// "no authentication" on a network interface: on this panel it means
+		// anyone reachable can create containers as root on the host.
+		if !isLoopbackHost(cfg.Host) {
+			return fmt.Errorf("--no-auth refuses to start on %s: it is a development switch and this address is reachable from the network; bind a loopback host instead", cfg.Host)
+		}
 		mgr.auth.Disable()
 	} else if err := mgr.auth.BeginSetup(); err != nil {
 		return err
@@ -98,11 +107,23 @@ func Run(cfg Config) error {
 		}
 	}()
 
-	srv := newHTTPServer(fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+	srv := newHTTPServer(net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
 		limitBodies(mgr.auth.attach(mux)))
 
 	banner(cfg, mgr)
 	return srv.ListenAndServe()
+}
+
+// isLoopbackHost reports whether the bind address can only be reached from
+// this machine. Everything else - the container-default 0.0.0.0 included -
+// counts as network-reachable.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "", "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // newHTTPServer applies the connection timeouts. With only ReadHeaderTimeout
@@ -152,18 +173,16 @@ func banner(cfg Config, mgr *Manager) {
 	if dockerAvailable() {
 		docker = "available - new servers can use the docker runtime"
 	}
-	authState := "open (no users yet - create one in Settings)"
+	authState := "closed until first-run setup creates an admin (setup token is in this log)"
 	switch {
 	case cfg.NoAuth:
 		authState = "DISABLED by --no-auth (development only)"
 	case mgr.auth.Enabled():
 		authState = "enabled - sign in required"
-	case cfg.Host != "127.0.0.1" && cfg.Host != "localhost":
-		authState = "OPEN AND REACHABLE FROM THE NETWORK - create a user before exposing this"
 	}
 
 	fmt.Printf("\n  Teploy Arcade %s\n", agentVersion)
-	fmt.Printf("  panel     http://%s:%d\n", cfg.Host, cfg.Port)
+	fmt.Printf("  panel     http://%s\n", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)))
 	fmt.Printf("  data      %s\n", cfg.DataDir)
 	fmt.Printf("  docker    %s\n", docker)
 	fmt.Printf("  auth      %s\n", authState)

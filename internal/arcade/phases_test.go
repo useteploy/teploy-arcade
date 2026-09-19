@@ -45,7 +45,7 @@ func TestFilePathsCannotEscapeServerDir(t *testing.T) {
 	dir := mgr.serverDir(s)
 	link := filepath.Join(dir, "escape")
 	if err := os.Symlink(filepath.Dir(mgr.dataDir), link); err == nil {
-		if _, err := mgr.ListFiles(s, "escape"); err == nil {
+		if _, _, err := mgr.ListFiles(s, "escape"); err == nil {
 			t.Error("a symlink out of the server directory was followed")
 		}
 	}
@@ -55,7 +55,7 @@ func TestFileReadWriteRoundTrip(t *testing.T) {
 	_, mgr := newTestAgent(t)
 	s := mgr.List()[0]
 
-	entries, err := mgr.ListFiles(s, "")
+	entries, _, err := mgr.ListFiles(s, "")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -507,7 +507,7 @@ func TestSchedulerRunsStepsAndPanelActions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := mgr.sched.Run(task.ID, "tester"); err != nil {
+	if err := mgr.sched.Run("", task.ID, "tester"); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
@@ -522,7 +522,7 @@ func TestSchedulerRunsStepsAndPanelActions(t *testing.T) {
 
 	// an unknown action must report itself rather than fail silently
 	bad, _ := mgr.sched.Add(&Task{ServerID: s.ID, Name: "bad", Commands: "!explode", Time: "05:00", Repeat: true})
-	if err := mgr.sched.Run(bad.ID, "tester"); err == nil {
+	if err := mgr.sched.Run("", bad.ID, "tester"); err == nil {
 		t.Error("unknown action should error")
 	}
 	if e := mgr.sched.Get(bad.ID); e.LastErr == "" {
@@ -531,7 +531,7 @@ func TestSchedulerRunsStepsAndPanelActions(t *testing.T) {
 
 	// one-shot disables itself after firing
 	once, _ := mgr.sched.Add(&Task{ServerID: s.ID, Name: "once", Commands: "say bye", Time: "06:00", Repeat: false})
-	_ = mgr.sched.Run(once.ID, "tester")
+	_ = mgr.sched.Run("", once.ID, "tester")
 	if mgr.sched.Get(once.ID).Enabled {
 		t.Error("a one-shot task should disable itself after running")
 	}

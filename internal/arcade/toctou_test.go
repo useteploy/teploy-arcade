@@ -74,7 +74,7 @@ func TestPathOperationsCannotBeRacedOutOfTheServerDirectory(t *testing.T) {
 			for n := 0; n < rounds; n++ {
 				_ = mgr.WriteFile(s, "plugins/planted.jar", "PK\x03\x04")
 				_, _ = mgr.ReadFile(s, "plugins/bait.txt")
-				_, _ = mgr.ListFiles(s, "plugins")
+				_, _, _ = mgr.ListFiles(s, "plugins")
 				_ = mgr.MkDir(s, "plugins/sub")
 				_ = mgr.DeletePath(s, "plugins/bait.txt")
 				_, _, _, _ = mgr.OpenForDownload(s, "plugins/bait.txt")

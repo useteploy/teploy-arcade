@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Reusable: the release workflow calls this job so a tag cannot publish
+  # binaries or an image from a commit that has not passed the same checks
+  # main runs.
+  workflow_call:
 
 jobs:
   test:

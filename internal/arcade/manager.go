@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -43,8 +44,13 @@ type Manager struct {
 	// reservation every concurrent import passes the same portOwner check and
 	// they all land on one port. Every member of a claimed binding set is
 	// reserved (spans and extras), not just the base.
-	reservedPorts map[int]string
-	reservedByWho map[string][]int
+	//
+	// Reservations are owned by a unique lease ID, never by a display name:
+	// the name is only a label for error messages. Two operations with the
+	// same display name used to release each other's ports, and dropping a
+	// reservation by base port leaked every span/extra member until restart.
+	reservedPorts map[int]string        // port -> lease ID
+	reservedByWho map[string]*portLease // lease ID -> lease
 
 	sim    Runner
 	docker Runner
@@ -91,7 +97,7 @@ func NewManager(dataDir string, hub *Hub) *Manager {
 		mcp:     newMCPTokens(dataDir),
 	}
 	m.reservedPorts = map[int]string{}
-	m.reservedByWho = map[string][]int{}
+	m.reservedByWho = map[string]*portLease{}
 	m.dirSizes = map[string]int64{}
 	m.sched = newScheduler(dataDir, m)
 	m.sim = &simRunner{mgr: m}
@@ -134,13 +140,35 @@ func (m *Manager) Load() error {
 		m.seed()
 		return m.Save()
 	}
+	// `[null]` decodes successfully into a slice holding a nil pointer, and
+	// records without an ID cannot be addressed, locked or persisted
+	// meaningfully - both used to panic or corrupt the map. Dropped loudly.
+	valid := list[:0]
+	for i, s := range list {
+		if s == nil {
+			log.Printf("servers.json: dropped a null record at index %d", i)
+			continue
+		}
+		if s.ID == "" {
+			log.Printf("servers.json: dropped a record with no id (name %q)", s.Name)
+			continue
+		}
+		valid = append(valid, s)
+	}
+	list = valid
 	// What the file says was running is the only record of intent that
 	// survives a reboot, and Load is about to overwrite it. Captured here so
 	// resume() can put back what the host took down. See resume().
 	wasUp := map[string]bool{}
 
 	m.mu.Lock()
+	seen := make(map[string]bool, len(list))
 	for _, s := range list {
+		if seen[s.ID] {
+			log.Printf("servers.json: dropped a duplicate record for %s", s.ID)
+			continue
+		}
+		seen[s.ID] = true
 		// Nothing is running after a panel restart; don't claim otherwise.
 		if s.Status == StatusRunning || s.Status == StatusStarting || s.Status == StatusStopping {
 			wasUp[s.ID] = s.Status != StatusStopping
@@ -161,12 +189,27 @@ func (m *Manager) Load() error {
 }
 
 // recoverInterruptedRestores finishes or discards restore transactions that
-// were interrupted by process death. A staging directory still holding
-// entries in "old" means the live tree had already been moved aside and the
-// install never completed: the held entries go back, because "the previous
-// world was put back" is the documented contract of every restore failure.
-// An empty "old" means the crash happened before anything moved - the
-// archive is untouched, so the staging tree is simply dropped.
+// were interrupted by process death.
+//
+// What recovery may safely delete is decided from the transaction's own
+// structure, not from "the staging tree is non-empty". Evacuation moves live
+// entries into old/ one at a time, so a crash mid-evacuation leaves SOME
+// originals still live. The old recovery treated any non-empty old/ as proof
+// that everything live was installed by the restore, deleted every live
+// entry, and restored old/ - destroying the originals evacuation never
+// reached.
+//
+// The invariant that makes the safe rule work: an entry only ever enters old/
+// by being renamed OUT of the live directory, so a live entry whose name also
+// appears in old/ must have been placed there by the install phase (it is a
+// replacement, and the original is held); a live entry whose name is NOT in
+// old/ is either an original evacuation never reached or a brand-new archive
+// entry - and deleting either of those can destroy data, so recovery leaves
+// them alone. Worst case that leaves a stray new file beside the restored
+// originals; untidy, never destructive.
+//
+// When putting the held entries back fails, the staging tree is KEPT: it is
+// the only remaining copy of whatever did not make it out.
 func (m *Manager) recoverInterruptedRestores() {
 	for _, s := range m.List() {
 		dir := m.serverDir(s)
@@ -186,28 +229,34 @@ func (m *Manager) recoverInterruptedRestores() {
 				log.Printf("%s: discarded a completed restore's leftover staging directory %s", s.Name, e.Name())
 				continue
 			}
-			if heldEnts, err := os.ReadDir(held); err == nil && len(heldEnts) > 0 {
-				// At swap time EVERY live entry had been moved into old/, so
-				// anything now in the live directory was placed there by the
-				// interrupted install. (Enumerating staging/new instead
-				// removed exactly the NOT-yet-installed entries and left the
-				// installed ones blocking the old world's return.) Remove
-				// all live entries except the staging tree itself, then put
-				// the old world back.
-				if liveEnts, lerr := os.ReadDir(dir); lerr == nil {
-					for _, le := range liveEnts {
-						if le.Name() == e.Name() {
-							continue
-						}
-						_ = os.RemoveAll(filepath.Join(dir, le.Name()))
-					}
-				}
-				restoreHeld(held, dir)
-				log.Printf("%s: recovered an interrupted restore - the previous world was put back from %s",
-					s.Name, e.Name())
-			} else {
+			heldEnts, err := os.ReadDir(held)
+			if err != nil || len(heldEnts) == 0 {
 				log.Printf("%s: discarded an interrupted restore's staging directory %s (nothing had moved)", s.Name, e.Name())
+				_ = os.RemoveAll(staging)
+				continue
 			}
+			heldNames := make(map[string]bool, len(heldEnts))
+			for _, he := range heldEnts {
+				heldNames[he.Name()] = true
+			}
+			// Remove ONLY the live entries whose originals are held: those are
+			// replacements the interrupted install put there, and they block
+			// the originals' return. Everything else live is left untouched.
+			if liveEnts, lerr := os.ReadDir(dir); lerr == nil {
+				for _, le := range liveEnts {
+					if le.Name() == e.Name() || !heldNames[le.Name()] {
+						continue
+					}
+					_ = os.RemoveAll(filepath.Join(dir, le.Name()))
+				}
+			}
+			if rerr := restoreHeld(held, dir); rerr != nil {
+				log.Printf("%s: an interrupted restore could not be rolled back fully; the previous world is RETAINED at %s (%v). Resolve it by hand before starting this server.",
+					s.Name, staging, rerr)
+				continue
+			}
+			log.Printf("%s: recovered an interrupted restore - the previous world was put back from %s",
+				s.Name, e.Name())
 			_ = os.RemoveAll(staging)
 		}
 	}
@@ -645,38 +694,64 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	if err := checkFitsHost(memMB, cpu); err != nil {
 		return nil, err
 	}
+	// An unknown runtime is refused rather than silently simulated: a typo in
+	// "docker" used to report the successful creation of a simulated server,
+	// which the operator only met when the real thing never appeared.
+	if runtime == "" {
+		runtime = RuntimeSim
+	}
+	if runtime != RuntimeSim && runtime != RuntimeDocker {
+		return nil, fmt.Errorf("unknown runtime %q (use %q or %q)", runtime, RuntimeSim, RuntimeDocker)
+	}
+	// Claimed, not merely checked - and when the caller left the port to the
+	// panel, the search walks the template's FULL geometry (span and fixed
+	// extras), because a free base with an occupied extra is not a free
+	// binding set. The old suggestion compared single numbers and handed
+	// Create a base it would immediately refuse.
+	lease := ""
 	if port == 0 {
-		port = m.NextFreePort(t.PortHint)
-	}
-	// Claimed, not merely checked.
-	//
-	// portOwner walks the registered servers and nothing else, and Create does
-	// not register its server until several steps later - a disk check, a seed,
-	// a Save. Two creates arriving together therefore both passed, and an
-	// import already holding a reservation was invisible to both: the panel
-	// happily produced two servers on one port, and the second one to start
-	// failed inside Docker with a bind error that named nothing the operator
-	// could act on.
-	//
-	// Import and clone have claimed through reservedPorts since the concurrent
-	// import bug; create was the path still doing it the old way, which meant
-	// the reservation could only ever be half-honoured.
-	cand, err := candidateBindings(port, t.Protocols, t.PortSpan, t.ExtraPorts)
-	if err != nil {
-		return nil, err
-	}
-	if holder, ok := m.claimPortBindings(cand, name); !ok {
-		return nil, fmt.Errorf("port %d is already used by %q", port, holder)
+		hint := t.PortHint
+		if hint == 0 {
+			hint = 25565
+		}
+		for base := hint; base <= 65535; base++ {
+			cand, cerr := candidateBindings(base, t.Protocols, t.PortSpan, t.ExtraPorts)
+			if cerr != nil {
+				continue // the span runs off the top of the range
+			}
+			l, holder, ok := m.claimPortBindings(cand, name)
+			if !ok {
+				if holder == "" && l == "" {
+					return nil, fmt.Errorf("could not allocate a port reservation")
+				}
+				continue
+			}
+			port, lease = base, l
+			break
+		}
+		if port == 0 {
+			return nil, fmt.Errorf("no free port found for %s (needs %d consecutive and its fixed extras)", t.Name, maxInt(1, t.PortSpan))
+		}
+	} else {
+		cand, err := candidateBindings(port, t.Protocols, t.PortSpan, t.ExtraPorts)
+		if err != nil {
+			return nil, err
+		}
+		l, holder, ok := m.claimPortBindings(cand, name)
+		if !ok {
+			if holder == "" {
+				return nil, fmt.Errorf("could not allocate a port reservation")
+			}
+			return nil, fmt.Errorf("port %d is already used by %q", port, holder)
+		}
+		lease = l
 	}
 	claimHeld := true
 	defer func() {
 		if claimHeld {
-			m.releasePort(port)
+			m.releaseReservation(lease)
 		}
 	}()
-	if runtime != RuntimeDocker {
-		runtime = RuntimeSim
-	}
 	// The same seam Start probes through, rather than a second direct call:
 	// one question, one answer, and it is what makes the create path testable.
 	if runtime == RuntimeDocker && !dockerReachable() {
@@ -713,6 +788,15 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	if cpu > 0 {
 		s.CPU = cpu
 	}
+	// The EFFECTIVE configuration is validated, not the caller's raw values:
+	// memMB=0 means "use the template's default", and a default larger than
+	// the host used to pass because only the supplied values were checked.
+	if err := checkServerLimits(s.Port, s.MemoryMB, s.CPU); err != nil {
+		return nil, err
+	}
+	if err := checkFitsHost(s.MemoryMB, s.CPU); err != nil {
+		return nil, err
+	}
 	s.Props["max-players"] = itoa(s.MaxPlayers)
 	s.Props["server-port"] = itoa(port)
 	s.Props["motd"] = name
@@ -746,7 +830,10 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	m.mu.Lock()
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)
-	delete(m.reservedPorts, port) // the server itself now holds the port
+	// The whole lease, inside the same critical section as the registration:
+	// the server now owns the binding set, and there must be no window where
+	// neither the lease nor the server holds it.
+	m.releaseReservationLocked(lease)
 	m.mu.Unlock()
 	claimHeld = false
 
@@ -772,6 +859,13 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 
 	m.broadcastEvent("server.created", s.ID)
 	return s, nil
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // SetResources changes a server's memory and CPU allotment.
@@ -931,11 +1025,45 @@ func (m *Manager) Delete(id string) error {
 	if n := m.sched.DropServer(id); n > 0 {
 		log.Printf("%s: removed %d scheduled task(s) along with the server", id, n)
 	}
-	_ = os.RemoveAll(filepath.Join(m.dataDir, "servers", id))
-	_ = os.RemoveAll(m.backupDir(id))
-
-	_ = m.Save()
+	// Cleanup failures are reported, not discarded: "deleted" used to be
+	// returned while the world directory, the backups, or the persisted entry
+	// survived - and an entry whose files are gone but whose servers.json row
+	// remains resurrects at the next restart pointing at nothing. The server
+	// is already detached at this point, so the error says what still needs
+	// attention rather than undoing the detach.
+	//
+	// The direct path (not serverDir's resolved one) is deliberate for an
+	// adopted server: RemoveAll on the panel's own symlink unlinks the entry,
+	// never the operator's tree behind it.
+	var cleanupErrs []error
+	if err := os.RemoveAll(filepath.Join(m.dataDir, "servers", id)); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("the server directory could not be removed: %w", err))
+	}
+	if err := os.RemoveAll(m.backupDir(id)); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("the backups could not be removed: %w", err))
+	}
+	if err := m.Save(); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("the server list could not be persisted: %w", err))
+	}
 	m.broadcastEvent("server.deleted", id)
+	if len(cleanupErrs) > 0 {
+		return fmt.Errorf("the server was removed from the panel, but cleanup is incomplete: %w", errors.Join(cleanupErrs...))
+	}
+	return nil
+}
+
+// requireRegistered re-validates that this *Server is still the manager's live
+// entry for its ID. File, plugin and backup operations can wait minutes on the
+// server's filesystem gate while Delete removes the server; without this
+// check the waiter wakes up and its next ensureServerDir call RECREATES the
+// directory of a deleted server, publishing a ghost.
+func (m *Manager) requireRegistered(s *Server) error {
+	m.mu.RLock()
+	same := m.servers[s.ID] == s
+	m.mu.RUnlock()
+	if !same {
+		return fmt.Errorf("this server no longer exists")
+	}
 	return nil
 }
 
@@ -1080,7 +1208,11 @@ func candidateBindings(base int, protos []string, span int, extras []string) ([]
 	return out, nil
 }
 
-func (m *Manager) claimPortBindings(cand []portBinding, who string) (string, bool) {
+func (m *Manager) claimPortBindings(cand []portBinding, label string) (lease, holder string, ok bool) {
+	lease, err := randomHex(8)
+	if err != nil {
+		return "", "", false
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, id := range m.order {
@@ -1088,20 +1220,31 @@ func (m *Manager) claimPortBindings(cand []portBinding, who string) (string, boo
 		if !ok {
 			continue
 		}
-		if bindingConflict(serverBindingsLocked(s), cand) {
-			return s.Name, false
+		// serverBindings takes s.mu itself; the manager -> server lock order
+		// is the documented one (changeServerPort and Save already use it).
+		// The old call read s.Protocols/PortSpan/ExtraPorts/BindPort with only
+		// the manager mutex held - a data race against every settings edit.
+		if bindingConflict(serverBindings(s), cand) {
+			return "", s.Name, false
 		}
 	}
 	for _, b := range cand {
-		if holder, taken := m.reservedPorts[b.port]; taken {
-			return holder + " (import in progress)", false
+		if existing, taken := m.reservedPorts[b.port]; taken {
+			return "", m.reservedByWho[existing].label + " (import in progress)", false
 		}
 	}
+	m.reservedByWho[lease] = &portLease{label: label, ports: portsOf(cand)}
 	for _, b := range cand {
-		m.reservedPorts[b.port] = who
+		m.reservedPorts[b.port] = lease
 	}
-	m.reservedByWho[who] = append(m.reservedByWho[who], portsOf(cand)...)
-	return "", true
+	return lease, "", true
+}
+
+// portLease is one operation's reservation: every port it claimed, and the
+// human-readable label shown when someone else collides with it.
+type portLease struct {
+	label string
+	ports []int
 }
 
 // dynamicBindings probes the server tree for runtime-derived ports (the
@@ -1124,25 +1267,52 @@ func portsOf(cand []portBinding) []int {
 	return out
 }
 
-func (m *Manager) claimPort(port int, who string) (string, bool) {
+func (m *Manager) claimPort(port int, label string) (string, string, bool) {
 	cand, err := candidateBindings(port, nil, 1, nil)
 	if err != nil {
-		return err.Error(), false
+		return "", err.Error(), false
 	}
-	return m.claimPortBindings(cand, who)
+	return m.claimPortBindings(cand, label)
 }
 
+// releaseReservation drops a lease's whole claim: every span and extra member,
+// never only the base port. Idempotent, so the deferred cleanup after a
+// registration that already consumed the lease is a no-op.
+func (m *Manager) releaseReservation(lease string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseReservationLocked(lease)
+}
+
+// releaseReservationLocked is releaseReservation for callers already holding
+// m.mu - the registration paths, which must drop the reservation in the same
+// critical section that adds the server, so there is no window where neither
+// the lease nor the server owns the port.
+func (m *Manager) releaseReservationLocked(lease string) {
+	l, ok := m.reservedByWho[lease]
+	if !ok {
+		return
+	}
+	for _, p := range l.ports {
+		// Never release a port a newer lease has since claimed.
+		if m.reservedPorts[p] == lease {
+			delete(m.reservedPorts, p)
+		}
+	}
+	delete(m.reservedByWho, lease)
+}
+
+// releasePort releases the lease that currently owns this port. Kept for the
+// paths that wake up knowing only a port number; new code should hold the
+// lease ID returned by claimPortBindings.
 func (m *Manager) releasePort(port int) {
 	m.mu.Lock()
-	who := m.reservedPorts[port]
-	// Release the WHOLE reservation this port belongs to: spans and extras
-	// were reserved together, and dropping only the base left phantom holds
-	// on the remaining members.
-	for _, p := range m.reservedByWho[who] {
-		delete(m.reservedPorts, p)
+	defer m.mu.Unlock()
+	lease := m.reservedPorts[port]
+	if lease == "" {
+		return
 	}
-	delete(m.reservedByWho, who)
-	m.mu.Unlock()
+	m.releaseReservationLocked(lease)
 }
 
 func (m *Manager) portOwner(port int) *Server {
@@ -1158,6 +1328,9 @@ func (m *Manager) NextFreePort(hint int) int {
 	if hint == 0 {
 		hint = 25565
 	}
+	if hint < 1 {
+		hint = 1
+	}
 	var occupied []portBinding
 	for _, s := range m.List() {
 		occupied = append(occupied, serverBindings(s)...)
@@ -1171,7 +1344,11 @@ func (m *Manager) NextFreePort(hint int) int {
 		reserved[p] = who
 	}
 	m.mu.RUnlock()
-	for p := hint; p < hint+400; p++ {
+	// Capped at 65535 and exhausted honestly: the old loop stopped after 400
+	// candidates and then returned the ORIGINAL hint - recommending a port it
+	// had just watched be occupied. Zero means "no suggestion"; callers that
+	// need a port treat it as a refusal.
+	for p := hint; p <= 65535; p++ {
 		if bindingConflict(occupied, []portBinding{{p, "tcp"}, {p, "udp"}}) {
 			continue
 		}
@@ -1180,7 +1357,7 @@ func (m *Manager) NextFreePort(hint int) int {
 		}
 		return p
 	}
-	return hint
+	return 0
 }
 
 // ------------------------------------------------------------- lifecycle
@@ -1580,7 +1757,9 @@ func (m *Manager) processExited(s *Server, err error) {
 		if ee, ok := err.(interface{ ExitCode() int }); ok {
 			code = ee.ExitCode()
 		}
-		if code == 137 {
+		if code == 137 && containerOOMKilled(s.ID) {
+			// Only the daemon's own flag distinguishes an OOM kill from any
+			// other SIGKILL.
 			reason = "OOM"
 		}
 		m.fail(s, code, reason)
@@ -1826,10 +2005,15 @@ func (m *Manager) Host() map[string]any {
 	var allocMem, disk int
 	running := 0
 	for _, s := range m.List() {
+		// Limits are written under s.mu (SetResources, restore, reloadProps);
+		// summing them bare raced those writes.
+		s.mu.Lock()
 		allocCPU += s.CPU
 		allocMem += s.MemoryMB
 		disk += s.DiskGB
-		if s.State() == StatusRunning {
+		st := s.Status
+		s.mu.Unlock()
+		if st == StatusRunning {
 			running++
 		}
 	}
@@ -1947,7 +2131,7 @@ func (m *Manager) changeServerPort(s *Server, port int) error {
 		if !ok || other.ID == s.ID {
 			continue
 		}
-		if bindingConflict(serverBindingsLocked(other), candidate) {
+		if bindingConflict(serverBindings(other), candidate) {
 			other.mu.Lock()
 			name := other.Name
 			other.mu.Unlock()
@@ -1995,6 +2179,10 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 	// Start could read the old port for -p and the new one for SERVER_PORT.
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	// Serialized against the other cooperating configuration writers (file
+	// edits, plugin publication) for the same reason WriteFile takes it.
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
 
 	// The port moves first and atomically. If it is taken, the whole request
 	// is refused before any other setting has been applied.
@@ -2003,7 +2191,6 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 			return nil, err
 		}
 	}
-
 
 	// Everything that touches s.Props happens under the lock. reloadProps
 	// writes the same map from the file-manager path, and Go aborts the whole

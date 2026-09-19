@@ -105,13 +105,19 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 	if err != nil {
 		return nil, err
 	}
-	if holder, ok := m.claimPortBindings(cloneCand, name); !ok {
+	// Claimed under a unique lease, never the display name: two same-named
+	// clones used to be able to release each other's reservation.
+	lease, holder, ok := m.claimPortBindings(cloneCand, name)
+	if !ok {
+		if holder == "" {
+			return nil, fmt.Errorf("could not allocate a port reservation")
+		}
 		return nil, fmt.Errorf("port %d is already used by %q; give a different port", port, holder)
 	}
 	claimHeld := true
 	defer func() {
 		if claimHeld {
-			m.releasePort(port)
+			m.releaseReservation(lease)
 		}
 	}()
 
@@ -169,7 +175,7 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		defer src.fsMu.Unlock()
 
 		if !m.lockBackup(src.ID) {
-			m.releasePort(port)
+			m.releaseReservation(lease)
 			job.fail(fmt.Errorf("a snapshot operation is running for %s; try again when it finishes", src.Name))
 			return
 		}
@@ -182,7 +188,7 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		// cannot be delivered aborts the clone before any bytes are copied.
 		resume, err := m.quiesceForBackup(src)
 		if err != nil {
-			m.releasePort(port)
+			m.releaseReservation(lease)
 			job.fail(fmt.Errorf("could not quiesce %s for cloning: %v", src.Name, err))
 			return
 		}
@@ -191,7 +197,7 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		if err := copyTreeFiltered(srcDir, dst, job, cloneSkip); err != nil {
 			// A half-copied tree is a server that boots on a truncated world.
 			_ = os.RemoveAll(dst)
-			m.releasePort(port)
+			m.releaseReservation(lease)
 			job.fail(friendlyFSError(err, "the cloned server"))
 			return
 		}
@@ -208,7 +214,7 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		// configured server, because the panel and the game would disagree
 		// about its port from the first boot.
 		if err := m.writeProps(s); err != nil {
-			m.releasePort(port)
+			m.releaseReservation(lease)
 			job.fail(fmt.Errorf("copied the files but could not write the clone's server.properties: %v", err))
 			return
 		}
@@ -221,7 +227,9 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		m.mu.Lock()
 		m.servers[s.ID] = s
 		m.order = append(m.order, s.ID)
-		delete(m.reservedPorts, s.Port)
+		// The whole lease (span and extras included), dropped in the same
+		// critical section as the registration.
+		m.releaseReservationLocked(lease)
 		m.mu.Unlock()
 
 		// Registered, but not exposed until it survives persistence: a clone

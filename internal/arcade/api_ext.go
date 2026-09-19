@@ -2,6 +2,7 @@ package arcade
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -100,10 +101,15 @@ func (a *API) serverMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	win, points := windowOf(r)
+	// Snapshot under the lock: SetResources and restore write these fields,
+	// and reading them bare was a data race on every metrics request.
+	s.mu.Lock()
+	limitMB, limitCPU := s.MemoryMB, s.CPU
+	s.mu.Unlock()
 	writeJSON(w, 200, map[string]any{
 		"samples":   a.mgr.metrics.Series(s.ID, win, points),
-		"limit_mb":  s.MemoryMB,
-		"limit_cpu": s.CPU,
+		"limit_mb":  limitMB,
+		"limit_cpu": limitCPU,
 	})
 }
 
@@ -123,12 +129,12 @@ func (a *API) listFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Query().Get("path")
-	entries, err := a.mgr.ListFiles(s, path)
+	entries, truncated, err := a.mgr.ListFiles(s, path)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"path": path, "entries": entries})
+	writeJSON(w, 200, map[string]any{"path": path, "entries": entries, "truncated": truncated})
 }
 
 func (a *API) readFile(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +219,24 @@ func (a *API) download(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
-	_, _ = io.Copy(w, rc)
+	// Rolling write deadline, not none at all: the absolute deadline had to
+	// go because a large world over a slow link outruns it, but a client that
+	// stops reading still has to release this connection - each chunk gets a
+	// fresh budget, a stalled one ends the transfer.
+	rcw := http.NewResponseController(w)
+	buf := make([]byte, 256<<10)
+	for {
+		_ = rcw.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		n, rerr := rc.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
 }
 
 func (a *API) listBackups(w http.ResponseWriter, r *http.Request) {
@@ -268,12 +291,25 @@ func (a *API) createBackup(w http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		return
 	}
-	// Archiving or unpacking a multi-GB world outruns the server's WriteTimeout,
-	// and the client then sees EOF while the archive lands on disk anyway - the
-	// same "the panel lied about a backup" outcome M13 was filed to stop.
-	clearStreamDeadlines(w)
+	// The body is parsed BEFORE any deadline is lifted, so a dribbling or
+	// oversized request still meets the server's read deadline - the old
+	// order cleared deadlines first and then read whatever arrived, however
+	// slowly. An empty body is fine; a malformed one is not.
 	var body struct{ Note string }
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, 400, err)
+		return
+	}
+	if len(body.Note) > 4096 {
+		writeErr(w, 400, fmt.Errorf("the backup note is too long (limit 4096 characters)"))
+		return
+	}
+	// Archiving or unpacking a multi-GB world outruns the server's absolute
+	// WriteTimeout, and the client then sees EOF while the archive lands on
+	// disk anyway - the same "the panel lied about a backup" outcome M13 was
+	// filed to stop. Only the absolute deadline is lifted; the response write
+	// at the end still happens or fails on its own.
+	clearStreamDeadlines(w)
 
 	b, err := a.mgr.CreateBackup(s, body.Note, actorOf(r))
 	if err != nil {
@@ -348,12 +384,30 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, resp)
 }
 
-func setSessionCookie(w http.ResponseWriter, s *Session) {
+// loginWorkBounds caps how much CPU and audit storage one unauthenticated
+// caller can spend. Every login attempt costs ~100ms of PBKDF2 and a rewrite
+// of the audit file under the auth mutex; without bounds, a bot that found an
+// exposed panel could keep both pinned while legitimate requests queue.
+var loginWork = make(chan struct{}, 4)
+
+// authInputOK bounds credential field sizes. The request body cap is 8 MB,
+// which is right for file uploads and absurd for a name or password.
+func authInputOK(name, password string) bool {
+	return len(name) >= 1 && len(name) <= 128 &&
+		len(password) >= 1 && len(password) <= 1024
+}
+
+func setSessionCookie(w http.ResponseWriter, r *http.Request, s *Session) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "gss_session",
 		Value:    s.Token,
 		Path:     "/",
 		HttpOnly: true,
+		// Secure only when this request itself arrived over TLS. An
+		// X-Forwarded-Proto header is the proxy's claim, not the panel's
+		// knowledge, and honouring it blindly would flip the flag on for a
+		// plaintext request whenever someone asked it to.
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  s.Expires,
 	})
@@ -365,13 +419,33 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
+	if !authInputOK(body.Name, body.Password) {
+		// Same answer as bad credentials: a different one would enumerate
+		// which lengths the panel considers legal.
+		writeErr(w, 401, fmt.Errorf("invalid credentials"))
+		return
+	}
+	select {
+	case loginWork <- struct{}{}:
+		defer func() { <-loginWork }()
+	default:
+		w.Header().Set("Retry-After", "2")
+		writeErr(w, http.StatusTooManyRequests, fmt.Errorf("too many authentication attempts in flight; try again shortly"))
+		return
+	}
 	s, err := a.mgr.auth.Login(body.Name, body.Password)
 	if err != nil {
-		a.mgr.audit(body.Name, "auth.login_failed", "", "")
+		// The attempted name is caller-supplied and unbounded in principle;
+		// record a truncated claim, not an authenticated actor.
+		claimed := body.Name
+		if len(claimed) > 64 {
+			claimed = claimed[:64] + "..."
+		}
+		a.mgr.audit(claimed, "auth.login_failed", "", "")
 		writeErr(w, 401, err)
 		return
 	}
-	setSessionCookie(w, s)
+	setSessionCookie(w, r, s)
 	a.mgr.audit(s.User, "auth.login", "", s.Role)
 	writeJSON(w, 200, map[string]any{"user": map[string]any{"name": s.User, "role": s.Role}})
 }
@@ -380,7 +454,8 @@ func (a *API) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("gss_session"); err == nil {
 		a.mgr.auth.Logout(c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: "gss_session", Value: "", Path: "/", MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: "gss_session", Value: "", Path: "/", MaxAge: -1,
+		Secure: r.TLS != nil, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -428,7 +503,7 @@ func (a *API) setup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err)
 		return
 	}
-	setSessionCookie(w, s)
+	setSessionCookie(w, r, s)
 	a.mgr.audit(u.Name, "auth.setup", "", "first admin created")
 	writeJSON(w, 201, map[string]any{"user": map[string]any{"name": u.Name, "role": u.Role}})
 }
@@ -618,13 +693,28 @@ func (a *API) createTask(w http.ResponseWriter, r *http.Request) {
 	if s == nil {
 		return
 	}
-	var body Task
+	// A create-only request shape, not a decoded Task: decoding straight into
+	// the stored type let a client seed Runs/LastRun/LastErr bookkeeping and
+	// choose its own task ID.
+	var body struct {
+		Name     string `json:"name"`
+		Commands string `json:"commands"`
+		Time     string `json:"time"`
+		Repeat   bool   `json:"repeat"`
+		Enabled  *bool  `json:"enabled"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	body.ServerID = s.ID
-	t, err := a.mgr.sched.Add(&body)
+	enabled := true
+	if body.Enabled != nil {
+		enabled = *body.Enabled
+	}
+	t, err := a.mgr.sched.Add(&Task{
+		ServerID: s.ID, Name: body.Name, Commands: body.Commands,
+		Time: body.Time, Repeat: body.Repeat, Enabled: enabled,
+	})
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -648,7 +738,10 @@ func (a *API) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	t, err := a.mgr.sched.Update(r.PathValue("tid"), func(t *Task) {
+	// Both the URL's server ID and the task ID must match: the mutation used
+	// to ignore the server entirely, so a stale URL edited a different
+	// server's task - and audited the change against the wrong server.
+	t, err := a.mgr.sched.Update(r.PathValue("id"), r.PathValue("tid"), func(t *Task) {
 		if body.Name != nil {
 			t.Name = *body.Name
 		}
@@ -666,15 +759,15 @@ func (a *API) updateTask(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, 404, err)
 		return
 	}
-	a.mgr.audit(actorOf(r), "task.update", r.PathValue("id"), t.Name)
+	a.mgr.audit(actorOf(r), "task.update", t.ServerID, t.Name)
 	writeJSON(w, 200, t)
 }
 
 func (a *API) deleteTask(w http.ResponseWriter, r *http.Request) {
-	if err := a.mgr.sched.Delete(r.PathValue("tid")); err != nil {
+	if err := a.mgr.sched.Delete(r.PathValue("id"), r.PathValue("tid")); err != nil {
 		writeErr(w, 404, err)
 		return
 	}
@@ -683,7 +776,7 @@ func (a *API) deleteTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) runTask(w http.ResponseWriter, r *http.Request) {
-	if err := a.mgr.sched.Run(r.PathValue("tid"), actorOf(r)); err != nil {
+	if err := a.mgr.sched.Run(r.PathValue("id"), r.PathValue("tid"), actorOf(r)); err != nil {
 		writeErr(w, 400, err)
 		return
 	}

@@ -342,7 +342,7 @@ func TestConcurrentImportsCannotClaimOnePort(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if _, ok := mgr.claimPort(port, fmt.Sprintf("import-%d", i)); ok {
+			if _, _, ok := mgr.claimPort(port, fmt.Sprintf("import-%d", i)); ok {
 				mu.Lock()
 				granted++
 				mu.Unlock()
@@ -357,7 +357,7 @@ func TestConcurrentImportsCannotClaimOnePort(t *testing.T) {
 
 	// And releasing must hand it back, or a failed import blocks the port forever.
 	mgr.releasePort(port)
-	if _, ok := mgr.claimPort(port, "later"); !ok {
+	if _, _, ok := mgr.claimPort(port, "later"); !ok {
 		t.Error("a released port could not be claimed again")
 	}
 }

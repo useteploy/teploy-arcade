@@ -188,7 +188,17 @@ func writeAtomicIn(r *os.Root, name string, data []byte, perm os.FileMode) error
 	}
 	tmp := path.Join(dir, ".arcade-tmp-"+suffix)
 
-	f, err := r.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	// The file being replaced decides its own permission bits: a fixed 0644
+	// used to broaden a chmod-restricted file (and strip the executable bit
+	// off a script) as a side effect of editing it.
+	mode := perm
+	if old, err := r.Stat(name); err == nil {
+		mode = old.Mode().Perm()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	f, err := r.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 	if err != nil {
 		return err
 	}
@@ -216,23 +226,35 @@ func writeAtomicIn(r *os.Root, name string, data []byte, perm os.FileMode) error
 	// AccessDeniedException before the world loaded. Done through the Root so
 	// the confinement still holds; a chown by absolute path would step outside
 	// the sandbox this function exists to keep.
-	preserveOwnerIn(r, tmp, name)
+	if err := preserveOwnerInChecked(r, tmp, name); err != nil {
+		cleanup()
+		return err
+	}
 
 	if err := r.Rename(tmp, name); err != nil {
 		cleanup()
 		return err
 	}
-	return nil
+	// The directory entry has to be durable too, or a crash right after a
+	// "successful" write can leave the old file's name pointing at nothing.
+	parent, err := r.Open(path.Dir(name))
+	if err != nil {
+		return err
+	}
+	return errors.Join(parent.Sync(), parent.Close())
 }
 
 // Seam, so the handover is testable without being root.
 var rootChown = func(r *os.Root, name string, uid, gid int) error { return r.Chown(name, uid, gid) }
 
-// preserveOwnerIn is preserveOwner for a Root-confined write: the file being
-// replaced decides, and a file that does not exist yet inherits its directory.
-func preserveOwnerIn(r *os.Root, tmp, name string) {
+// preserveOwnerInChecked is preserveOwner for a Root-confined write: the file
+// being replaced decides, and a file that does not exist yet inherits its
+// directory. Unlike the old best-effort version it reports failure: a server
+// file left root-owned makes the game die on AccessDeniedException, which is
+// not an outcome to wave through.
+func preserveOwnerInChecked(r *os.Root, tmp, name string) error {
 	if geteuid() != 0 {
-		return
+		return nil
 	}
 	uid, gid, ok := rootOwner(r, name)
 	if !ok {
@@ -243,9 +265,9 @@ func preserveOwnerIn(r *os.Root, tmp, name string) {
 		uid, gid, ok = rootOwner(r, dir)
 	}
 	if !ok || (uid == 0 && gid == 0) {
-		return
+		return nil
 	}
-	_ = rootChown(r, tmp, uid, gid)
+	return rootChown(r, tmp, uid, gid)
 }
 
 func rootOwner(r *os.Root, name string) (int, int, bool) {
@@ -283,28 +305,82 @@ func isTextFile(name string, size int64) bool {
 	return textExt[strings.ToLower(filepath.Ext(name))]
 }
 
-func (m *Manager) ListFiles(s *Server, rel string) ([]FileEntry, error) {
+// openRegularIn opens one file through the root with O_NONBLOCK and refuses
+// anything that is not a regular file. The nonblocking open matters before the
+// type check, not after: opening a FIFO read-only BLOCKS until a writer
+// appears, and a server tree is writable by the game and its plugins, so a
+// planted FIFO used to hang a read or a download handler forever with its
+// deadlines cleared. On a regular file O_NONBLOCK is a no-op.
+func openRegularIn(r *os.Root, name string) (*os.File, os.FileInfo, error) {
+	f, err := r.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	if !st.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	return f, st, nil
+}
+
+// propsPortValue reads the server-port a properties text names. Every caller
+// used to scan for the FIRST occurrence while reloadProps kept the LAST, so a
+// file with two server-port lines was validated as one port and applied as
+// another. One function, last occurrence wins, everywhere.
+func propsPortValue(content string) (int, bool) {
+	port := 0
+	found := false
+	for _, ln := range strings.Split(content, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(ln, "="); ok && strings.TrimSpace(k) == "server-port" {
+			p, err := strconv.Atoi(strings.TrimSpace(v))
+			if err == nil {
+				port, found = p, true
+			}
+		}
+	}
+	return port, found
+}
+
+func (m *Manager) ListFiles(s *Server, rel string) ([]FileEntry, bool, error) {
+	if err := m.requireRegistered(s); err != nil {
+		return nil, false, err
+	}
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer r.Close()
 
 	d, err := r.Open(name)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer d.Close()
-	ents, err := d.ReadDir(-1)
-	if err != nil {
-		return nil, err
+	// One bounded page, not the whole directory: ReadDir(-1) materialised
+	// every entry before the 2000-item cap was applied, so a directory with a
+	// million entries was fully read into memory first. The second return
+	// value tells the caller the listing was cut short, rather than silently
+	// hiding everything past the cap.
+	ents, err := d.ReadDir(maxListItems + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	truncated := len(ents) > maxListItems
+	if truncated {
+		ents = ents[:maxListItems]
 	}
 
 	out := make([]FileEntry, 0, len(ents))
-	for i, e := range ents {
-		if i >= maxListItems {
-			break
-		}
+	for _, e := range ents {
 		info, err := e.Info()
 		if err != nil {
 			continue
@@ -324,36 +400,39 @@ func (m *Manager) ListFiles(s *Server, rel string) ([]FileEntry, error) {
 		}
 		return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
 	})
-	return out, nil
+	return out, truncated, nil
 }
 
 func (m *Manager) ReadFile(s *Server, rel string) (string, error) {
+	if err := m.requireRegistered(s); err != nil {
+		return "", err
+	}
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
 		return "", err
 	}
 	defer r.Close()
 
-	f, err := r.Open(name)
+	f, info, err := openRegularIn(r, name)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
-	// Type and size come from the open descriptor rather than a second stat of
-	// the path, which could by then describe a different file.
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("%s is a directory", rel)
-	}
 	if info.Size() > maxEditBytes {
 		return "", fmt.Errorf("%s is %d KB; files above %d KB are download-only",
 			rel, info.Size()/1024, maxEditBytes/1024)
 	}
-	b, err := io.ReadAll(f)
-	return string(b), err
+	// The limit is enforced on the bytes actually consumed, not on the size
+	// the descriptor reported: a file growing under the read used to blow past
+	// the cap because the check ran once, before an unbounded ReadAll.
+	b, err := io.ReadAll(io.LimitReader(f, maxEditBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(b) > maxEditBytes {
+		return "", fmt.Errorf("%s is above the %d KB editor limit", rel, maxEditBytes/1024)
+	}
+	return string(b), nil
 }
 
 func (m *Manager) WriteFile(s *Server, rel, content string) error {
@@ -362,7 +441,16 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 	// could open its archive window between the check and the rename.
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	// Serialized against every other cooperating configuration mutation: two
+	// shared-section writers used to interleave their publish/model-commit
+	// phases, and a failed write's rollback could land over a newer
+	// successful edit's bytes.
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
 
+	if err := m.requireRegistered(s); err != nil {
+		return err
+	}
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
 		return err
@@ -379,12 +467,11 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 			return friendlyFSError(err, rel)
 		}
 	}
-	// server.properties carries the panel's port identity. Order: snapshot
-	// the old bytes, write the new file, THEN commit the port. If the port
-	// commit loses a race for the port, the old file is restored so disk and
-	// model never disagree; the previous shape committed the port first and
-	// left the model moved when a disk failure dropped the write.
-	if path.Base(name) == "server.properties" {
+	// Only the ROOT server.properties is the panel's port identity - compared
+	// on the exact cleaned path, not the basename: editing
+	// plugins/example/server.properties used to run the port transaction and
+	// reloadProps on a nested file and change the panel's global model.
+	if name == "server.properties" {
 		if err := m.validatePropsPort(s, content); err != nil {
 			return err
 		}
@@ -408,30 +495,21 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 		s.mu.Lock()
 		current := s.Port
 		s.mu.Unlock()
-		for _, ln := range strings.Split(content, "\n") {
-			ln = strings.TrimSpace(ln)
-			if ln == "" || strings.HasPrefix(ln, "#") {
-				continue
+		if p, ok := propsPortValue(content); ok && p > 0 && p != current {
+			// WRITE FIRST, COMMIT SECOND: with this order a failed
+			// write never moves the model (no revert exists to
+			// fail), and a failed commit only has to restore the
+			// old bytes. The previous shape committed first and
+			// needed a model revert whose own failure was silently
+			// dropped, stranding disk and model on different ports.
+			if werr := writePropsFileGuard(r, name, content); werr != nil {
+				return friendlyFSError(werr, rel)
 			}
-			if k, v, ok := strings.Cut(ln, "="); ok && strings.TrimSpace(k) == "server-port" {
-				if p, cerr := strconv.Atoi(strings.TrimSpace(v)); cerr == nil && p > 0 && p != current {
-					// WRITE FIRST, COMMIT SECOND: with this order a failed
-					// write never moves the model (no revert exists to
-					// fail), and a failed commit only has to restore the
-					// old bytes. The previous shape committed first and
-					// needed a model revert whose own failure was silently
-					// dropped, stranding disk and model on different ports.
-					if werr := writePropsFileGuard(r, name, content); werr != nil {
-						return friendlyFSError(werr, rel)
-					}
-					if err := m.changeServerPort(s, p); err != nil {
-						restoreOld()
-						return err
-					}
-					return m.reloadProps(s, content)
-				}
-				break
+			if err := m.changeServerPort(s, p); err != nil {
+				restoreOld()
+				return err
 			}
+			return m.reloadProps(s, content)
 		}
 	}
 	if err := writeAtomicIn(r, name, []byte(content), 0o644); err != nil {
@@ -440,7 +518,7 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 
 	// server.properties is the panel's own model too - keep them in step rather
 	// than letting the file and the settings screen disagree.
-	if path.Base(name) == "server.properties" {
+	if name == "server.properties" {
 		return m.reloadProps(s, content)
 	}
 	return nil
@@ -460,6 +538,9 @@ func (m *Manager) StatRel(s *Server, rel string) (os.FileInfo, error) {
 func (m *Manager) DeletePath(s *Server, rel string) error {
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	if err := m.requireRegistered(s); err != nil {
+		return err
+	}
 
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
@@ -481,6 +562,9 @@ func (m *Manager) MkDir(s *Server, rel string) error {
 	// under the archiver's feet mid-walk.
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	if err := m.requireRegistered(s); err != nil {
+		return err
+	}
 
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
@@ -495,6 +579,9 @@ func (m *Manager) MkDir(s *Server, rel string) error {
 
 // OpenForDownload hands back a reader the HTTP layer streams out.
 func (m *Manager) OpenForDownload(s *Server, rel string) (io.ReadCloser, string, int64, error) {
+	if err := m.requireRegistered(s); err != nil {
+		return nil, "", 0, err
+	}
 	r, name, err := m.rooted(s, rel)
 	if err != nil {
 		return nil, "", 0, err
@@ -503,18 +590,12 @@ func (m *Manager) OpenForDownload(s *Server, rel string) (io.ReadCloser, string,
 	// is independent of it, so the handle does not have to outlive this call.
 	defer r.Close()
 
-	f, err := r.Open(name)
+	// Regular files only, opened nonblocking first: a FIFO planted in the
+	// tree used to hang the download handler forever - with its deadlines
+	// cleared for the transfer, so nothing would ever reclaim it.
+	f, info, err := openRegularIn(r, name)
 	if err != nil {
 		return nil, "", 0, err
-	}
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, "", 0, err
-	}
-	if info.IsDir() {
-		f.Close()
-		return nil, "", 0, fmt.Errorf("%s is a directory", rel)
 	}
 	return f, path.Base(name), info.Size(), nil
 }
@@ -563,56 +644,68 @@ func (m *Manager) writePropsHeld(s *Server) error {
 // new properties bytes (a restore's staged archive) call this first so a
 // conflict is refused BEFORE the tree is swapped, not after.
 func (m *Manager) validatePropsPort(s *Server, content string) error {
-	for _, ln := range strings.Split(content, "\n") {
-		ln = strings.TrimSpace(ln)
-		if ln == "" || strings.HasPrefix(ln, "#") {
-			continue
-		}
-		k, v, ok := strings.Cut(ln, "=")
-		if !ok || strings.TrimSpace(k) != "server-port" {
-			continue
-		}
-		p, err := strconv.Atoi(strings.TrimSpace(v))
-		if err != nil || p < 1 || p > 65535 {
-			return fmt.Errorf("server-port %q is out of range", v)
-		}
-		s.mu.Lock()
-		current := s.Port
-		s.mu.Unlock()
-		if p == current {
-			return nil
-		}
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		protos, span, extras := func() ([]string, int, []string) {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			return s.Protocols, s.PortSpan, s.ExtraPorts
-		}()
-		candidate, cerr := candidateBindings(p, protos, span, extras)
-		if cerr != nil {
-			return cerr
-		}
-		for _, id := range m.order {
-			other, ok := m.servers[id]
-			if !ok || other.ID == s.ID {
-				continue
-			}
-			if bindingConflict(serverBindingsLocked(other), candidate) {
-				other.mu.Lock()
-				name := other.Name
-				other.mu.Unlock()
-				return fmt.Errorf("port %d is already used by %q", p, name)
-			}
-		}
-		for _, b := range candidate {
-			if _, held := m.reservedPorts[b.port]; held {
-				return fmt.Errorf("port %d is reserved by an import or create in progress", b.port)
-			}
-		}
+	p, ok := propsPortValue(content)
+	if !ok {
 		return nil
 	}
+	if p < 1 || p > 65535 {
+		return fmt.Errorf("server-port %d is out of range", p)
+	}
+	s.mu.Lock()
+	current := s.Port
+	s.mu.Unlock()
+	if p == current {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	protos, span, extras := func() ([]string, int, []string) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.Protocols, s.PortSpan, s.ExtraPorts
+	}()
+	candidate, cerr := candidateBindings(p, protos, span, extras)
+	if cerr != nil {
+		return cerr
+	}
+	for _, id := range m.order {
+		other, ok := m.servers[id]
+		if !ok || other.ID == s.ID {
+			continue
+		}
+		if bindingConflict(serverBindings(other), candidate) {
+			other.mu.Lock()
+			name := other.Name
+			other.mu.Unlock()
+			return fmt.Errorf("port %d is already used by %q", p, name)
+		}
+	}
+	for _, b := range candidate {
+		if _, held := m.reservedPorts[b.port]; held {
+			return fmt.Errorf("port %d is reserved by an import or create in progress", b.port)
+		}
+	}
 	return nil
+}
+
+// parsePropsLines is the one parser every properties reader uses. Plain
+// key=value lines and #/! comments only: escaped separators and continuations
+// are legitimate Java-properties syntax this panel does not implement, and
+// guessing at them differently in different paths is how the file and the
+// model came to disagree. Last occurrence of a repeated key wins, matching
+// what the game itself does.
+func parsePropsLines(content string) map[string]string {
+	parsed := map[string]string{}
+	for _, ln := range strings.Split(content, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "#") || strings.HasPrefix(ln, "!") {
+			continue
+		}
+		if k, v, ok := strings.Cut(ln, "="); ok {
+			parsed[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return parsed
 }
 
 // reloadProps parses an edited server.properties back into the panel's model so
@@ -620,16 +713,7 @@ func (m *Manager) validatePropsPort(s *Server, content string) error {
 // failure: the file HAS landed at that point, and the caller must be able to
 // tell the operator the panel could not record it.
 func (m *Manager) reloadProps(s *Server, content string) error {
-	parsed := map[string]string{}
-	for _, ln := range strings.Split(content, "\n") {
-		ln = strings.TrimSpace(ln)
-		if ln == "" || strings.HasPrefix(ln, "#") {
-			continue
-		}
-		if k, v, ok := strings.Cut(ln, "="); ok {
-			parsed[strings.TrimSpace(k)] = strings.TrimSpace(v)
-		}
-	}
+	parsed := parsePropsLines(content)
 
 	// Every port adoption goes through the manager-level transaction: the
 	// old shape assigned s.Port directly here, letting an edited or restored
@@ -639,7 +723,7 @@ func (m *Manager) reloadProps(s *Server, content string) error {
 		s.mu.Lock()
 		current := s.Port
 		s.mu.Unlock()
-		p, convErr := strconv.Atoi(raw)
+		p, convErr := strconv.Atoi(strings.TrimSpace(raw))
 		var err error
 		if convErr != nil || p < 1 || p > 65535 {
 			err = fmt.Errorf("server-port %q is out of range", raw)
@@ -651,18 +735,19 @@ func (m *Manager) reloadProps(s *Server, content string) error {
 			// Port must not disagree with each other.
 			log.Printf("%s: refusing the edited server-port from server.properties: %v", s.ID, err)
 			s.mu.Lock()
-			s.Props["server-port"] = itoa(s.Port)
+			port := s.Port
 			s.mu.Unlock()
 			delete(parsed, "server-port")
+			parsed["server-port"] = itoa(port)
 		}
 	}
 
 	s.mu.Lock()
-	for k, v := range parsed {
-		if _, known := s.Props[k]; known {
-			s.Props[k] = v
-		}
-	}
+	// The file replaces the model wholesale. The old shape updated only keys
+	// the model already knew, so a key deleted from the file survived in the
+	// panel (and the next settings save wrote it back), and a key added to
+	// the file never appeared on screen.
+	s.Props = parsed
 	if mp := atoi(parsed["max-players"]); mp > 0 {
 		s.MaxPlayers = mp
 	}
