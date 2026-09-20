@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"time"
@@ -76,9 +77,17 @@ func Run(cfg Config) error {
 		// 0.0.0.0. Refusing the combination is the only honest reading of
 		// "no authentication" on a network interface: on this panel it means
 		// anyone reachable can create containers as root on the host.
-		if !isLoopbackHost(cfg.Host) {
-			return fmt.Errorf("--no-auth refuses to start on %s: it is a development switch and this address is reachable from the network; bind a loopback host instead", cfg.Host)
+		//
+		// R01 (audit pass 7): the old predicate accepted the EMPTY host as
+		// loopback, but net.JoinHostPort("", port) is a wildcard listener -
+		// every interface, not loopback. "localhost" was trusted to resolve
+		// to loopback as well. Only a literal loopback address passes now,
+		// normalised, before any worker starts.
+		host, err := canonicalNoAuthHost(cfg.Host)
+		if err != nil {
+			return err
 		}
+		cfg.Host = host
 		mgr.auth.Disable()
 	} else if err := mgr.auth.BeginSetup(); err != nil {
 		return err
@@ -114,16 +123,19 @@ func Run(cfg Config) error {
 	return srv.ListenAndServe()
 }
 
-// isLoopbackHost reports whether the bind address can only be reached from
-// this machine. Everything else - the container-default 0.0.0.0 included -
-// counts as network-reachable.
-func isLoopbackHost(host string) bool {
-	switch host {
-	case "", "localhost", "127.0.0.1", "::1":
-		return true
+// canonicalNoAuthHost is the address --no-auth may bind: a literal loopback
+// address, nothing else. The empty string is a wildcard listener and
+// "localhost" is a name whose resolution is not the panel's to trust, so both
+// are normalised or refused rather than passed through to net.Listen.
+func canonicalNoAuthHost(host string) (string, error) {
+	if host == "localhost" {
+		host = "127.0.0.1"
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	ip, err := netip.ParseAddr(host)
+	if err != nil || !ip.Unmap().IsLoopback() {
+		return "", fmt.Errorf("--no-auth refuses to start on %q: it is a development switch and only a literal loopback address (127.0.0.1, ::1, 127.x.x.x) may carry it; the empty host is a wildcard bind, not loopback", host)
+	}
+	return ip.Unmap().String(), nil
 }
 
 // newHTTPServer applies the connection timeouts. With only ReadHeaderTimeout

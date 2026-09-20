@@ -3,6 +3,7 @@ package arcade
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,19 +49,49 @@ func toolText(t *testing.T, resp map[string]any) (string, bool) {
 	return text, isErr
 }
 
+// rpcRaw performs one POST and returns status and body, for the cases where
+// the HTTP status itself is the assertion (authentication is answered at the
+// HTTP boundary with a 401 challenge, not inside a JSON-RPC body).
+func rpcRaw(t *testing.T, srv *httptest.Server, token, method string, params any) (int, string) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+	})
+	req, _ := http.NewRequest("POST", srv.URL+"/api/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("rpc: %v", err)
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	return res.StatusCode, string(b)
+}
+
 // An unauthenticated caller must get nothing. This is the whole point of the
 // separate token: the MCP endpoint is reachable without a panel session.
+// R09 (audit pass 7): the refusal is an HTTP 401 with a Bearer challenge -
+// a client can tell "bad credentials" from "bad request" without parsing a
+// JSON-RPC error that was never a JSON-RPC conversation.
 func TestMCPRequiresBearerToken(t *testing.T) {
 	srv, _ := newTestAgent(t)
 	defer srv.Close()
 
-	resp := rpc(t, srv, "", "tools/list", nil)
-	if resp["error"] == nil {
-		t.Fatal("tools/list succeeded with no token")
+	code, _ := rpcRaw(t, srv, "", "tools/list", nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("tools/list with no token answered %d, want 401", code)
 	}
-	resp = rpc(t, srv, "tpa_not_a_real_token", "tools/list", nil)
-	if resp["error"] == nil {
-		t.Fatal("tools/list succeeded with a bogus token")
+	code, _ = rpcRaw(t, srv, "tpa_not_a_real_token", "tools/list", nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("tools/list with a bogus token answered %d, want 401", code)
+	}
+	// A malformed scheme is a 401 too, not a token lookup.
+	code, _ = rpcRaw(t, srv, "Basic dXNlcjpwYXNz", "tools/list", nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("tools/list with a non-Bearer scheme answered %d, want 401", code)
 	}
 }
 
@@ -170,7 +201,8 @@ func TestMCPTokenRevoke(t *testing.T) {
 	if err := mgr.mcp.Revoke("temp"); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	if resp := rpc(t, srv, tok, "ping", nil); resp["error"] == nil {
-		t.Fatal("a revoked token still works")
+	// R09: revocation is answered at the HTTP boundary.
+	if code, _ := rpcRaw(t, srv, tok, "ping", nil); code != http.StatusUnauthorized {
+		t.Fatalf("a revoked token still works (status %d, want 401)", code)
 	}
 }

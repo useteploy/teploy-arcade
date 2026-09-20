@@ -349,9 +349,13 @@ async function viewScheduler(id) {
         const task = d.tasks.find((x) => x.id === tid);
         row.querySelector('[data-toggle]').addEventListener('click', async () => {
           try {
+            // R57 (audit pass 7): only the field being changed is sent. The
+            // old body spread the whole (possibly stale) task object, so a
+            // toggle could silently overwrite a concurrent edit to its name,
+            // time or commands.
             await api(`/api/servers/${id}/tasks/${tid}`, {
               method: 'PATCH',
-              body: JSON.stringify({ ...task, enabled: !task.enabled }),
+              body: JSON.stringify({ enabled: !task.enabled }),
             });
             load();
           } catch (e) { toast(e.message, 'err'); }
@@ -444,8 +448,12 @@ function taskDialog(serverId, task, onSaved) {
       commands: $('#tCmd', modal).value.trim(),
       time: $('#tTime', modal).value.trim(),
       repeat: rep.classList.contains('is-on'),
-      enabled: true,
     };
+    // R57 (audit pass 7): `enabled: true` is sent on CREATE only. The dialog
+    // always sending it meant renaming a disabled task silently re-enabled
+    // it - the schedule came back on without anyone switching it on. An edit
+    // leaves the enabled state exactly as it was.
+    if (!editing) body.enabled = true;
     try {
       if (editing) {
         await api(`/api/servers/${serverId}/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify(body) });

@@ -143,7 +143,7 @@ func (m *Manager) listPluginDir(s *Server, dir string) ([]PluginEntry, error) {
 	}
 	defer r.Close()
 
-	d, err := r.Open(name)
+	d, err := openDirIn(r, name)
 	if os.IsNotExist(err) {
 		// mods/ is only created by the first install. An empty screen is the
 		// right answer; an error here is one the operator cannot act on.
@@ -316,16 +316,36 @@ func checkDownloadScheme(u *url.URL) error {
 	return fmt.Errorf("only http and https downloads are allowed, not %q", u.Scheme)
 }
 
+// ExpectedSHA256 parses an operator-supplied digest. R64 (audit pass 7): an
+// empty value is genuinely optional, but a MALFORMED one is an error, not a
+// silent skip - the old guard only compared when hex-decoding happened to
+// succeed, so a typo'd checksum disabled verification while the operator
+// believed it was enforced.
+func ExpectedSHA256(text string) ([]byte, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, nil
+	}
+	if len(text) != 2*sha256.Size {
+		return nil, fmt.Errorf("sha256 must contain exactly 64 hexadecimal characters")
+	}
+	b, err := hex.DecodeString(text)
+	if err != nil {
+		return nil, fmt.Errorf("invalid sha256: %w", err)
+	}
+	return b, nil
+}
+
 // validateJar verifies the download is an intact zip archive, not four magic
 // bytes: a truncated or corrupt jar used to pass on the local-header prefix
 // alone and fail inside the game's classloader at next start. Entry CRCs are
 // checked by reading every entry, under a decompression budget so a zip bomb
 // cannot turn validation into the thing it was guarding against. An expected
 // SHA-256, when supplied, is verified in constant time.
-func validateJar(data []byte, expectedSHA256 string) error {
-	if expected, err := hex.DecodeString(strings.TrimSpace(expectedSHA256)); err == nil && len(expected) == sha256.Size {
+func validateJar(data []byte, expectedSHA256 []byte) error {
+	if expectedSHA256 != nil {
 		actual := sha256.Sum256(data)
-		if subtle.ConstantTimeCompare(expected, actual[:]) != 1 {
+		if subtle.ConstantTimeCompare(expectedSHA256, actual[:]) != 1 {
 			return fmt.Errorf("the download's SHA-256 does not match the expected digest")
 		}
 	}
@@ -379,6 +399,14 @@ func validateJar(data []byte, expectedSHA256 string) error {
 // unobserved after the fact.
 func (m *Manager) InstallPlugin(ctx context.Context, s *Server, rawURL, expectedSHA256 string) (PluginEntry, error) {
 	dir, _, err := pluginDirFor(s)
+	if err != nil {
+		return PluginEntry{}, err
+	}
+	// R64: the digest is parsed BEFORE anything is fetched, so a malformed
+	// checksum can never turn into "no checksum" halfway through - the
+	// operator learns their input was invalid, not that verification was
+	// silently skipped.
+	expected, err := ExpectedSHA256(expectedSHA256)
 	if err != nil {
 		return PluginEntry{}, err
 	}
@@ -452,7 +480,7 @@ func (m *Manager) InstallPlugin(ctx context.Context, s *Server, rawURL, expected
 	// land as a plausible .jar, and the game then fails to boot with a stack
 	// trace that points at the plugin rather than at the download. Four magic
 	// bytes proved nothing; the whole archive is validated.
-	if err := validateJar(body, expectedSHA256); err != nil {
+	if err := validateJar(body, expected); err != nil {
 		return PluginEntry{}, fmt.Errorf("%s did not return a valid jar file: %w", u.Redacted(), err)
 	}
 

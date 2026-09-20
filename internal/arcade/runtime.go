@@ -95,6 +95,7 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 // Seams, so the ownership logic is testable without being root.
 var (
 	chownFile = os.Chown
+	chownLink = os.Lchown
 	geteuid   = os.Geteuid
 )
 
@@ -137,6 +138,12 @@ const (
 // For the paths that write a whole tree at once - creating a server, cloning
 // one, a copy import, a backup restore - where root ownership is not one file
 // the game cannot write but all of them.
+//
+// R13 (audit pass 7): ownership is set with Lchown, never Chown. The walk
+// does not follow symlinks, but the entries themselves can BE symlinks a game
+// or plugin planted, and Chown on a symlink path follows it - a root-run
+// panel handing uid:gid to a target anywhere on the host the link names.
+// Lchown touches the link's own inode and nothing else.
 func chownTree(root string, uid, gid int) {
 	if geteuid() != 0 || (uid == 0 && gid == 0) {
 		return
@@ -145,7 +152,7 @@ func chownTree(root string, uid, gid int) {
 		if err != nil {
 			return nil // one unreadable entry is not a reason to abandon the rest
 		}
-		_ = chownFile(p, uid, gid)
+		_ = chownLink(p, uid, gid)
 		return nil
 	})
 }
@@ -185,12 +192,19 @@ func sweepTempFiles(root string) {
 	// Only the panel's reserved prefix: a name merely containing ".tmp" is
 	// not evidence of panel ownership - game data (cache.tmp, world.tmp.dat)
 	// was being deleted on every boot.
+	//
+	// R22 (audit pass 7): the generic ".tar.gz.part" suffix rule is gone.
+	// tarGz assembles under ".arcade-tmp-backup-*" since pass 4, so nothing
+	// the panel writes carries that suffix anymore - but a user export or a
+	// partial download legitimately can, and a suffix is not ownership. Any
+	// pre-pass-4 leftovers are old enough that an operator deleting them by
+	// hand is cheaper than the panel deleting something it did not create.
 	var removed int
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		if strings.HasPrefix(d.Name(), ".arcade-tmp-") || strings.HasSuffix(d.Name(), ".tar.gz.part") {
+		if strings.HasPrefix(d.Name(), ".arcade-tmp-") {
 			if os.Remove(p) == nil {
 				removed++
 			}
@@ -241,12 +255,17 @@ var (
 
 // hostPathFor maps a path inside this process onto the equivalent host path,
 // so sibling containers bind-mount the right directory.
+//
+// R31 (audit pass 7): segment-aware. A raw prefix test mapped "/data-other"
+// onto the host's "/host-data-other", silently pointing a bind mount at a
+// different tree than the one the panel reads.
 func hostPathFor(p string) string {
 	if dataHostPath == "" || dataDirPath == "" || dataHostPath == dataDirPath {
 		return p
 	}
-	if strings.HasPrefix(p, dataDirPath) {
-		return dataHostPath + strings.TrimPrefix(p, dataDirPath)
+	if relativeWithin(dataDirPath, p) {
+		rel, _ := filepath.Rel(dataDirPath, p)
+		return filepath.Join(dataHostPath, rel)
 	}
 	return p
 }

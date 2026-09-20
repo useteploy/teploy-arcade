@@ -54,13 +54,17 @@ jobs:
         id: meta
         with:
           images: ghcr.io/useteploy/teploy-arcade
+          # R69 (audit pass 7): `latest` moves only on stable releases. The
+          # old raw rule `enable=!is_prerelease` passed a literal the action's
+          # parser rejects (it requires exactly true/false after expression
+          # expansion), which threw before ANY tag was produced - stable
+          # included. flavor latest=auto is the action's own semver-driven
+          # policy: semver tags get latest, prereleases do not.
+          flavor: |
+            latest=auto
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            # `latest` only for stable releases: a v1.2.3-rc1 used to move the
-            # tag every operator's pull command resolves to. is_prerelease is
-            # derived from the semver tag itself.
-            type=raw,value=latest,enable=!is_prerelease
       - uses: docker/build-push-action@v6
         with:
           context: .

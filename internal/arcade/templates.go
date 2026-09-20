@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -168,6 +169,28 @@ func LoadTemplates(dataDir string) error {
 		loaded = append(loaded, t)
 	}
 
+	// R51 (audit pass 7): catalog identity is validated as a whole before it
+	// is published. Two files declaring one slug made templateBySlug depend
+	// on directory ordering rather than identity, and a protocol or span a
+	// template could not actually launch with reached Docker as a start-time
+	// failure naming nothing actionable. Invalid custom additions are
+	// reported; they do not take the working catalog down.
+	seenSlugs := map[string]bool{}
+	deduped := loaded[:0]
+	for _, t := range loaded {
+		if seenSlugs[t.Slug] {
+			bad = append(bad, fmt.Sprintf("%s.json: duplicate template slug %q; keeping the first one", t.Slug, t.Slug))
+			continue
+		}
+		seenSlugs[t.Slug] = true
+		if err := validateTemplateGeometry(&t); err != nil {
+			bad = append(bad, fmt.Sprintf("%s.json: %v", t.Slug, err))
+			continue
+		}
+		deduped = append(deduped, t)
+	}
+	loaded = deduped
+
 	if len(loaded) == 0 {
 		return fmt.Errorf("no usable templates in %s (%s)", dir, strings.Join(bad, "; "))
 	}
@@ -239,6 +262,30 @@ func validateTemplate(t *Template) error {
 	}
 	if t.PortHint <= 0 {
 		t.PortHint = 25565
+	}
+	return validateTemplateGeometry(t)
+}
+
+// validateTemplateGeometry checks the launch contract validateTemplate's
+// field-by-field rules cannot see: the declared protocols must be ones
+// publishArgs knows how to publish, and the span must stay inside the bound
+// publishArgs enforces - otherwise the ledger reserves a set of ports the
+// container will never actually carry (R51, audit pass 7).
+func validateTemplateGeometry(t *Template) error {
+	for _, p := range t.Protocols {
+		if p != "tcp" && p != "udp" {
+			return fmt.Errorf("protocol %q is not supported (tcp or udp)", p)
+		}
+	}
+	span := t.PortSpan
+	if span < 1 {
+		span = 1
+	}
+	if span > 16 {
+		return fmt.Errorf("port_span %d exceeds the 16-port publishing bound", t.PortSpan)
+	}
+	if t.DataPath != "" && !path.IsAbs(t.DataPath) {
+		return fmt.Errorf("data_path %q must be an absolute container path", t.DataPath)
 	}
 	return nil
 }

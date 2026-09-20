@@ -81,6 +81,14 @@ async function viewImport() {
   const renderScan = () => {
     const s = scan;
 
+    // R61 (audit pass 7): a NEW scan is a NEW intent. The controls below are
+    // rebuilt showing their defaults (Simulator on, copy unclaimed), and the
+    // submitted values reset to match - a rescan used to leave `runtime`
+    // holding a previous scan's Docker pick while the screen showed
+    // Simulator, and the import then ran under the runtime nobody chose.
+    runtime = 'sim';
+    mode = 'copy';
+
     if (!s.is_server) {
       out.innerHTML = `<div class="panelbox">
         <h3>Not a server directory</h3>
@@ -212,8 +220,16 @@ async function viewImport() {
     };
     out.querySelectorAll('#impModes .tpl').forEach((el) =>
       el.addEventListener('click', () => setMode(el.dataset.mode)));
-    // A copy that will not fit is not a default worth offering.
-    setMode(s.enough_space ? 'copy' : 'adopt');
+    // R61 (audit pass 7): copy stays selected even when the disk cannot hold
+    // it. Auto-switching to adopt turned a capacity problem into an in-place
+    // management decision - the panel writing into a directory it was only
+    // looking at - that the operator never chose. Adoption is an explicit
+    // click; a copy that will not fit is refused at the button with the
+    // reason.
+    setMode('copy');
+    if (!s.enough_space) {
+      $('#modeNote', out).innerHTML = `<span style="color:var(--amber)">A copy needs ${esc(s.size_human)} and the panel's disk cannot hold it. Free space, or explicitly choose adoption - the panel will not pick it for you.</span>`;
+    }
 
     out.querySelectorAll('#impRuntime button').forEach((b) =>
       b.addEventListener('click', () => {
@@ -227,6 +243,19 @@ async function viewImport() {
   const start = async () => {
     const template = $('#impTemplate', out).value;
     if (!template) { toast('Choose which server software this is.', 'warn'); return; }
+    // R61: the mismatch between the displayed mode and the submitted one is
+    // refused rather than resolved silently - a rescan used to leave `mode`
+    // holding the previous scan's choice while the controls showed the
+    // default.
+    const picked = out.querySelector('#impModes .tpl.is-picked');
+    if (picked && picked.dataset.mode !== mode) {
+      mode = picked.dataset.mode;
+    }
+    if (mode === 'copy' && scan && !scan.enough_space) {
+      toast('Not enough space to copy. Free space or explicitly choose adoption.', 'err');
+      return;
+    }
+    if (mode === 'adopt' && scan && !confirm(`Manage ${scan.path} in place? Stop its other manager first.`)) return;
 
     const btn = $('#impGo', out);
     btn.disabled = true;

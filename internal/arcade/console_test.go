@@ -289,13 +289,20 @@ func TestSettingsRestartFlagAndPortConflict(t *testing.T) {
 		t.Fatalf("requires_restart = %v, want one entry", need)
 	}
 
-	// immediate settings must not claim a restart is needed
+	// R24 (audit pass 7): "Spawn monsters" from the first edit is still
+	// waiting on a restart - the server never restarted - so the pending list
+	// must still carry it. The old code replaced the list with each edit's
+	// own keys, silently clearing a real warning.
+	//
+	// R26 (audit pass 7): pvp is next_restart now too (nothing in the panel
+	// applies it live), so this edit legitimately adds its own key to the
+	// still-pending list rather than reporting nothing.
 	need, err = mgr.ApplySettings(s, map[string]string{"pvp": "false"})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if len(need) != 0 {
-		t.Errorf("pvp is immediate but reported %v", need)
+	if len(need) != 2 || need[0] != "PVP" || need[1] != "Spawn monsters" {
+		t.Errorf("second edit should report its own key plus the still-pending one, got %v", need)
 	}
 
 	if _, err := mgr.ApplySettings(s, map[string]string{"server-port": itoa(other.Port)}); err == nil {

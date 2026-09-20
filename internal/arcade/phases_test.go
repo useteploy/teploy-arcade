@@ -478,10 +478,18 @@ func TestSchedulerClockParsingAndNextRun(t *testing.T) {
 	if n := later.NextRun(now); n.Day() != 12 || n.Hour() != 23 {
 		t.Errorf("later-today next run = %v", n)
 	}
-	// a one-shot whose moment has passed has no next run
+	// R55 (audit pass 7): a PENDING one-shot whose moment passed today has
+	// its next occurrence TOMORROW, because that is what the loop will fire
+	// (the due window has closed for today). The old preview said "never"
+	// for a task the loop was still going to run.
 	once := &Task{Time: "04:00:00", Repeat: false, Enabled: true}
-	if n := once.NextRun(now); !n.IsZero() {
-		t.Errorf("expired one-shot should have no next run, got %v", n)
+	if n := once.NextRun(now); n.Day() != 13 || n.Hour() != 4 {
+		t.Errorf("pending one-shot next run = %v, want tomorrow 04:00 (what the loop fires)", n)
+	}
+	// a one-shot that has RUN is disabled and has no next run
+	done := &Task{Time: "04:00:00", Repeat: false, Enabled: false, LastRun: now.Add(-6 * time.Hour).Unix()}
+	if n := done.NextRun(now); !n.IsZero() {
+		t.Errorf("completed one-shot should have no next run, got %v", n)
 	}
 }
 

@@ -328,26 +328,82 @@ func openRegularIn(r *os.Root, name string) (*os.File, os.FileInfo, error) {
 	return f, st, nil
 }
 
-// propsPortValue reads the server-port a properties text names. Every caller
-// used to scan for the FIRST occurrence while reloadProps kept the LAST, so a
-// file with two server-port lines was validated as one port and applied as
-// another. One function, last occurrence wins, everywhere.
-func propsPortValue(content string) (int, bool) {
-	port := 0
-	found := false
+// propsPortValue reads the server-port a properties text names, under the
+// restricted safety mode R25 (audit pass 7) defines for the managed identity:
+//
+//   - the FINAL occurrence of server-port must be a valid port number. The
+//     old reader skipped non-numeric occurrences and kept the previous valid
+//     one, so a file whose last line said `server-port=bad` validated as the
+//     earlier port while Java Properties - and therefore the game - read
+//     "bad" and failed to boot with the panel claiming a port it liked.
+//   - duplicate server-port keys are refused. A duplicate is last-wins in
+//     the game and "first valid" here, which is exactly the disagreement
+//     this function exists to prevent.
+//   - a colon-separated `server-port:...` spelling is refused rather than
+//     read as "no port here": Java accepts it, this panel does not parse it,
+//     and the two disagreeing is worse than refusing the edit.
+//
+// The rest of the file (comments, other keys, spacing) is not this function's
+// business; only the managed identity is restricted.
+func propsPortValue(content string) (int, bool, error) {
+	seen := 0
+	var last string
 	for _, ln := range strings.Split(content, "\n") {
 		ln = strings.TrimSpace(ln)
-		if ln == "" || strings.HasPrefix(ln, "#") {
+		if ln == "" || strings.HasPrefix(ln, "#") || strings.HasPrefix(ln, "!") {
 			continue
 		}
-		if k, v, ok := strings.Cut(ln, "="); ok && strings.TrimSpace(k) == "server-port" {
-			p, err := strconv.Atoi(strings.TrimSpace(v))
-			if err == nil {
-				port, found = p, true
+		k, v, ok := strings.Cut(ln, "=")
+		if !ok {
+			// The managed key in a separator this parser does not implement
+			// is an ambiguity, not an absence.
+			head, _, colon := strings.Cut(ln, ":")
+			if colon && strings.TrimSpace(head) == "server-port" {
+				return 0, false, fmt.Errorf("server-port uses ':' as a separator, which the panel does not support; write it as server-port=<port>")
 			}
+			continue
 		}
+		if strings.TrimSpace(k) != "server-port" {
+			continue
+		}
+		seen++
+		last = strings.TrimSpace(v)
 	}
-	return port, found
+	if seen == 0 {
+		return 0, false, nil
+	}
+	if seen > 1 {
+		return 0, false, fmt.Errorf("server-port appears %d times; the panel cannot tell which one the game will read", seen)
+	}
+	p, err := strconv.Atoi(last)
+	if err != nil || p < 1 || p > 65535 {
+		return 0, false, fmt.Errorf("server-port %q is not a valid port", last)
+	}
+	return p, true, nil
+}
+
+// openDirIn opens one directory through the root with O_DIRECTORY and
+// O_NONBLOCK. R15 (audit pass 7): a plain read-only open of a FIFO blocks
+// until a writer appears - BEFORE any directory check can run, because the
+// type is only knowable from the opened descriptor. A game tree is writable
+// by the game and its plugins, so a planted FIFO named like a directory could
+// hang the file-list route (and the archiver's walk) indefinitely. On a real
+// directory both flags are no-ops.
+func openDirIn(r *os.Root, name string) (*os.File, error) {
+	f, err := r.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !st.IsDir() {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s is not a directory", name)
+	}
+	return f, nil
 }
 
 func (m *Manager) ListFiles(s *Server, rel string) ([]FileEntry, bool, error) {
@@ -360,7 +416,7 @@ func (m *Manager) ListFiles(s *Server, rel string) ([]FileEntry, bool, error) {
 	}
 	defer r.Close()
 
-	d, err := r.Open(name)
+	d, err := openDirIn(r, name)
 	if err != nil {
 		return nil, false, err
 	}
@@ -495,7 +551,11 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 		s.mu.Lock()
 		current := s.Port
 		s.mu.Unlock()
-		if p, ok := propsPortValue(content); ok && p > 0 && p != current {
+		p, ok, perr := propsPortValue(content)
+		if perr != nil {
+			return perr
+		}
+		if ok && p > 0 && p != current {
 			// WRITE FIRST, COMMIT SECOND: with this order a failed
 			// write never moves the model (no revert exists to
 			// fail), and a failed commit only has to restore the
@@ -644,7 +704,10 @@ func (m *Manager) writePropsHeld(s *Server) error {
 // new properties bytes (a restore's staged archive) call this first so a
 // conflict is refused BEFORE the tree is swapped, not after.
 func (m *Manager) validatePropsPort(s *Server, content string) error {
-	p, ok := propsPortValue(content)
+	p, ok, perr := propsPortValue(content)
+	if perr != nil {
+		return perr
+	}
 	if !ok {
 		return nil
 	}

@@ -440,16 +440,41 @@ var mcLevel = regexp.MustCompile(`^\[?\d{2}:\d{2}:\d{2}\]?\s*\[[^\]]*/(INFO|WARN
 //
 // Reserve the larger of 512 MB or 25%, which is the rule of thumb the itzg
 // image's own docs use.
+//
+// R46 (audit pass 7): the old floor clamped the heap back UP to 512 for a
+// 512 MB container - a heap equal to the whole limit, the exact shape this
+// function exists to prevent. Admission now refuses Java servers below
+// minJavaServerMemMB (see checkJavaMemory), and this calculator never clamps
+// upward: a small legacy limit gets the largest honest heap, not a poisoned
+// one.
 func jvmHeapMB(limitMB int) int {
 	reserve := limitMB / 4
 	if reserve < 512 {
 		reserve = 512
 	}
 	heap := limitMB - reserve
-	if heap < 512 {
-		heap = 512 // below this Minecraft will not start at all
+	if heap < 256 {
+		heap = 256 // below this Minecraft will not start at all
 	}
 	return heap
+}
+
+// checkJavaMemory refuses a container too small for the JVM the itzg images
+// launch. A 512 MB container passed the generic bound, but jvmHeapMB's native
+// reserve means every byte of it would be heap - no metaspace, no thread
+// stacks, nothing - and the kernel kills the server mid-chunk-generation
+// with nothing in the log pointing at the number someone typed. Non-Java
+// images keep the generic floor; a native game binary does not need a JVM
+// reserve (R46, audit pass 7).
+func checkJavaMemory(image string, memMB int) error {
+	if memMB <= 0 || !usesItzgConventions(image) {
+		return nil
+	}
+	if memMB < minJavaServerMemMB {
+		return fmt.Errorf("Java servers need at least %d MB so the heap leaves room for the JVM itself; %d MB would hand the whole container to the heap",
+			minJavaServerMemMB, memMB)
+	}
+	return nil
 }
 
 // classify assigns a level in the agent, not the browser: every game formats
@@ -845,6 +870,13 @@ func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 	if !usesItzgConventions(s.Image) {
 		env, cmd := templateLaunchArgs(s)
 		args = append(args, env...)
+		// R47 (audit pass 7): the didstopia Rust image ships a KNOWN default
+		// RCON password ("docker", per its own Dockerfile). A fresh random
+		// secret is injected on every launch - after the template's own env,
+		// so a value in a template file cannot override it back.
+		if s.Game == "rust" {
+			args = append(args, "-e", "RUST_RCON_PASSWORD="+rconSecret)
+		}
 		args = append(args,
 			"--memory", fmt.Sprintf("%dm", s.MemoryMB),
 			"--cpus", fmt.Sprintf("%.2f", s.CPU),
@@ -935,8 +967,15 @@ func (r *dockerRunner) Start(s *Server, emit func(Line)) error {
 	// Only clear a *dead* leftover. Force-removing a running container here
 	// would kill a live server with no graceful save - the panel calls this
 	// "Start", so the operator would have no idea they just did that.
-	if containerRunning(s.ID) {
+	// R35: an UNKNOWN state is refused the same way - a daemon hiccup used to
+	// read as "not running" and authorise `docker rm -f` against a container
+	// that was merely unobservable. Only a confirmed missing/stopped
+	// leftover may be cleared.
+	switch containerState(s.ID) {
+	case ContainerRunning:
 		return fmt.Errorf("a container for this server is already running; the panel will re-attach to it")
+	case ContainerUnknown:
+		return fmt.Errorf("docker could not be asked whether this server's container exists; refusing to clear it blind - try again when the daemon answers")
 	}
 	_ = exec.Command("docker", "rm", "-f", name).Run()
 
@@ -983,12 +1022,46 @@ func (r *dockerRunner) Start(s *Server, emit func(Line)) error {
 	return r.attach(s, emit, false)
 }
 
-// containerRunning reports whether this server's container is alive right now,
-// regardless of what the panel's persisted state claims.
-var containerRunning = func(id string) bool {
-	out, err := exec.Command("docker", "inspect", "-f", "{{.State.Running}}",
+// ContainerState is the honest answer to "where is this server's container".
+// R35 (audit pass 7): a failed `docker inspect` used to read as "not
+// running", and callers turned that into proof of death - a transient daemon
+// outage could clear live reservations, restore "failed" over a running
+// game, or authorise a force-remove of a container that was merely
+// unobservable. Unknown is its own answer and blocks destructive decisions.
+type ContainerState uint8
+
+const (
+	ContainerUnknown ContainerState = iota // the daemon could not be asked; the truth is not known
+	ContainerMissing                       // the daemon answered: no such container
+	ContainerStopped                       // the daemon answered: not running
+	ContainerRunning                       // the daemon answered: running
+)
+
+// containerState asks the daemon once, bounded. Any transport, permission or
+// parse failure is Unknown - never guessed into one of the known states.
+var containerState = func(id string) ContainerState {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}",
 		containerPrefix+"-"+id).Output()
-	return err == nil && strings.TrimSpace(string(out)) == "true"
+	if err != nil {
+		return ContainerUnknown
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "true":
+		return ContainerRunning
+	case "false":
+		return ContainerStopped
+	}
+	return ContainerUnknown
+}
+
+// containerRunning keeps its old contract for the callers that only need
+// "PROVEN running" (reconcile, quiesce): a positive answer, nothing less.
+// A function of the tri-state probe, not a second exec path, so a stubbed
+// probe governs both.
+func containerRunning(id string) bool {
+	return containerState(id) == ContainerRunning
 }
 
 // Adopt re-attaches to a container that outlived the panel.
@@ -1173,24 +1246,31 @@ func (r *dockerRunner) watchExit(ctx context.Context, s *Server, name string) {
 				}
 				return
 			}
-			if containerRunning(s.ID) {
-				// Transport error with a live container: supervision
-				// continues. The watcher's job is to outlast daemon hiccups,
-				// not to interpret them as exits.
+			// R35: a wait error is retried unless the daemon POSITIVELY
+			// reports the container gone. "Inspect also failed" used to fall
+			// through to processExited - reporting a game crash during a
+			// daemon outage while the container sat there perfectly alive.
+			// Supervision outlasts the outage instead.
+			switch containerState(s.ID) {
+			case ContainerRunning:
 				log.Printf("%s: docker wait failed but the container is running; watching again in %s (%v)",
 					s.ID, backoff, err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(backoff):
-				}
-				if backoff < 30*time.Second {
-					backoff *= 2
-				}
-				continue
+			case ContainerMissing, ContainerStopped:
+				r.mgr.processExited(s, err)
+				return
+			default:
+				log.Printf("%s: docker wait failed and the daemon could not be asked; retrying in %s (%v)",
+					s.ID, backoff, err)
 			}
-			r.mgr.processExited(s, err)
-			return
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
 		}
 		// An exit code that actually arrived is authoritative even if the context
 		// has since been cancelled: Stop cancels right after `docker stop` returns,
@@ -1246,10 +1326,24 @@ func (r *dockerRunner) pollStats(ctx context.Context, s *Server, name string) {
 			if len(f) < 2 {
 				continue
 			}
-			cpu := parseFloatPrefix(strings.TrimSuffix(f[0], "%"))
+			dockerPct := parseFloatPrefix(strings.TrimSuffix(f[0], "%"))
 			mem := parseMem(f[1])
 			s.mu.Lock()
-			s.cpuPct = cpu
+			// R44 (audit pass 7): docker stats' percentage is core-relative -
+			// 100% means one full core, 200% means two. Storing it as
+			// "percent of the server's own limit" (which is what Snapshot,
+			// the sparklines and sampleLoop all document s.cpuPct as)
+			// over-reported multi-core quotas by the quota factor and made
+			// sampleLoop's percent*quota arithmetic double-scale. Converted
+			// here, at ingestion, under the same lock as the quota it is
+			// relative to; a quota of 0 (unset) keeps the raw figure rather
+			// than dividing by zero.
+			quota := s.CPU
+			pct := dockerPct
+			if quota > 0 {
+				pct = dockerPct / quota
+			}
+			s.cpuPct = clampF(pct, 0, 100)
 			s.memMB = mem
 			s.mu.Unlock()
 		}
@@ -1539,18 +1633,37 @@ func parseFloatPrefix(s string) float64 {
 }
 
 // parseMem turns docker's "1.234GiB / 4GiB" into megabytes.
+//
+// R44 (audit pass 7): every unit docker actually prints is handled, and an
+// unrecognised suffix yields 0 rather than a plausible wrong number. The old
+// parser handled GiB and KiB only - a "123MiB" reading fell through and came
+// back as 123 MB (a 23% under-report at that magnitude), and plain bytes came
+// back as megabytes outright.
 func parseMem(s string) int {
 	part := strings.SplitN(s, "/", 2)[0]
 	part = strings.TrimSpace(part)
 	v := parseFloatPrefix(part)
-	up := strings.ToUpper(part)
-	switch {
-	case strings.Contains(up, "GIB"), strings.Contains(up, "GB"):
-		return int(v * 1024)
-	case strings.Contains(up, "KIB"), strings.Contains(up, "KB"):
-		return int(v / 1024)
+	// The unit is the trailing alphabetic suffix; docker prints IEC units
+	// (B, KiB, MiB, GiB, TiB) but the SI spellings are accepted too so a
+	// locale or CLI change degrades to a rounding difference, not a 1000x.
+	i := len(part)
+	for i > 0 && (part[i-1] < '0' || part[i-1] > '9') && part[i-1] != '.' {
+		i--
 	}
-	return int(v)
+	unit := strings.ToUpper(strings.TrimSpace(part[i:]))
+	switch unit {
+	case "", "B":
+		return int(v / (1 << 20))
+	case "KB", "KIB":
+		return int(v / (1 << 10))
+	case "MB", "MIB":
+		return int(v)
+	case "GB", "GIB":
+		return int(v * (1 << 10))
+	case "TB", "TIB":
+		return int(v * (1 << 20))
+	}
+	return 0
 }
 
 func fakeUUID(seed string) string {

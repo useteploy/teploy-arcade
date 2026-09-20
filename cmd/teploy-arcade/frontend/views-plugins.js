@@ -33,14 +33,20 @@ async function viewPlugins(id) {
           <div class="row"><span class="k">Finding a plugin</span><span class="muted">Copy the download link
             from Modrinth, Hangar or SpigotMC and paste it below. The panel does not proxy those
             indexes, so the link you use is the one the author published.</span></div>
-          <div class="row"><span class="k">Uploading a file</span><span class="muted">Use the Files tab -
-            it writes into the same directory.</span></div>
+          <!-- R66 (audit pass 7): the old row here advertised uploading a jar
+             through the Files tab - but that interface only edits text files
+             and has no jar-upload workflow. The claim is gone until the
+             workflow exists. -->
         </div>
       </div>
     </div>
     <div class="addbar" id="plBar" style="display:none">
       <span class="sigil"><i class="ico ico-sm ico-download"></i></span>
       <input class="inp" id="plURL" placeholder="https://example.com/plugin.jar" autocomplete="off">
+      <!-- R64/R66 (audit pass 7): the backend has verified an optional
+         SHA-256 since pass 6; the field is exposed here and wired into the
+         request, so "I gave it a checksum" is something the UI can mean. -->
+      <input class="inp mono" id="plSHA" placeholder="SHA-256 (optional)" autocomplete="off" spellcheck="false" style="max-width:220px">
       <button type="button" class="btn btn-primary" id="plInstall">Install</button>
     </div>
   </div>`);
@@ -134,21 +140,34 @@ async function viewPlugins(id) {
     }
   };
 
+  // R66: one in-flight guard shared by the click and Enter paths - the old
+  // shape only disabled the button, so pressing Enter mid-download started a
+  // second one against the same target.
+  let installing = false;
   const install = async () => {
+    if (installing) return;
     const url = $('#plURL', root).value.trim();
     if (!url) return;
+    const sha = $('#plSHA', root).value.trim();
+    if (sha && !/^[0-9a-fA-F]{64}$/.test(sha)) {
+      toast('The SHA-256 must be exactly 64 hexadecimal characters (or empty)', 'err');
+      return;
+    }
+    installing = true;
     const btn = $('#plInstall', root);
     btn.disabled = true;
     btn.textContent = 'Downloading…';
     try {
       const res = await api(`/api/servers/${id}/plugins/install`, {
         method: 'POST',
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, sha256: sha }),
       });
       $('#plURL', root).value = '';
+      $('#plSHA', root).value = '';
       toast(`Installed ${res.plugin.name}`);
       flagRestart(res);
     } catch (e) { toast(e.message, 'err'); }
+    installing = false;
     btn.disabled = false;
     btn.textContent = 'Install';
     load();
@@ -156,6 +175,7 @@ async function viewPlugins(id) {
 
   $('#plInstall', root).addEventListener('click', install);
   $('#plURL', root).addEventListener('keydown', (e) => { if (e.key === 'Enter') install(); });
+  $('#plSHA', root).addEventListener('keydown', (e) => { if (e.key === 'Enter') install(); });
 
   load();
   return root;

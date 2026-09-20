@@ -93,6 +93,14 @@ async function viewFiles(id) {
             <button type="button" class="btn btn-ghost btn-sm btn-icon" data-rm title="Delete"><i class="ico ico-sm ico-trash"></i></button>
           </span>
         </div>`).join('');
+      // R63 (audit pass 7): a truncated listing used to render as the whole
+      // directory, so files past the cap were invisible with nothing saying
+      // they exist. Say the listing is incomplete; the stable-cursor
+      // pagination that reaches the rest is tracked in AUDIT_OPEN.
+      if (data.truncated) {
+        list.innerHTML += `<div class="row" style="color:var(--amber)"><i class="ico ico-sm ico-warning"></i>
+          This listing is incomplete: the directory exceeds the current page limit.</div>`;
+      }
 
       list.querySelectorAll('.filerow').forEach((row) => {
         const path = row.dataset.path;
@@ -234,7 +242,10 @@ async function viewBackups(id) {
     list.innerHTML = `<div class="row"><span class="spin"></span></div>`;
     try {
       const data = await api(`/api/servers/${id}/backups`);
-      $('#bkFree', root).textContent = data.free_bytes ? humanBytes(data.free_bytes) : 'unknown';
+      // R66 (audit pass 7): zero free bytes is a real measurement, not
+      // "unknown" - the old truthiness check hid the most urgent number this
+      // screen can show.
+      $('#bkFree', root).textContent = data.free_bytes == null ? 'unknown' : humanBytes(data.free_bytes);
       $('#bkKeep', root).value = data.keep || 0;
       if (!data.backups.length) {
         list.innerHTML = `<div class="row muted">No backups yet.</div>`;
@@ -280,7 +291,10 @@ async function viewBackups(id) {
   });
 
   $('#mkBackup', root).addEventListener('click', async () => {
-    const note = prompt('Note for this backup (optional)') || '';
+    // R66 (audit pass 7): cancelling the note prompt cancels the backup.
+    // `prompt(...) || ''` turned null (Cancel) into an empty note and ran on.
+    const note = prompt('Note for this backup (optional)');
+    if (note === null) return;
     const btn = $('#mkBackup', root);
     btn.disabled = true;
     btn.innerHTML = `<span class="spin"></span> Backing up…`;

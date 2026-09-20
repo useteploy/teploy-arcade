@@ -29,9 +29,9 @@ func TestACancelledWaitStillReportsAContainerThatIsGone(t *testing.T) {
 	s.Status = StatusStopping
 	s.mu.Unlock()
 
-	old := containerRunning
-	t.Cleanup(func() { containerRunning = old })
-	containerRunning = func(string) bool { return false } // it is already gone
+	old := containerState
+	t.Cleanup(func() { containerState = old })
+	containerState = func(string) ContainerState { return ContainerMissing } // it is already gone
 
 	// A context that is already cancelled, which is the state Stop leaves
 	// behind, driving the same path `docker wait` failing would.
@@ -64,9 +64,9 @@ func TestACancelledWaitLeavesALiveContainerAlone(t *testing.T) {
 	s.Status = StatusRunning
 	s.mu.Unlock()
 
-	old := containerRunning
-	t.Cleanup(func() { containerRunning = old })
-	containerRunning = func(string) bool { return true }
+	old := containerState
+	t.Cleanup(func() { containerState = old })
+	containerState = func(string) ContainerState { return ContainerRunning }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

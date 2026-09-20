@@ -396,8 +396,13 @@ var templates = []Template{
 		// on the same image. A pinned Bedrock version is a dead template on the
 		// day Mojang prunes it, and Mojang prunes.
 		Maturity: "preview", Image: "itzg/minecraft-bedrock-server", Versions: []string{"LATEST"},
+		// R49 (audit pass 7): the template configures a SECOND listener
+		// (SERVER_PORT_V6 = PORT_PLUS_1) but declared a one-port span, so the
+		// ledger never reserved it and the container never published it. A
+		// two-port UDP span covers both listeners; base 65535 is refused by
+		// candidateBindings because base+1 leaves the range.
 		MemoryMB: 2048, CPU: 2, DiskGB: 10, MaxPlayers: 10, PortHint: 19132,
-		Protocols: []string{"udp"}, ReadyLog: "Server started.",
+		Protocols: []string{"udp"}, PortSpan: 2, ReadyLog: "Server started.",
 		// Verified on the deployed host: this is the line, and this env is the
 		// difference between booting and exiting. See dockerRunArgs.
 		Env: map[string]string{"SERVER_PORT_V6": "${PORT_PLUS_1}"},
@@ -507,9 +512,23 @@ var templates = []Template{
 		Mark: "rust", Description: "Wipes on a schedule - the backup job matters here more than anywhere else.",
 		Maturity: "preview", Image: "didstopia/rust-server", Versions: []string{"latest"},
 		MemoryMB: 8192, CPU: 4, DiskGB: 30, MaxPlayers: 100, PortHint: 28015,
-		// Game traffic is UDP; the +1 port is RCON, which this image publishes
-		// on TCP and is how its console is reached at all.
-		Protocols: []string{"udp", "tcp"}, PortSpan: 2, ReadyLog: "Server startup complete",
+		// R47 (audit pass 7): the span used to publish TCP on both ports,
+		// which put the image's RCON listener (base+1, TCP, and - per the
+		// upstream Dockerfile - passworded with the known default "docker")
+		// on the network with a guessable credential. Two fixes: the span is
+		// UDP-only, so RCON's TCP port is reachable only via docker exec from
+		// the host, and dockerRunArgs injects RUST_RCON_PASSWORD with a fresh
+		// random secret per launch so no default survives even inside the
+		// container's own config.
+		Protocols: []string{"udp"}, PortSpan: 2, ReadyLog: "Server startup complete",
+		// R48 (audit pass 7): this image keeps its server under /steamcmd/rust
+		// (its own Dockerfile WORKDIR), not /data - a /data mount meant the
+		// panel's files, backups and settings addressed a directory the game
+		// shared nothing with. Paths from the image's published contract.
+		DataPath: "/steamcmd/rust",
+		Env: map[string]string{
+			"RUST_SERVER_PORT": "${PORT}",
+		},
 	},
 	{
 		Slug: "valheim", Name: "Valheim", Game: "valheim", Group: "Other",
@@ -520,6 +539,14 @@ var templates = []Template{
 		// 2457 the query port Steam's server browser answers on. Publishing only
 		// the first makes the server unlistable even when it is running.
 		Protocols: []string{"udp"}, PortSpan: 3, ReadyLog: "Game server connected",
+		// R48 (audit pass 7): the image documents /config as its persistent
+		// volume (worlds and configs); the generic /data fallback mounted a
+		// directory it never reads, and the world lived in the container's
+		// writable layer instead - silently lost on recreation.
+		DataPath: "/config",
+		Env: map[string]string{
+			"SERVER_PORT": "${PORT}",
+		},
 	},
 }
 
@@ -587,34 +614,41 @@ var propSchema = []PropMeta{
 		Help: "If enabled, players will be set to spectator mode if they die. Cannot be undone for players who have already died."},
 	{Key: "allow-nether", Label: "Nether world", Type: "bool", Group: "Gameplay", Applies: "next_restart", Owner: "game",
 		Help: "Allows players to travel to the Nether."},
-	{Key: "pvp", Label: "PVP", Type: "bool", Group: "Gameplay", Applies: "immediate", Owner: "game",
-		Help: "Players will be able to kill each other."},
+	// R26 (audit pass 7): every one of these was labelled "immediate" while
+	// ApplySettings only writes server.properties - nothing in the panel
+	// delivers a live reload command or verifies the game accepted one, so
+	// the label promised enforcement the panel never performed. A saved
+	// whitelist value reading as already-enforced is the consequential one.
+	// They are next_restart until a per-template adapter exists that applies
+	// AND verifies live (see AUDIT_OPEN).
+	{Key: "pvp", Label: "PVP", Type: "bool", Group: "Gameplay", Applies: "next_restart", Owner: "game",
+		Help: "Players will be able to kill each other. Takes effect on the next restart."},
 	{Key: "allow-flight", Label: "Flight", Type: "bool", Group: "Gameplay", Applies: "next_restart", Owner: "game",
 		Help: "Allows users to use flight on your server while in Survival mode, if they have a mod that provides flight."},
-	{Key: "force-gamemode", Label: "Force Gamemode", Type: "bool", Group: "Gameplay", Applies: "immediate", Owner: "game",
+	{Key: "force-gamemode", Label: "Force Gamemode", Type: "bool", Group: "Gameplay", Applies: "next_restart", Owner: "game",
 		Help: "Force players to join in the default game mode."},
-	{Key: "difficulty", Label: "Difficulty", Type: "enum", Group: "Gameplay", Applies: "immediate", Owner: "game",
+	{Key: "difficulty", Label: "Difficulty", Type: "enum", Group: "Gameplay", Applies: "next_restart", Owner: "game",
 		Options: []string{"peaceful", "easy", "normal", "hard"}},
-	{Key: "gamemode", Label: "Gamemode", Type: "enum", Group: "Gameplay", Applies: "immediate", Owner: "game",
+	{Key: "gamemode", Label: "Gamemode", Type: "enum", Group: "Gameplay", Applies: "next_restart", Owner: "game",
 		Options: []string{"survival", "creative", "adventure", "spectator"}},
-	{Key: "view-distance", Label: "View Distance", Type: "int", Group: "Gameplay", Applies: "immediate", Owner: "game",
+	{Key: "view-distance", Label: "View Distance", Type: "int", Group: "Gameplay", Applies: "next_restart", Owner: "game",
 		Unit: "chunks", Help: "Chunks sent to each player - the biggest single lever on CPU and bandwidth."},
 
 	{Key: "level-seed", Label: "Level seed", Type: "string", Group: "World", Applies: "new_world_only", Owner: "game",
 		Help: "Ignored for a world that already exists. Changing it does not regenerate the world."},
-	{Key: "simulation-distance", Label: "Simulation distance", Type: "int", Group: "World", Applies: "immediate", Owner: "game",
+	{Key: "simulation-distance", Label: "Simulation distance", Type: "int", Group: "World", Applies: "next_restart", Owner: "game",
 		Unit: "chunks", Help: "Chunks that actually tick. Lower this before lowering view distance."},
-	{Key: "spawn-protection", Label: "Spawn protection", Type: "int", Group: "World", Applies: "immediate", Owner: "game",
+	{Key: "spawn-protection", Label: "Spawn protection", Type: "int", Group: "World", Applies: "next_restart", Owner: "game",
 		Unit: "blocks", Help: "Blocks around spawn that non-operators cannot edit."},
 
 	{Key: "server-port", Label: "Server port", Type: "int", Group: "Network", Applies: "next_restart", Owner: "panel",
 		Help: "Container port mapping. Checked against the host before save, not at boot."},
-	{Key: "max-players", Label: "Max players", Type: "int", Group: "Network", Applies: "immediate", Owner: "game",
-		Help: "Applies immediately. Lowering it kicks nobody."},
+	{Key: "max-players", Label: "Max players", Type: "int", Group: "Network", Applies: "next_restart", Owner: "game",
+		Help: "Takes effect on the next restart."},
 	{Key: "online-mode", Label: "Online mode", Type: "bool", Group: "Network", Applies: "next_restart", Owner: "game",
 		Help: "Verifies players against Mojang. Disable only behind a proxy that already does."},
-	{Key: "white-list", Label: "Whitelist", Type: "bool", Group: "Network", Applies: "immediate", Owner: "game",
-		Help: "Only listed players may join."},
+	{Key: "white-list", Label: "Whitelist", Type: "bool", Group: "Network", Applies: "next_restart", Owner: "game",
+		Help: "Only listed players may join. The file is written now; the running game enforces it after a restart."},
 	{Key: "enable-command-block", Label: "Command blocks", Type: "bool", Group: "Network", Applies: "next_restart", Owner: "game"},
 	{Key: "motd", Label: "MOTD", Type: "string", Group: "Network", Applies: "next_restart", Owner: "game",
 		Help: "The line shown in the player's multiplayer list."},

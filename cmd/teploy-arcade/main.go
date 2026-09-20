@@ -32,9 +32,14 @@ var (
 
 func main() {
 	var (
-		host     = flag.String("host", "127.0.0.1", "HTTP server host")
-		port     = flag.Int("port", 3457, "HTTP server port")
-		dataDir  = flag.String("data", defaultDataDir(), "Data directory for servers, backups and users")
+		host = flag.String("host", "127.0.0.1", "HTTP server host")
+		port = flag.Int("port", 3457, "HTTP server port")
+		// R74 (audit pass 7): the default is resolved AFTER flags parse, not
+		// while they are declared. defaultDataDir() probes and creates
+		// directories, and evaluating it during flag setup meant --version,
+		// --help and even a run carrying an explicit -data all touched
+		// /var/teploy-arcade first. "" means "resolve the default at startup".
+		dataDir  = flag.String("data", "", "Data directory for servers, backups and users (default resolved at startup)")
 		noAuth   = flag.Bool("no-auth", false, "Disable authentication (development only)")
 		dataHost = flag.String("data-host", "", "Host-side path matching -data, when the panel itself runs in a container")
 		origins  = flag.String("origin", "", "Extra hostnames allowed to open the console socket, comma separated (for a proxied deploy)")
@@ -53,6 +58,12 @@ func main() {
 		log.SetFlags(0)
 		log.Printf("teploy-arcade %s (%s, %s)", version, commit, date)
 		return
+	}
+
+	// R74: --help and --version must not create storage, and an explicit
+	// -data must not probe or create the unrelated default tree.
+	if *dataDir == "" {
+		*dataDir = defaultDataDir()
 	}
 
 	// Env wins only where the flag was not given. A password on a command line

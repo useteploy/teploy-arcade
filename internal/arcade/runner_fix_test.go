@@ -263,10 +263,13 @@ func TestDockerStartDoesNotBuildAContextItCannotCancel(t *testing.T) {
 		body = body[:end]
 	}
 
-	guard := strings.Index(body, "containerRunning(s.ID)")
+	// R35 (audit pass 7) moved the guard to the tri-state probe; the
+	// invariant this test protects is unchanged: the context is only created
+	// once the guard has cleared the early returns.
+	guard := strings.Index(body, "containerState(s.ID)")
 	made := strings.Index(body, "context.WithCancel")
 	if guard < 0 || made < 0 {
-		t.Fatal("dockerRunner.Start no longer has both the running guard and the context")
+		t.Fatal("dockerRunner.Start no longer has both the container guard and the context")
 	}
 	if made < guard {
 		t.Error("Start creates its context before the already-running guard, so the early return leaks the cancel func")

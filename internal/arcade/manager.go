@@ -230,7 +230,18 @@ func (m *Manager) recoverInterruptedRestores() {
 				continue
 			}
 			heldEnts, err := os.ReadDir(held)
-			if err != nil || len(heldEnts) == 0 {
+			if err != nil {
+				// R18 (audit pass 7): a read error is not evidence that nothing
+				// moved. An I/O or permission failure on old/ used to take the
+				// same branch as an empty holding directory and RemoveAll'd the
+				// staging tree - which, when old/ was unreadable but full, is the
+				// only remaining copy of the previous world. Retained and said so;
+				// the operator resolves it by hand with everything still there.
+				log.Printf("%s: could not read the held originals in %s (%v); the interrupted restore is RETAINED - resolve it by hand before starting this server",
+					s.Name, e.Name(), err)
+				continue
+			}
+			if len(heldEnts) == 0 {
 				log.Printf("%s: discarded an interrupted restore's staging directory %s (nothing had moved)", s.Name, e.Name())
 				_ = os.RemoveAll(staging)
 				continue
@@ -629,6 +640,10 @@ const (
 	maxServerMemMB = 1 << 20 // 1 TB, well past any real host
 	minServerCPU   = 0.1     // docker refuses --cpus below 0.01; 0.1 is the floor a game server is usable at
 	maxServerCPU   = 256.0
+
+	// The floor for images that launch a JVM (itzg's Minecraft and proxy
+	// images). See checkJavaMemory.
+	minJavaServerMemMB = 1024
 )
 
 func checkServerLimits(port, memMB int, cpu float64) error {
@@ -797,6 +812,12 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	if err := checkFitsHost(s.MemoryMB, s.CPU); err != nil {
 		return nil, err
 	}
+	// R46: the effective memory must also leave a JVM its native reserve on
+	// the images that launch one - checked on the effective value, which
+	// includes the template's default.
+	if err := checkJavaMemory(s.Image, s.MemoryMB); err != nil {
+		return nil, err
+	}
 	s.Props["max-players"] = itoa(s.MaxPlayers)
 	s.Props["server-port"] = itoa(port)
 	s.Props["motd"] = name
@@ -887,6 +908,18 @@ func (m *Manager) SetResources(s *Server, memMB int, cpu float64) ([]string, err
 	}
 	if memMB == 0 && cpu == 0 {
 		return nil, fmt.Errorf("nothing to change: pass memory_mb, cpu, or both")
+	}
+	// R46: the proposed memory must leave a JVM its native reserve on images
+	// that launch one. Checked on the incoming value before anything moves.
+	s.mu.Lock()
+	image := s.Image
+	effectiveMem := s.MemoryMB
+	if memMB > 0 {
+		effectiveMem = memMB
+	}
+	s.mu.Unlock()
+	if err := checkJavaMemory(image, effectiveMem); err != nil {
+		return nil, err
 	}
 
 	s.fsMu.RLock()
@@ -1500,11 +1533,24 @@ func (m *Manager) Stop(id string) error {
 			// The runner only cancels its watchers on success, so a container
 			// that refused to stop is still supervised. Saying "stopping"
 			// forever for a live server is a lie; report what is true.
+			// R35: an UNKNOWN docker state is not evidence of anything - the
+			// watchers stay attached and resolve the truth when the daemon
+			// answers again, so the state is left for supervision rather than
+			// guessed into "failed" (which would clear the live bindings of a
+			// container that may still be up).
 			m.panelLine(s, "error", "Stop failed: "+err.Error())
-			if s.Runtime == RuntimeDocker && containerRunning(s.ID) {
-				m.setStatus(s, StatusRunning, 0, "")
-			} else {
+			switch {
+			case s.Runtime != RuntimeDocker:
 				m.setStatus(s, StatusFailed, 1, err.Error())
+			default:
+				switch containerState(s.ID) {
+				case ContainerRunning:
+					m.setStatus(s, StatusRunning, 0, "")
+				case ContainerMissing, ContainerStopped:
+					m.setStatus(s, StatusFailed, 1, err.Error())
+				default:
+					m.panelLine(s, "warn", "Docker could not be asked whether the container is still up; supervision will resolve the state when the daemon answers.")
+				}
 			}
 			return
 		}
@@ -1526,10 +1572,20 @@ func (m *Manager) Kill(id string) error {
 		defer recoverPanic("kill worker for " + s.ID)
 		if err := m.runnerFor(s).Kill(s); err != nil {
 			m.panelLine(s, "error", "Kill failed: "+err.Error())
-			if s.Runtime == RuntimeDocker && containerRunning(s.ID) {
-				m.setStatus(s, StatusRunning, 0, "")
-			} else {
+			// R35: same rule as Stop - only a POSITIVE daemon answer moves the
+			// state; unknown leaves it to the still-attached watchers.
+			switch {
+			case s.Runtime != RuntimeDocker:
 				m.fail(s, 137, "killed")
+			default:
+				switch containerState(s.ID) {
+				case ContainerRunning:
+					m.setStatus(s, StatusRunning, 0, "")
+				case ContainerMissing, ContainerStopped:
+					m.fail(s, 137, "killed")
+				default:
+					m.panelLine(s, "warn", "Docker could not be asked whether the container is still up; supervision will resolve the state when the daemon answers.")
+				}
 			}
 			return
 		}
@@ -1598,6 +1654,17 @@ func (m *Manager) Send(id, cmd, mode, actor string) error {
 	if s.State() != StatusRunning {
 		return fmt.Errorf("server is not running")
 	}
+	// R28 (audit pass 7): external console input is another way to mutate the
+	// world, and the backup filesystem gate only coordinated panel file
+	// writes - a `save-on` or `stop` typed into the console (or sent by the
+	// scheduler or an MCP token) could land mid-archive and break the
+	// quiesce the archive depends on. Refused busy rather than queued: the
+	// snapshot adapter's own save commands go to the runner directly and
+	// never pass through here, so they are unaffected.
+	if !s.fsMu.TryRLock() {
+		return fmt.Errorf("console commands are temporarily blocked: a backup, restore or lifecycle operation owns this server's window; try again when it finishes")
+	}
+	defer s.fsMu.RUnlock()
 	line := cmd
 	if mode == "say" {
 		line = "say " + cmd
@@ -2184,6 +2251,21 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 	s.editMu.Lock()
 	defer s.editMu.Unlock()
 
+	// R24 (audit pass 7): the pre-edit values are captured BEFORE the port
+	// moves. changeServerPort writes the new port into s.Props, so the
+	// restart comparison below used to see the port as already-unchanged and
+	// a live port edit never raised its restart flag. The prior pending list
+	// is captured for the same reason: it was REPLACED by this edit's keys,
+	// so an unrelated or no-op edit silently cleared a real "memory change
+	// waiting on restart" warning.
+	s.mu.Lock()
+	oldProps := make(map[string]string, len(s.Props))
+	for k, v := range s.Props {
+		oldProps[k] = v
+	}
+	priorPending := append([]string(nil), s.PendingRestart...)
+	s.mu.Unlock()
+
 	// The port moves first and atomically. If it is taken, the whole request
 	// is refused before any other setting has been applied.
 	if newPort > 0 {
@@ -2203,15 +2285,31 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 		return st == StatusRunning || st == StatusStarting
 	}()
 
+	// The port itself only needs a restart when the container is live on the
+	// old one; a stopped server's next start uses the new port anyway.
+	if newPort > 0 && running && oldProps["server-port"] != itoa(newPort) {
+		if meta := propMetaFor("server-port"); meta != nil {
+			needRestart = append(needRestart, meta.Label)
+		}
+	}
+
 	s.mu.Lock()
 	for k, v := range changes {
-		if s.Props[k] != v && propMetaFor(k).Applies == "next_restart" && running {
+		if oldProps[k] != v && propMetaFor(k).Applies == "next_restart" && running {
 			needRestart = append(needRestart, propMetaFor(k).Label)
 		}
 		s.Props[k] = v
 	}
 	if newMax := atoi(changes["max-players"]); newMax > 0 {
 		s.MaxPlayers = newMax
+	}
+	// Merged with what was already pending, never replaced: the list is
+	// "everything waiting on a restart", and an unrelated edit arriving
+	// between two changes must not clear the first one's warning.
+	for _, prior := range priorPending {
+		if !contains(needRestart, prior) {
+			needRestart = append(needRestart, prior)
+		}
 	}
 	sort.Strings(needRestart)
 	s.PendingRestart = needRestart

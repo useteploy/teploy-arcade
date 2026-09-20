@@ -392,11 +392,11 @@ func TestReadyWatchdogPromotesAServerThatIsActuallyUp(t *testing.T) {
 
 	// The watchdog only promotes a container that is genuinely up; one that
 	// died is the exit watcher's business.
-	prevRunning := containerRunning
+	prevRunning := containerState
 	prevFallback := readyFallbackFor
-	containerRunning = func(string) bool { return true }
+	containerState = func(string) ContainerState { return ContainerRunning }
 	readyFallbackFor = 40 * time.Millisecond
-	defer func() { containerRunning = prevRunning; readyFallbackFor = prevFallback }()
+	defer func() { containerState = prevRunning; readyFallbackFor = prevFallback }()
 
 	r := &dockerRunner{mgr: mgr}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -424,11 +424,11 @@ func TestReadyWatchdogLeavesADeadContainerAlone(t *testing.T) {
 	s.Status = StatusStarting
 	s.mu.Unlock()
 
-	prevRunning := containerRunning
+	prevRunning := containerState
 	prevFallback := readyFallbackFor
-	containerRunning = func(string) bool { return false }
+	containerState = func(string) ContainerState { return ContainerMissing }
 	readyFallbackFor = 40 * time.Millisecond
-	defer func() { containerRunning = prevRunning; readyFallbackFor = prevFallback }()
+	defer func() { containerState = prevRunning; readyFallbackFor = prevFallback }()
 
 	r := &dockerRunner{mgr: mgr}
 	ctx, cancel := context.WithCancel(context.Background())

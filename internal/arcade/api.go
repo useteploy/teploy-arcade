@@ -396,11 +396,33 @@ const (
 	pingTimeout  = 10 * time.Second
 )
 
+// maxConsoleSockets bounds concurrent console WebSocket upgrades, mirroring
+// the SSE cap. Every upgraded console holds a socket, a reader goroutine, a
+// writer goroutine, a ping ticker and a 256-slot buffer for as long as the
+// client keeps it open; the event feed got a ceiling in pass 6 and this path
+// - reachable by any viewer - never had one (R11, audit pass 7).
+const maxConsoleSockets = 64
+
+// consoleSockets is the lease every console upgrade acquires before the
+// handshake and releases when its handler returns.
+var consoleSockets = make(chan struct{}, maxConsoleSockets)
+
 func (a *API) console(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("server")
 	s := a.mgr.Get(id)
 	if s == nil {
 		http.Error(w, "no such server", 404)
+		return
+	}
+
+	// R11: the lease is taken BEFORE the upgrade, so a refused connection
+	// never becomes an upgraded one, and released on every exit path.
+	select {
+	case consoleSockets <- struct{}{}:
+		defer func() { <-consoleSockets }()
+	default:
+		http.Error(w, "this panel already has its maximum number of console connections open; close a console and try again",
+			http.StatusTooManyRequests)
 		return
 	}
 
@@ -430,6 +452,13 @@ func (a *API) console(w http.ResponseWriter, r *http.Request) {
 	conn := NewConn(256)
 	replay, seq, capacity := a.hub.Join(id, conn)
 	defer a.hub.Leave(id, conn)
+	// R11: a join onto a deleted server's tombstone room never feeds this
+	// socket anything - close it now rather than leaving an idle upgraded
+	// connection the client reads as a silent console.
+	if a.hub.Dead(id) {
+		_ = c.Close(websocket.StatusPolicyViolation, "this server was deleted")
+		return
+	}
 
 	// writeConsole bounds every payload write: the writer goroutine used to
 	// use the unbounded connection context, so a client that stopped reading

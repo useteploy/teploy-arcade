@@ -59,7 +59,9 @@ func TestUnclaimedPanelRefusesOperationalRoutes(t *testing.T) {
 	}
 
 	// MCP dispatch refuses even a well-formed bearer request while unclaimed.
-	// JSON-RPC errors ride a 200, so the payload is what must say no.
+	// R09 (audit pass 7): the refusal is an HTTP 401 challenge at the
+	// transport boundary, not a JSON-RPC error riding a 200 - the request
+	// never became a conversation.
 	req, _ := http.NewRequest("POST", srv.URL+"/api/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
 	req.Header.Set("Authorization", "Bearer tpa_nonsense")
 	req.Header.Set("Content-Type", "application/json")
@@ -67,18 +69,9 @@ func TestUnclaimedPanelRefusesOperationalRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rpc struct {
-		Error *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&rpc); err != nil {
-		t.Fatal(err)
-	}
 	res.Body.Close()
-	if rpc.Error == nil || !strings.Contains(rpc.Error.Message, "token") {
-		t.Errorf("MCP dispatch on an unclaimed panel answered %v; it must refuse the token", rpc.Error)
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("MCP dispatch on an unclaimed panel answered %d; it must refuse the token", res.StatusCode)
 	}
 
 	// The one route that must work: claiming through the bootstrap token.

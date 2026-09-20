@@ -217,6 +217,20 @@ func classifyJar(name string) (slug, warn string, proxy bool) {
 
 // ---------------------------------------------------------------- scanning
 
+// relativeWithin reports whether target is base or lives under it, using
+// filepath.Rel on cleaned paths. R31 (audit pass 7): the containment checks
+// used `strings.HasPrefix(target, base + separator)`, which mishandles the
+// filesystem ROOT (base "/" produces "//" and nothing matches, so importing
+// "/" was not recognised as an ancestor of the data directory) and sibling
+// prefixes ("/data' vs '/data-other'). Segment-aware comparison, not text.
+func relativeWithin(base, target string) bool {
+	rel, err := filepath.Rel(filepath.Clean(base), filepath.Clean(target))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
 // importSource vets a host path before anything reads, copies or links it.
 func (m *Manager) importSource(path string) (string, error) {
 	path = strings.TrimSpace(path)
@@ -255,10 +269,10 @@ func (m *Manager) importSource(path string) (string, error) {
 	// server this panel already manages; a source that *contains* the data
 	// directory would have the copy copying itself, and the destination grows
 	// until the disk is full.
-	if abs == data || strings.HasPrefix(abs, data+string(os.PathSeparator)) {
+	if relativeWithin(data, abs) {
 		return "", fmt.Errorf("%s is inside the panel's own data directory, so it is already managed here", abs)
 	}
-	if strings.HasPrefix(data, abs+string(os.PathSeparator)) {
+	if abs != data && relativeWithin(abs, data) {
 		return "", fmt.Errorf("%s contains the panel's data directory; copying it would copy the copy", abs)
 	}
 	return abs, nil
@@ -789,6 +803,11 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	}
 	if req.CPU > 0 {
 		s.CPU = req.CPU
+	}
+	// R46: the effective memory, template default included, must leave a JVM
+	// its native reserve on the images that launch one.
+	if err := checkJavaMemory(s.Image, s.MemoryMB); err != nil {
+		return nil, err
 	}
 	applyImportedProps(s, sc, port)
 

@@ -373,6 +373,12 @@ func (sc *Scheduler) Get(id string) *Task {
 // daylight-saving day the clock jumps, and midnight+3h30 landed on 04:30 when
 // the task says 03:30 - the preview disagreed with the loop, which compares
 // wall-clock time, on exactly the days people schedule restarts around.
+//
+// R55 (audit pass 7): a PENDING one-shot (enabled, never run) whose moment
+// passed today reports TOMORROW's occurrence, because that is what the loop
+// will actually fire - the window check (secsNow in [at, at+59]) cannot fire
+// it today anymore. The old preview returned "never" for exactly the tasks
+// the loop was still going to run.
 func (t *Task) NextRun(now time.Time) time.Time {
 	secs, err := parseClock(t.Time)
 	if err != nil {
@@ -383,7 +389,11 @@ func (t *Task) NextRun(now time.Time) time.Time {
 	next := time.Date(now.Year(), now.Month(), now.Day(), h, m, s, 0, loc)
 	if !next.After(now) {
 		if !t.Repeat {
-			return time.Time{} // one-shot whose moment has passed today
+			// A one-shot that already ran is disabled and has no next run.
+			// One still pending gets tomorrow's occurrence, matching the loop.
+			if t.LastRun > 0 || !t.Enabled {
+				return time.Time{}
+			}
 		}
 		tomorrow := now.AddDate(0, 0, 1)
 		next = time.Date(tomorrow.Year(), tomorrow.Month(), tomorrow.Day(), h, m, s, 0, loc)
@@ -437,11 +447,26 @@ func (sc *Scheduler) loop() {
 			// Admission before the goroutine: without it a panel restarting
 			// into a pile of due tasks spawned one goroutine per task, all
 			// waiting (and then all running) at once.
+			//
+			// R54 (audit pass 7): a due occurrence that cannot get a slot is
+			// REPORTED, not silently dropped. The old path just skipped it, so
+			// four long jobs could eat every slot for the whole 60-second due
+			// window and a promised nightly backup or restart vanished with
+			// nothing anywhere saying it had. The occurrence stays unrun
+			// (LastRun is not touched) and the reason is written onto the task
+			// where the UI already shows last-run failures - the queue redesign
+			// that keeps and runs late occurrences is tracked in AUDIT_OPEN.
 			select {
 			case sc.slots <- struct{}{}:
 			default:
-				log.Printf("scheduler: %d task runs are already executing; skipping %q this occurrence",
+				log.Printf("scheduler: %d task runs are already executing; %q could not start this occurrence",
 					maxConcurrentTaskRuns, task.Name)
+				if err := sc.record(task.ID, func(t *Task) {
+					t.LastErr = fmt.Sprintf("skipped at %s: all %d task slots were busy for the whole due window",
+						now.Format("15:04:05"), maxConcurrentTaskRuns)
+				}); err != nil {
+					log.Printf("scheduler: could not record the skipped occurrence of %q: %v", task.Name, err)
+				}
 				continue
 			}
 			go func(id string) {

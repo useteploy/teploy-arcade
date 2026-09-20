@@ -76,6 +76,18 @@ func (h *Handler) logf(f string, a ...any) {
 	log.Printf(f, a...)
 }
 
+// bearerToken parses the Authorization header strictly. R09 (audit pass 7):
+// TrimPrefix accepted "bearer x" (lowercase scheme) and treated a missing
+// scheme as a bare token guess; the MCP HTTP transport specifies a
+// well-formed Bearer challenge, and a malformed one is a 401, not a lookup.
+func bearerToken(h string) (string, bool) {
+	parts := strings.Fields(h)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
+		return "", false
+	}
+	return parts[1], true
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -83,9 +95,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if h.Check == nil || !h.Check(strings.TrimSpace(tok)) {
-		writeRPC(w, nil, nil, &rpcError{Code: -32001, Message: "invalid or missing bearer token"})
+	// R09: authentication failures are answered at the HTTP boundary with a
+	// real 401 challenge, not folded into a JSON-RPC error body - a client
+	// cannot distinguish "bad token" from "bad request" otherwise.
+	tok, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok || h.Check == nil || !h.Check(tok) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="teploy-arcade"`)
+		http.Error(w, "invalid or missing bearer token", http.StatusUnauthorized)
 		return
 	}
 
@@ -94,10 +110,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeRPC(w, nil, nil, &rpcError{Code: -32700, Message: "unreadable body"})
 		return
 	}
-
+	// R09: a bounded reader alone does not prove the body fits - a valid JSON
+	// prefix followed by more data used to decode fine and ignore the rest.
+	// Exactly one JSON value per request.
+	dec := json.NewDecoder(strings.NewReader(string(body)))
 	var req rpcRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := dec.Decode(&req); err != nil {
 		writeRPC(w, nil, nil, &rpcError{Code: -32700, Message: "parse error"})
+		return
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeRPC(w, nil, nil, &rpcError{Code: -32600, Message: "exactly one JSON-RPC request per POST"})
+		return
+	}
+	// R09: the version field is checked rather than assumed, and a request
+	// carrying an ID must be string or number - MCP forbids null and
+	// fractional IDs. An absent ID means notification, which never gets a
+	// response body.
+	isNotification := len(req.ID) == 0 || string(req.ID) == "null"
+	if req.JSONRPC != "" && req.JSONRPC != "2.0" {
+		writeRPC(w, req.ID, nil, &rpcError{Code: -32600, Message: `jsonrpc must be "2.0"`})
+		return
+	}
+	if !isNotification && !validRPCID(req.ID) {
+		writeRPC(w, req.ID, nil, &rpcError{Code: -32600, Message: "id must be a string or an integer"})
+		return
+	}
+	if isNotification && req.Method != "notifications/initialized" {
+		// Notifications never receive a response; nothing else is currently
+		// accepted as one, so say so the way the protocol wants.
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
@@ -158,4 +200,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func writeRPC(w http.ResponseWriter, id json.RawMessage, result any, e *rpcError) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rpcResponse{JSONRPC: "2.0", ID: id, Result: result, Error: e})
+}
+
+// validRPCID reports whether a request ID has a shape JSON-RPC 2.0 - and,
+// more strictly, MCP - permits: a string or an integer. Null, bools, floats
+// and arrays/objects are refused (R09, audit pass 7).
+func validRPCID(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var v any
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	if dec.Decode(&v) != nil {
+		return false
+	}
+	switch id := v.(type) {
+	case string:
+		return true
+	case json.Number:
+		_, err := id.Int64()
+		return err == nil
+	}
+	return false
 }

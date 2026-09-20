@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Phase 8: authentication, roles and the audit log.
@@ -363,12 +364,31 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// Credential upper bounds shared by every credential ingress. Login has
+// enforced these since pass 6 (authInputOK); creation, first-run setup and
+// password changes did not (R03, audit pass 7), so an account could be
+// created with credentials the login route then refuses - locked out by a
+// length rule that only one side of the panel knew about.
+const (
+	maxNameBytes     = 128
+	maxPasswordBytes = 1024
+)
+
 func checkNewUser(name, password, role string) error {
 	if len(strings.TrimSpace(name)) < 2 {
 		return fmt.Errorf("name must be at least 2 characters")
 	}
 	if len(password) < 8 {
 		return fmt.Errorf("password must be at least 8 characters")
+	}
+	// The same upper bounds login enforces, measured in bytes: a multibyte
+	// name under 128 runes can still exceed 128 bytes, and login counts
+	// bytes. An account accepted here and refused there is locked out.
+	if len(name) > maxNameBytes {
+		return fmt.Errorf("name must be at most %d bytes", maxNameBytes)
+	}
+	if len(password) > maxPasswordBytes {
+		return fmt.Errorf("password must be at most %d bytes", maxPasswordBytes)
 	}
 	if _, ok := roleRank[role]; !ok {
 		return fmt.Errorf("unknown role %q", role)
@@ -587,6 +607,11 @@ func (a *Auth) SetPassword(name, current, next, keepToken string, byAdmin bool) 
 	if len(next) < 8 {
 		return fmt.Errorf("password must be at least 8 characters")
 	}
+	// R03: the upper bound login enforces. A reset that accepts a password
+	// the login route refuses is an account locked out by its own change.
+	if len(next) > maxPasswordBytes {
+		return fmt.Errorf("password must be at most %d bytes", maxPasswordBytes)
+	}
 
 	// Both PBKDF2 derivations run OUTSIDE the mutex - the same shape Login
 	// already uses. The old shape held the global write lock across up to
@@ -711,7 +736,34 @@ func (a *Auth) DeleteUser(name string) error {
 
 const auditKept = 2000
 
+// auditText bounds one audit field in bytes, UTF-8-safely. R05 (audit pass 7):
+// retention was bounded by entry COUNT, and the command/detail sources that
+// feed the audit log (console commands, task output) are caller-influenced -
+// a 7 MB note or command turned every retained entry into megabytes and every
+// append into a rewrite of all of it under the auth mutex. Truncation is
+// visible so a record that was cut can be recognised as cut.
+func auditText(s string, max int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	if len(s) <= max {
+		return s
+	}
+	cut := s[:max]
+	for !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + " [truncated]"
+}
+
 func (a *Auth) Append(e AuditEntry) {
+	// R05: the byte caps are enforced here, at the one sink every audit
+	// record passes through, rather than at the individual callers that
+	// remember to have a cap. Field limits keep the retained set bounded in
+	// bytes as well as in entries.
+	e.Actor = auditText(e.Actor, 128)
+	e.Action = auditText(e.Action, 128)
+	e.Target = auditText(e.Target, 256)
+	e.Detail = auditText(e.Detail, 4096)
+
 	// Marshal and write inside the lock. Snapshotting under the lock and
 	// writing outside it lets two appends interleave so the later write lands
 	// an older snapshot, silently dropping an entry - and the audit log is the
@@ -781,10 +833,24 @@ func (a *Auth) requireEvenLockedOut(role string, next http.HandlerFunc) http.Han
 	return a.gate(role, false, next)
 }
 
+// gateState reads the three facts the request gate decides on as ONE snapshot,
+// under one lock. R02 (audit pass 7): gate used to call Enabled() and then
+// SetupRequired() as two separate observations, and the first-account
+// transition can land between them - a request that saw "no users" from the
+// first read and "setup no longer required" from the second walked the
+// development-mode branch without a session on a panel that now enforces
+// auth. An atomic snapshot cannot straddle the transition.
+func (a *Auth) gateState() (enabled, setupRequired bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.enabled, a.setupGate && !a.forced && len(a.users) == 0
+}
+
 func (a *Auth) gate(role string, lockout bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !a.Enabled() {
-			if a.SetupRequired() {
+		enabled, setupRequired := a.gateState()
+		if !enabled {
+			if setupRequired {
 				// Unclaimed, not development: the only routes that stay open
 				// are the ones registered without this gate. Everything else
 				// waits for the first admin, because "no users" must not mean
@@ -794,6 +860,8 @@ func (a *Auth) gate(role string, lockout bool, next http.HandlerFunc) http.Handl
 				})
 				return
 			}
+			// !enabled && !setupRequired can only mean --no-auth: every other
+			// path to a disabled enforcement arms the setup gate.
 			next(w, r)
 			return
 		}

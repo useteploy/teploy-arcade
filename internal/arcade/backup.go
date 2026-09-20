@@ -688,7 +688,11 @@ func tarGz(src, dst string) (int64, error) {
 
 	var walk func(rel string) error
 	walk = func(rel string) error {
-		d, err := root.Open(rel)
+		// O_DIRECTORY|O_NONBLOCK (R15, audit pass 7): a FIFO swapped in where
+		// a directory was expected used to block the plain open for as long
+		// as no writer appeared - with the save-off quiesce held the whole
+		// time.
+		d, err := openDirIn(root, rel)
 		if err != nil {
 			return err
 		}
@@ -713,15 +717,15 @@ func tarGz(src, dst string) (int64, error) {
 			if !fi.IsDir() && !fi.Mode().IsRegular() {
 				return fmt.Errorf("%s is not a regular file; refusing to archive it", child)
 			}
-			hdr, err := tar.FileInfoHeader(fi, "")
-			if err != nil {
-				return err
-			}
-			hdr.Name = filepath.ToSlash(child)
-			if err := tw.WriteHeader(hdr); err != nil {
-				return err
-			}
 			if fi.IsDir() {
+				hdr, err := tar.FileInfoHeader(fi, "")
+				if err != nil {
+					return err
+				}
+				hdr.Name = filepath.ToSlash(child)
+				if err := tw.WriteHeader(hdr); err != nil {
+					return err
+				}
 				if err := walk(child); err != nil {
 					return err
 				}
@@ -737,10 +741,28 @@ func tarGz(src, dst string) (int64, error) {
 				in.Close()
 				return fmt.Errorf("%s changed under the archive into a non-regular file", child)
 			}
-			_, err = io.Copy(tw, in)
+			// R29 (audit pass 7): the header describes the DESCRIPTOR's size
+			// and the copy writes exactly that many bytes. The header used to
+			// come from the walk's earlier Lstat while io.Copy ran to EOF, so
+			// a log growing under the archive blew past its declared entry
+			// size and failed the whole backup with tar.ErrWriteTooLong, and
+			// a shrinking file left a short entry. A short read is an error,
+			// not a silently truncated member.
+			hdr, err := tar.FileInfoHeader(st, "")
+			if err != nil {
+				in.Close()
+				return err
+			}
+			hdr.Name = filepath.ToSlash(child)
+			hdr.Size = st.Size()
+			if err := tw.WriteHeader(hdr); err != nil {
+				in.Close()
+				return err
+			}
+			_, err = io.CopyN(tw, in, st.Size())
 			in.Close()
 			if err != nil {
-				return err
+				return fmt.Errorf("%s changed size under the archive: %w", child, err)
 			}
 		}
 		return nil

@@ -900,7 +900,13 @@ class ConsoleController {
       </div>`;
     }).join('');
     list.querySelectorAll('[data-kick]').forEach((b) =>
-      b.addEventListener('click', () => this.sendRaw(`kick ${b.dataset.kick}`)));
+      b.addEventListener('click', () => {
+        const name = b.dataset.kick;
+        // R60: an administrative action is always sent as a command, and the
+        // player name is validated before it is composed onto a console line.
+        if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) { toast('Invalid player name', 'err'); return; }
+        this.sendRaw(`kick ${name}`, { mode: 'command' });
+      }));
   }
 
   send() {
@@ -909,14 +915,19 @@ class ConsoleController {
     this.history.push(text);
     this.histIdx = -1;
     this.input.value = '';
-    this.sendRaw(text);
+    // The chat toggle only governs free-typed input. Typed administrative
+    // actions (R60, audit pass 7) pass their mode explicitly, so a Kick
+    // clicked while Chat mode happens to be on can never broadcast
+    // "say kick <player>" instead of kicking.
+    this.sendRaw(text, { mode: this.chat ? 'say' : 'command' });
   }
 
-  sendRaw(text) {
+  sendRaw(text, { mode = 'command' } = {}) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) { toast('Not connected', 'err'); return; }
     this.ws.send(JSON.stringify({
-      t: 'command', id: String(Date.now()), text,
-      mode: this.chat ? 'say' : 'command', actor: 'panel',
+      // Collision-resistant rather than a bare timestamp: two sends inside
+      // one millisecond used to share an ack id (R60).
+      t: 'command', id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2)), text, mode,
     }));
     this.setAutoscroll(true);
     this.toBottom(true);
@@ -1461,6 +1472,13 @@ async function router(force) {
   const same = next.name === state.route.name && next.id === state.route.id;
   state.route = next;
 
+  // R58 (audit pass 7): every navigation takes a generation. The view
+  // factories below await their data, and the newest navigation used to be
+  // writable by the OLDEST one's slow fetch - navigate A (slow) then B, and
+  // A mounted after B, showing the wrong server. A stale generation tears
+  // down its candidate and mounts nothing.
+  const generation = ++routerGeneration;
+
   if (state.console) { state.console.destroy(); state.console = null; }
 
   const host = $('#view');
@@ -1492,6 +1510,11 @@ async function router(force) {
     default: el = viewServers(); break;
   }
 
+  if (generation !== routerGeneration) {
+    if (el) el.dispatchEvent(new CustomEvent('gss:teardown'));
+    return;
+  }
+
   host.innerHTML = '';
   host.appendChild(el);
   applyRole(host);
@@ -1499,6 +1522,9 @@ async function router(force) {
   renderTabstrip();
   void same; void force;
 }
+
+// Incremented by every router() call; only the latest generation may mount.
+let routerGeneration = 0;
 
 // ------------------------------------------------------------------- roles
 

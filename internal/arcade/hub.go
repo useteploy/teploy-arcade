@@ -147,6 +147,21 @@ func (h *Hub) Join(roomID string, c *Conn) (replay []Line, seq int64, capacity i
 	return replay, r.seq, ringSize
 }
 
+// Dead reports whether this room is a deletion tombstone. Dead is terminal -
+// DropRoom is the only writer and a tombstone never revives - so a positive
+// answer stays true for the life of the process. R11 (audit pass 7): a join
+// that lands on a dead room used to leave the upgraded console socket open
+// with nothing feeding it; the caller can now detect it and close promptly.
+func (h *Hub) Dead(roomID string) bool {
+	r, ok := h.lookup(roomID)
+	if !ok {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.dead
+}
+
 func (h *Hub) Leave(roomID string, c *Conn) {
 	// The room is often already gone: DropRoom closes every socket, and each
 	// reader then runs its deferred Leave. Closing the conn is still required -

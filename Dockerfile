@@ -10,7 +10,10 @@ RUN CGO_ENABLED=0 go build -trimpath \
       -o /out/teploy-arcade ./cmd/teploy-arcade
 
 # Run
-FROM alpine:3.20
+# R70 (audit pass 7): Alpine 3.20 left scheduled support in April 2026;
+# 3.24 is a supported branch. The runtime packages (docker-cli,
+# ca-certificates, tzdata) re-resolve from 3.24's repos on every build.
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates docker-cli tzdata
 WORKDIR /app
 # The frontend is embedded in the binary, so nothing else ships.

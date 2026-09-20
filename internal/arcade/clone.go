@@ -192,13 +192,42 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 			job.fail(fmt.Errorf("could not quiesce %s for cloning: %v", src.Name, err))
 			return
 		}
-		defer resume()
+		// R27 (audit pass 7): the resume result is part of the clone's
+		// result. A bare `defer resume()` discarded its error, so a clone
+		// could report success with the source still holding save-off - the
+		// source's world silently unsaveable until somebody noticed. The
+		// copy finishing and the source being safely resumed are separate
+		// outcomes, and both have to be true before the job is done.
+		resumed := false
+		resumeOrFail := func() error {
+			if resumed {
+				return nil
+			}
+			resumed = true
+			if rerr := resume(); rerr != nil {
+				m.panelLine(src, "error", "Clone finished, but world saves could NOT be resumed - run save-on from the console.")
+				return rerr
+			}
+			return nil
+		}
+		defer func() { _ = resumeOrFail() }()
 
 		if err := copyTreeFiltered(srcDir, dst, job, cloneSkip); err != nil {
 			// A half-copied tree is a server that boots on a truncated world.
 			_ = os.RemoveAll(dst)
 			m.releaseReservation(lease)
 			job.fail(friendlyFSError(err, "the cloned server"))
+			return
+		}
+
+		// The source must be safely resumed before the clone is allowed to
+		// succeed (R27): registration and job.done only happen when the
+		// save-on landed, and a failed resume fails the job with the copy
+		// still cleaned up - never a green clone over a muted source.
+		if rerr := resumeOrFail(); rerr != nil {
+			_ = os.RemoveAll(dst)
+			m.releaseReservation(lease)
+			job.fail(fmt.Errorf("copied the files but could not resume world saves on %s: %w", src.Name, rerr))
 			return
 		}
 

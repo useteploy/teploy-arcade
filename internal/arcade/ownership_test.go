@@ -24,16 +24,21 @@ import (
 
 // withChownRecorder makes the process look like root and records what it would
 // have handed over, so the logic is testable without actually being root.
+// Both seams are recorded: regular files go through Chown, and since R13
+// (audit pass 7) tree repair goes through Lchown so a symlink in the tree
+// changes its own inode, never its target.
 func withChownRecorder(t *testing.T) *[][3]any {
 	t.Helper()
 	calls := &[][3]any{}
-	oldChown, oldEuid := chownFile, geteuid
-	t.Cleanup(func() { chownFile, geteuid = oldChown, oldEuid })
+	oldChown, oldLchown, oldEuid := chownFile, chownLink, geteuid
+	t.Cleanup(func() { chownFile, chownLink, geteuid = oldChown, oldLchown, oldEuid })
 	geteuid = func() int { return 0 }
-	chownFile = func(path string, uid, gid int) error {
+	rec := func(path string, uid, gid int) error {
 		*calls = append(*calls, [3]any{path, uid, gid})
 		return nil
 	}
+	chownFile = rec
+	chownLink = rec
 	return calls
 }
 

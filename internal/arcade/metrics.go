@@ -117,8 +117,13 @@ func (m *Manager) sampleLoop() {
 		var hostMem, hostPlayers int
 
 		for _, s := range m.List() {
+			// R43 (audit pass 7): the quota is copied under the same lock as
+			// the samples. s.CPU was read after the unlock, racing
+			// SetResources - a change between the two reads produced a sample
+			// mixing one limit with another's usage.
 			s.mu.Lock()
 			cpu, mem, players := s.cpuPct, s.memMB, len(s.players)
+			quota := s.CPU
 			running := s.Status == StatusRunning
 			s.mu.Unlock()
 			if !running {
@@ -127,8 +132,10 @@ func (m *Manager) sampleLoop() {
 			m.metrics.push(s.ID, Sample{T: now, CPU: round1(cpu), MemMB: mem, Players: players})
 
 			// host CPU is expressed in vCPU-equivalents so servers with
-			// different limits sum honestly
-			hostCPU += cpu / 100 * s.CPU
+			// different limits sum honestly. s.cpuPct is "percent of the
+			// server's own limit" (see pollStats), so percent/100 * quota is
+			// cores - no second scaling anywhere (R44).
+			hostCPU += cpu / 100 * quota
 			hostMem += mem
 			hostPlayers += players
 		}
