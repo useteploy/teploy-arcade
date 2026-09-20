@@ -1,8 +1,8 @@
 # Open audit items
 
-Unresolved findings for this repository from the ChatGPT-led audit series (2026-09-09 through 2026-09-19, passes 1-6; register: teploy-neutron-lullmail expanded audit). Pass 6 triaged all 43 of its findings: code landed for 42 (A40, supply-chain pinning, excepted - deferred as a program), 0 refuted, and 17 deferred tails are tracked below alongside one pre-existing item. Read this before treating related work as done; update it when you close, defer, or upstream-report an item.
+Unresolved findings for this repository from the ChatGPT-led audit series (2026-09-09 through 2026-09-19, passes 1-7; register: teploy-neutron-lullmail expanded audit). Pass 7 triaged all 74 of its findings: code landed for 37 (several closing their safe half, with the deeper tail carried below), 0 refuted, and 37 deferred - most corroborating deferrals this register already tracks. Read this before treating related work as done; update it when you close, defer, or upstream-report an item.
 
-Open items: 17 P2 improvements + 1 pre-existing P2 (18 total)
+Open items: 17 P2 improvements + 1 pre-existing P2 from pass 6, plus the pass-7 deferral tails listed in their section below.
 
 ## useteploy__teploy-arcade-03 - P2 - Open improvement (pre-existing)
 
@@ -52,6 +52,92 @@ Verification: go build, go vet, full go test ./... and go test -race ./internal/
 10. HIGH boot sweep deleted any file containing .tmp - FIXED: panel temps carry the reserved ".arcade-tmp-" prefix (writeFileAtomic + writeAtomicIn); the sweep removes only that prefix.
 
 Verification: go build, go vet, go test ./..., go test -race ./internal/arcade - all clean (2026-09-12).
+
+## ChatGPT audit pass 7 (2026-09-19, AUDIT-CHATGPT-7.md) - 37 of 74 findings closed in code, 37 deferred, 0 refuted
+
+Reviewed against `329e67e73352aa7f972182ee02bd489d73234d8c` (all 74 findings verified against source first). Regression tests in `internal/arcade/audit7_test.go`. Upstream (teploy-cli-owned) defects: none - all 74 live in this repository.
+
+### Fixed (37)
+
+1. R01 HIGH empty no-auth host passed the loopback guard but bound wildcard - FIXED: canonicalNoAuthHost accepts only literal loopback addresses (localhost normalised, empty host refused) before any worker starts.
+2. R02 HIGH auth-mode checks straddled first-account creation - FIXED: gate() reads enabled/setup-required as ONE snapshot under one lock (gateState); regression test hammers the transition.
+3. R03 MED creation/reset validation disagreed with login limits - FIXED: 128-byte name / 1024-byte password upper bounds enforced at CreateUser, CreateFirstUser and SetPassword, matching authInputOK.
+4. R05 MED audit entries could amplify memory (partial) - FIXED half: every field is byte-capped and UTF-8-safely truncated at the one sink every record passes through. Deferred half below (own mutex/rotated store).
+5. R09 MED MCP HTTP/JSON-RPC accepted malformed requests (partial) - FIXED halves: strict Bearer parsing with an HTTP 401 + WWW-Authenticate at the transport boundary, exactly-one-JSON-value check, jsonrpc version check, MCP ID-shape validation (string/integer; null is a notification and never answered). Deferred half below.
+6. R11 MED WebSocket connections lacked admission control - FIXED: a 64-connection lease acquired before every console upgrade (mirroring the SSE cap); a join onto a deleted server's tombstone room closes the socket promptly (Hub.Dead).
+7. R13 HIGH recursive ownership repair followed symlinks - FIXED: chownTree sets ownership with Lchown (the link's own inode), never Chown through it.
+8. R15 MED directory opens could block on a FIFO - FIXED: ListFiles, the plugin directory listing and the archiver's walk open directories with O_DIRECTORY|O_NONBLOCK before any type check.
+9. R18 HIGH boot recovery discarded staging when reading held originals failed - FIXED: a read error on old/ is no longer the empty case; the staging tree (the only remaining copy) is retained with a loud log line.
+10. R22 MED startup cleanup recognised an overly broad temp suffix - FIXED: the `.tar.gz.part` suffix rule is gone; only the panel's `.arcade-tmp-` prefix is swept.
+11. R24 MED port changes lost restart warnings and later edits erased earlier ones - FIXED: ApplySettings snapshots the pre-edit props before the port moves, adds the live-port restart flag itself, and MERGES into PendingRestart instead of replacing it.
+12. R25 HIGH properties parsing disagreed with Java (partial) - FIXED half: the managed server-port identity is strict - the FINAL occurrence must be a valid port, duplicate keys are refused, and a colon separator is refused as ambiguity. Deferred half below.
+13. R26 HIGH settings advertised as immediate were file-only - FIXED: every file-only key's Applies metadata is now next_restart (whitelist included), with help text saying so; "immediate" returns only with a verified live adapter.
+14. R27 HIGH clone dropped resume errors (partial) - FIXED half: the clone's save-on resume must succeed before registration/job.done; a failed resume fails the job with the copy rolled back and the console told to run save-on. Deferred half: the verified save-state ack contract (A06).
+15. R28 HIGH raw console commands could undermine the backup gate - FIXED: Manager.Send (HTTP, WS, scheduler, MCP) refuses busy while the server's filesystem gate is held exclusively; the quiesce transport bypasses Manager.Send and is unaffected.
+16. R29 MED tar header could describe a different size than the descriptor copied - FIXED: the header and the copy both come from the opened descriptor (hdr.Size = st.Size, io.CopyN); a short read is an error.
+17. R31 HIGH string-prefix path checks mishandled roots and sibling prefixes - FIXED: segment-aware relativeWithin (filepath.Rel) for import containment ("/" is recognised as an ancestor; /data vs /data-other distinguished) and hostPathFor mount translation.
+18. R35 HIGH docker transport errors read as proof of death (partial) - FIXED half: ContainerState tri-state (running/stopped/missing/unknown); Start refuses `docker rm -f` on unknown, Stop/Kill workers leave the state to the still-attached watchers on unknown, watchExit retries on unknown. Deferred half: the typed Engine-API inspector (A24).
+19. R43 MED metrics sampler read s.CPU outside the lock - FIXED: the quota is copied under the same lock as the samples it scales.
+20. R44 MED CPU percentages mixed units and memory parsing was incomplete - FIXED: docker's core-relative percentage is converted to percent-of-quota at ingestion (under the lock with the quota); parseMem handles B/KB/MB/GB/TB (IEC and SI) and refuses the unrecognised.
+21. R46 MED the minimum Java heap could consume the whole container - FIXED: checkJavaMemory refuses <1024 MB effective memory on itzg-convention images (Create, SetResources, Import); jvmHeapMB never clamps the heap back up to the limit.
+22. R47 HIGH the Rust template could expose the image's default RCON password - FIXED: the span is UDP-only so the RCON TCP port is no longer published, and every launch injects RUST_RCON_PASSWORD with the per-launch random secret after template env.
+23. R48 HIGH Rust/Valheim did not describe their persistent paths (partial) - FIXED half: DataPath /steamcmd/rust and /config from the images' published contracts, port env wired. Deferred half: real-image persistence/launch contract tests and migration of pre-existing installs; templates stay preview.
+24. R49 MED Bedrock configured a second listener without declaring the geometry - FIXED: PortSpan 2 (both UDP listeners reserved and published; base 65535 refused at admission).
+25. R51 MED template validation missed catalog uniqueness (partial) - FIXED half: duplicate slugs are reported and the first kept; protocols, span bound and absolute DataPath validated before the catalog publishes. Deferred half: full launch-contract/capability validation.
+26. R54 MED due tasks were silently dropped when slots were full (partial) - FIXED half: a skipped occurrence records its reason on the task (LastErr) instead of vanishing. Deferred half: the durable pending-occurrence queue.
+27. R55 MED scheduler preview and loop disagreed on one-shots - FIXED: a pending one-shot whose moment passed today previews TOMORROW's occurrence - exactly what the loop fires; a completed one-shot previews none.
+28. R57 MED editing a disabled task re-enabled it; toggles overwrote concurrent edits - FIXED: the dialog sends enabled only on create; the toggle PATCHes only {enabled}.
+29. R58 MED a slower route request could overwrite a newer navigation - FIXED: router() takes a generation per navigation; only the newest may mount, stale candidates get gss:teardown.
+30. R60 MED the Kick action inherited chat mode - FIXED: typed administrative actions pass mode explicitly; Kick validates the player name and always sends 'command'; ack IDs are collision-resistant.
+31. R61 MED import UI could select adoption implicitly and retain a stale runtime - FIXED: copy stays selected when space is short (with the reason shown), adoption needs an explicit confirm, and a rescan resets mode/runtime to match the rebuilt controls.
+32. R63 LOW the file UI hid directory truncation - FIXED: a truncated listing renders an explicit incompleteness notice.
+33. R64 HIGH malformed plugin SHA-256 silently disabled verification - FIXED: ExpectedSHA256 refuses malformed digests BEFORE any download; the UI exposes the checksum field with format validation.
+34. R66 LOW small UI affordances claimed unavailable behavior - FIXED: backup-note Cancel cancels; zero free bytes renders as zero (not unknown); the plugin screen's phantom upload claim removed; one in-flight guard for install (click and Enter).
+35. R69 HIGH the release metadata expression rejected every image publication - FIXED: flavor latest=auto with semver tags (the action's own stable-vs-prerelease policy); the invalid `enable=!is_prerelease` raw rule removed.
+36. R70 MED the Alpine runtime base was outside support - FIXED: runtime stage moved to alpine:3.24 (a supported branch); digest pinning stays with A40.
+37. R74 LOW CLI default-path evaluation had side effects before flags decided - FIXED: the default data dir resolves after --version/--help return and only when -data was not given.
+
+### Deferred, with rationale (37)
+
+1. R04 - Login rate limiting / per-account session caps: corroborates A11; needs the idle-vs-active policy the reverted cap attempt documented, plus a per-origin limiter table design.
+2. R05 (tail) - Audit store with its own synchronization and rotated append storage, plus a durable audit-health indication: the byte caps bound the amplification; the store split is a rework of Auth's locking.
+3. R06 - http.CrossOriginProtection + mandatory JSON content type on mutations: corroborates A13; needs the TLS-termination/proxy decision so trusted origins are real.
+4. R07 - Secure-cookie/public-origin configuration: corroborates A13's deployment half; deliberately not X-Forwarded-Proto.
+5. R08 - Typed, scoped MCP tools replacing raw console: corroborates A27; a token/client migration decision.
+6. R09 (tail) - Origin validation per the MCP transport spec and explicit protocol-version negotiation: the strictness that needs no product decision landed; the rest is a client-contract change.
+7. R10 - 202 + durable operation IDs for long HTTP work: corroborates A14/A38; the async-operation resource is an API-shape change.
+8. R12 - Strict JSON decoding (DisallowUnknownFields + one-value + content type) across mutation routes: needs the client migration first (the UI PATCHes stale full objects in places this pass fixed piecemeal).
+9. R14 - Rooted, descriptor-based readers for import copying, player lists and Geyser config: a broadened os.Root refactor of paths that today use readSmall/copyFile by absolute name.
+10. R16 - requireRegistered/editMu as a uniform invariant across every entry point, reads never mkdir: the pass-6 convention extended; a full entry-point sweep with barrier tests.
+11. R17 - Publication-aware AtomicStateWrite (file+dir fsync outcomes) for private state: corroborates A10/A18; callers must handle Published before this lands.
+12. R19 - Durable restore journal (manifest, phases, idempotent rollback): the R1/A07 generalization; crash-injection test harness included.
+13. R20 - Persisted RecoveryRequired interlock blocking start/restore/clone/file mutations until resolved: depends on R19's journal being the thing that arms it.
+14. R21 - Durable deletion tombstones + detach/delete intent split: corroborates A21; API-contract change with A35's dialog.
+15. R23 - Candidate-then-commit transactions for ApplySettings/SetResources/Reorder/retention: corroborates A10's multi-resource half.
+16. R27 (tail) - Verified save-state ack contract per template (command acceptance is not save state): A06 unchanged.
+17. R30 - Cross-server shared-capacity disk reservations keyed by filesystem identity: corroborates A07's reservation-manager design.
+18. R32 - Import parity with Create's invariants + frozen source selection (jar fingerprint, stopped-source policy): import admission redesign.
+19. R33 - Clone freezes the source's complete launch configuration instead of re-deriving from the current template: LaunchSnapshot model.
+20. R34 - Owned, durable, panic-safe import/clone jobs: folds into R10's operation model and A33's worker ownership.
+21. R36 - Centralized bounded docker executor with per-op deadlines and shared daemon-health cache: corroborates A25.
+22. R37 - Re-adoption rebuilds the live binding ledger from actual Docker PortBindings: the AppliedRuntime inspect-and-reserve design; needs the ownership labels.
+23. R38 - One immutable LaunchPlan built once under the start gate (panel-visible read only, daemon path only for the mount): removes the second dynamic probe and the path-space mismatch.
+24. R39 - Strict Geyser detection (enabled regular jar) and a reviewed bounded config parser returning errors, not defaults: needs the config-schema decision.
+25. R40 - Cryptographically random server IDs + exclusive directory claim: the current scheme checks map+disk; the rework is an identity-format decision (deployed hosts embed these IDs in container names).
+26. R41 - Log-follow reconnect with cursor/backoff and a tri-state readiness/health model: corroborates A26 plus a UI state contract.
+27. R42 - Durable DesiredRunning + generation fencing for lifecycle intents: the lifecycle redesign shared with A32/A33.
+28. R45 - Panel-scope vs daemon-host-scope capacity model: needs the remote-daemon deployment decision.
+29. R48 (tail) - Real-image persistence/RCON/port contract tests per native template and migration of pre-existing installs (a template change does not move an existing container's world): the paths landed from the images' published contracts; verification needs boot tests.
+30. R50 - Conservative template-seeding ownership (unknown ledger retains the active file; unique no-replace candidates; durable ledger writes): migration-policy decision.
+31. R52 - Player-list raw-field preservation + a stopped-server identity contract: the ListEntry rewrite to RawMessage records plus an online/offline-mode adapter decision.
+32. R53 - Source-marked player observations (null ping/UUID) and anchored log grammar: observability model change rippling into the UI.
+33. R56 - Typed task steps with cancellation and lifecycle completion waits: corroborates A32; needs the application context from A33.
+34. R59 - One client-side auth-state transition (401 coordinator, stopped reconnects, permission-derived disabling): a frontend rework of the api() wrapper and reconnect loops.
+35. R62 - Optimistic concurrency (ETag/If-Match) for file and settings edits: API contract plus UI draft-preservation design.
+36. R65 - HTTPS-only plugin downloads with audited exceptions and dialed-IP policy: corroborates A37's operator-trust decision.
+37. R67/R68/R71/R72/R73 - Keyboard/focus/skip-link accessibility pass, configured public game-address policy, supply-chain pinning (A40), Run() worker ownership (A33/teploy-arcade-03), and an explicit corrupt-state recovery mode: all corroborate existing register items; unchanged rationale.
+
+Verification (2026-09-19): gofmt clean, go vet clean, go test ./... clean (153s), go test -race ./... clean (259s), node test/routing.test.js 14/14, make build OK.
 
 ## ChatGPT audit pass 6 (2026-09-19, AUDIT-CHATGPT-6.md) - 42 of 43 findings closed in code, 17 deferred tails, 0 refuted
 
