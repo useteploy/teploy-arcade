@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -239,7 +240,7 @@ func (s *Server) Snapshot() map[string]any {
 		"address":         map[string]any{"host": hostAddr, "port": s.Port},
 		"motd":            s.motdLocked(),
 		"last_exit":       lastExit,
-		"pending_restart": s.PendingRestart,
+		"pending_restart": slices.Clone(s.PendingRestart),
 		"created_at":      s.CreatedAt,
 		"settings":        props,
 	}

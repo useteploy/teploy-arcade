@@ -881,7 +881,8 @@ function openClone(sourceId) {
         <div class="muted" style="font-size:11.5px;line-height:1.55">
           Logs, crash reports and the world lock are not copied, and neither are
           markers left by another panel. A running source has its saves paused
-          while the copy runs, the same as a backup.
+          while the copy runs, the same as a backup. Closing this dialog stops
+          progress updates; a started clone continues in the background.
         </div>
         <div id="clProg" hidden style="margin-top:14px">
           <div class="bar"><i id="clBar" style="width:0%"></i></div>
@@ -901,9 +902,27 @@ function openClone(sourceId) {
   </div>`);
 
   $('#modalHost').appendChild(modal);
-  const close = () => modal.remove();
+  const btn = $('#clGo', modal);
+  const cloneLabel = btn.innerHTML;
+  const openedAt = location.hash;
+  let closed = false, busy = false, timer = null, controller = null, job = null;
+  const stop = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (controller) controller.abort();
+    controller = null;
+  };
+  const close = () => {
+    closed = true;
+    stop();
+    window.removeEventListener('hashchange', close);
+    modal.remove();
+  };
   $('#cx', modal).addEventListener('click', close);
   $('#clCancel', modal).addEventListener('click', close);
+  // A dismissed dialog must not retain ownership of a later route, including
+  // Back/Forward followed by a return to the same hash.
+  window.addEventListener('hashchange', close);
 
   // Renaming follows the source until the operator types their own name.
   let nameTouched = false;
@@ -914,48 +933,71 @@ function openClone(sourceId) {
     if (s) $('#clName', modal).value = `${s.name} copy`;
   });
 
-  let timer = null;
-  const stop = () => { if (timer) clearInterval(timer); timer = null; };
-
   $('#clGo', modal).addEventListener('click', async () => {
-    const btn = $('#clGo', modal);
+    if (closed || busy) return;
+    if (location.hash !== openedAt) { close(); return; }
+    busy = true;
     btn.disabled = true;
-    let job;
-    try {
-      job = await api('/api/clone', {
-        method: 'POST',
-        body: JSON.stringify({
-          source: $('#clSrc', modal).value,
-          name: $('#clName', modal).value,
-          port: parseInt($('#clPort', modal).value || '0', 10) || 0,
-        }),
-      });
-    } catch (e) { toast(e.message, 'err'); btn.disabled = false; return; }
+    const request = new AbortController();
+    controller = request;
+    const active = () => !closed && controller === request && location.hash === openedAt;
+    const retry = (message) => {
+      if (!active()) return;
+      stop();
+      busy = false;
+      btn.disabled = false;
+      // A status-fetch failure does not mean the backend clone failed. Keep
+      // its job ID and retry the read instead of creating a second server.
+      btn.innerHTML = job ? 'Retry status' : cloneLabel;
+      toast(message, 'err');
+    };
+    if (!job) {
+      try {
+        job = await api('/api/clone', {
+          method: 'POST',
+          signal: request.signal,
+          body: JSON.stringify({
+            source: $('#clSrc', modal).value,
+            name: $('#clName', modal).value,
+            port: parseInt($('#clPort', modal).value || '0', 10) || 0,
+          }),
+        });
+      } catch (e) { retry(e.message); return; }
+      if (!active()) return;
+    }
 
     $('#clProg', modal).hidden = false;
-    // Polled for the same reason the import is: the copy is the one thing here
-    // that runs for minutes, and the event feed carries server state - this is
-    // not a server yet.
-    timer = setInterval(async () => {
+    // Schedule only after the preceding read finishes: slow requests must not
+    // overlap or let an older response undo completion/error state.
+    const poll = async () => {
+      timer = null;
+      if (!active()) return;
       let j;
-      try { j = await api(`/api/import/${encodeURIComponent(job.id)}`); }
-      catch (e) { stop(); toast(e.message, 'err'); btn.disabled = false; return; }
+      try { j = await api(`/api/import/${encodeURIComponent(job.id)}`, { signal: request.signal }); }
+      catch (e) { retry(e.message); return; }
+      if (!active()) return;
       $('#clBar', modal).style.width = `${j.percent || 0}%`;
       $('#clState', modal).textContent = j.state === 'done' ? 'Done' : j.state === 'failed' ? 'Failed' : 'Copying…';
       $('#clBytes', modal).textContent = j.total_bytes ? `${humanBytes(j.copied_bytes)} of ${humanBytes(j.total_bytes)}` : '';
       $('#clCurrent', modal).textContent = j.error || j.current_file || '';
-      if (j.state === 'running') return;
-      stop();
-      if (j.state !== 'done') { toast(j.error || 'The clone failed.', 'err'); btn.disabled = false; return; }
-      toast(`Cloned ${j.name}`);
+      if (j.state === 'running') { timer = setTimeout(poll, 700); return; }
+      if (j.state !== 'done') {
+        job = null;
+        retry(j.error || 'The clone failed.');
+        return;
+      }
       try {
-        const d = await api('/api/servers');
+        const d = await api('/api/servers', { signal: request.signal });
+        if (!active()) return;
         state.servers = d.servers;
         state.host = d.host;
       } catch { /* the feed will catch up */ }
+      if (!active()) return;
+      toast(`Cloned ${j.name}`);
       close();
       location.hash = `#/s/${j.server_id}/dashboard`;
-    }, 700);
+    };
+    timer = setTimeout(poll, 700);
   });
 }
 

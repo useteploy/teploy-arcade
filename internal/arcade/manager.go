@@ -1979,10 +1979,8 @@ func (m *Manager) sampleHostCPU() {
 	m.usageMu.Lock()
 	prev := m.lastCPU
 	m.lastCPU = cur
-	if prev.total > 0 && cur.total > prev.total {
-		busy := float64(cur.busy - prev.busy)
-		total := float64(cur.total - prev.total)
-		m.hostCPU = busy / total * 100
+	if usage, ok := cpuUsagePercent(prev, cur); ok {
+		m.hostCPU = usage
 	}
 	m.usageMu.Unlock()
 }

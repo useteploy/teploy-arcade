@@ -52,3 +52,18 @@ func diskUsedGB(dir string) int {
 	}
 	return int((total - avail) / (1 << 30))
 }
+
+// cpuUsagePercent rejects first samples and counter resets/wraps. A falling
+// iowait counter can also make busy advance more than total; do not publish
+// that inconsistent interval as a percentage above 100.
+func cpuUsagePercent(prev, cur cpuSample) (float64, bool) {
+	if prev.total == 0 || cur.total <= prev.total || cur.busy < prev.busy ||
+		prev.busy > prev.total || cur.busy > cur.total {
+		return 0, false
+	}
+	busy, total := cur.busy-prev.busy, cur.total-prev.total
+	if busy > total {
+		return 0, false
+	}
+	return float64(busy) / float64(total) * 100, true
+}

@@ -64,7 +64,8 @@ when writable and `./data` otherwise; delete it to start over. First run seeds
 five servers so the panel isn't empty.
 
 ```sh
-make test                # 20 tests, ~20s
+make test                # Go tests, then all frontend regression scripts
+make test-frontend       # Node-only routing, modal lifecycle and Makefile guards
 ```
 
 On first run the panel is **open** — no users, loopback only, no ceremony. Create

@@ -4,6 +4,71 @@ Unresolved findings for this repository from the ChatGPT-led audit series (2026-
 
 Open items: 17 P2 improvements + 1 pre-existing P2 from pass 6, plus the pass-7 deferral tails listed in their section below.
 
+## Local fix continuation (2026-10-06; publication pending)
+
+The October audit finding IDs below are from the additive Arcade/Sandbox audit of
+`2d0eef99f974a3ae89202d1bce004c6956a94707`; they are distinct from similarly
+numbered historical pass findings. These fixes are prepared and tested locally,
+not confirmed on the remote branch or deployed. Existing deferred items remain open.
+
+- **October A-04 — clone dialog lifecycle: fixed locally.** Cancel, X, and hash
+  navigation dispose the dialog, clear its timer, abort active UI requests, and
+  remove its navigation listener. Every async continuation checks ownership
+  before updating progress, shared server state, success messages, or the route.
+  Polling is serialized with timeouts. A failed status read offers Retry status
+  for the same job ID instead of submitting another clone. Closing progress does
+  not cancel an already-started backend clone; the dialog now says so.
+- **October A-05 — duplicate task Save: fixed locally.** One in-flight guard covers
+  repeated activation and disables Save during a create or edit. Failure restores
+  controls for an explicit retry; dismissal/navigation aborts the UI request and
+  suppresses stale completion callbacks/messages. The initial focus timer is
+  cleared on close. Disabled-task edits still omit `enabled` (R57).
+- **October A-08 — Makefile test failure masking: fixed locally.** Node presence
+  is checked separately from script success. The phony `test-frontend` target
+  runs all `test/*.test.js` scripts and stops on a failing status; `test` invokes
+  it only after Go succeeds. CI now invokes the same frontend target.
+
+Verification: `make test-frontend` passed 14 existing routing cases and existing
+rail/script/stylesheet/icon guards, 25 new exact-source modal lifecycle cases,
+and 6 hermetic Makefile cases. All five shipped JS modules and three test scripts
+passed `node --check`. Selected regression tests fail against the unchanged base
+for leaked clone polling, duplicate task POST/PATCH, and masked frontend failure.
+The Makefile fixture substitutes a fake Go executable; it does not run Go tests.
+
+Remaining gates: real browser/keyboard/focus/viewport verification, full Go
+build/test/vet/race, backend integration, remote publication and CI on the new
+revision. UI guards do not provide backend idempotency after an uncertain POST
+response or a separately reopened submission; that requires a server contract.
+
+## Local fix continuation — backend patch (2026-10-06; publication pending)
+
+From `AUDIT_BACKEND_2026-10-06.md` (base `2d0eef9`), reconciled into this
+register at landing. Go gate executed 2026-10-06 (go1.26.6, daemon-free env):
+gofmt/build/vet clean; all ten `TestBackend*` regressions PASS plain and under
+`-race`; full unit + race suites show only `TestAnImportedServerRunsItsOwnJar`
+failing — environmental (live Docker required), reproduced identically on the
+pristine base worktree, so the patch introduces zero regressions.
+
+- **October A-01 — exact missing-container classification: fixed locally.**
+  Container-only inspect admits the daemon's exact missing-container response
+  (CLI exit 1, no stdout result, active context) as Missing; start's cleanup
+  path admits only Missing/Stopped; unknown enum values refused.
+- **October ARCADE-R43 — PendingRestart slice: fixed locally.** Snapshot clones
+  the slice under `s.mu`, preserving nil-vs-empty; detached-reader,
+  caller-mutation, SetResources append/sort and concurrent-encoding
+  regressions added.
+- **October A-06 — near-zero Linux memory arithmetic: fixed locally.** Field
+  presence distinguished from zero availability; subtract before whole-MiB
+  conversion; invalid measurements keep the zero fallback.
+- **October A-07 — guest CPU accounting: fixed locally.** First eight
+  nonduplicated counters summed; reset/wrap cannot underflow busy usage;
+  malformed/overflowed samples rejected.
+
+Remaining gates after this landing: live Docker lifecycle (the imported-server
+jar test), real browser/keyboard verification, remote publication and CI on the
+new revision. Typed Engine API migration and CLI-version acceptance remain open
+under R35/A24; nullable/freshness-aware host API under R45.
+
 ## useteploy__teploy-arcade-03 - P2 - Open improvement (pre-existing)
 
 **Make panel startup and shutdown own all spawned background workers**

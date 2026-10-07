@@ -25,8 +25,8 @@ jobs:
       # more than once. It is not optional here.
       - run: go test -race ./...
       # The frontend is plain files served from the binary, so its guards are a
-      # node script rather than a test framework.
+      # dependency-free Node scripts rather than a frontend build framework.
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: node test/routing.test.js
+      - run: make test-frontend

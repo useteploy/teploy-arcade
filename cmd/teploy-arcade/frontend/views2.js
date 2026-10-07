@@ -431,9 +431,19 @@ function taskDialog(serverId, task, onSaved) {
   </div>`);
 
   $('#modalHost').appendChild(modal);
-  const close = () => modal.remove();
+  const save = $('#save', modal);
+  const openedAt = location.hash;
+  let closed = false, saving = false, controller = null, focusTimer = null;
+  const close = () => {
+    closed = true;
+    if (focusTimer !== null) clearTimeout(focusTimer);
+    if (controller) controller.abort();
+    window.removeEventListener('hashchange', close);
+    modal.remove();
+  };
   $('#x', modal).addEventListener('click', close);
   $('#back', modal).addEventListener('click', close);
+  window.addEventListener('hashchange', close);
 
   const rep = $('#tRepeat', modal);
   rep.addEventListener('click', (e) => {
@@ -442,7 +452,15 @@ function taskDialog(serverId, task, onSaved) {
     rep.classList.toggle('is-on', on); rep.classList.toggle('is-off', !on);
   });
 
-  $('#save', modal).addEventListener('click', async () => {
+  save.addEventListener('click', async () => {
+    // The flag also covers queued/programmatic activation, which disabling
+    // the native button alone does not guard.
+    if (closed || saving) return;
+    if (location.hash !== openedAt) { close(); return; }
+    saving = true;
+    save.disabled = true;
+    save.textContent = 'Saving…';
+    controller = new AbortController();
     const body = {
       name: $('#tName', modal).value.trim(),
       commands: $('#tCmd', modal).value.trim(),
@@ -456,17 +474,27 @@ function taskDialog(serverId, task, onSaved) {
     if (!editing) body.enabled = true;
     try {
       if (editing) {
-        await api(`/api/servers/${serverId}/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+        await api(`/api/servers/${serverId}/tasks/${task.id}`, { method: 'PATCH', body: JSON.stringify(body), signal: controller.signal });
       } else {
-        await api(`/api/servers/${serverId}/tasks`, { method: 'POST', body: JSON.stringify(body) });
+        await api(`/api/servers/${serverId}/tasks`, { method: 'POST', body: JSON.stringify(body), signal: controller.signal });
       }
+      if (closed || location.hash !== openedAt) return;
       close();
       toast(editing ? 'Task updated' : 'Task created');
       onSaved();
-    } catch (e) { toast(e.message, 'err'); }
+    } catch (e) {
+      if (!closed && location.hash === openedAt) toast(e.message, 'err');
+    } finally {
+      saving = false;
+      controller = null;
+      if (!closed) { save.disabled = false; save.textContent = 'Save'; }
+    }
   });
 
-  setTimeout(() => $('#tName', modal).focus(), 30);
+  focusTimer = setTimeout(() => {
+    focusTimer = null;
+    if (!closed && location.hash === openedAt) $('#tName', modal).focus();
+  }, 30);
 }
 
 Object.assign(window.extraViews, { viewPlayers, viewScheduler, viewServerDashboard });

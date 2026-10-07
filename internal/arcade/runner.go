@@ -3,6 +3,7 @@ package arcade
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -974,7 +975,9 @@ func (r *dockerRunner) Start(s *Server, emit func(Line)) error {
 	switch containerState(s.ID) {
 	case ContainerRunning:
 		return fmt.Errorf("a container for this server is already running; the panel will re-attach to it")
-	case ContainerUnknown:
+	case ContainerMissing, ContainerStopped:
+		// Only these two observations authorize clearing a leftover.
+	default:
 		return fmt.Errorf("docker could not be asked whether this server's container exists; refusing to clear it blind - try again when the daemon answers")
 	}
 	_ = exec.Command("docker", "rm", "-f", name).Run()
@@ -1042,9 +1045,29 @@ const (
 var containerState = func(id string) ContainerState {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}",
-		containerPrefix+"-"+id).Output()
+	return inspectContainerState(ctx, id)
+}
+
+// inspectContainerState keeps inspection container-only: generic inspect can
+// fall through to images/networks and issue extra daemon requests. Until the
+// typed Engine inspector (A24) lands, accept only the exact CLI not-found
+// response for this name, with status 1 and no successful output. Never use a
+// substring such as "not found": missing sockets, credentials or contexts do
+// not prove that a container is absent. Unrecognized CLI variants fail closed.
+func inspectContainerState(ctx context.Context, id string) ContainerState {
+	name := containerPrefix + "-" + id
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "--type", "container",
+		"-f", "{{.State.Running}}", name).Output()
+	if ctx.Err() != nil {
+		return ContainerUnknown
+	}
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 &&
+			strings.TrimSpace(string(out)) == "" &&
+			strings.TrimSpace(string(exitErr.Stderr)) == "Error response from daemon: No such container: "+name {
+			return ContainerMissing
+		}
 		return ContainerUnknown
 	}
 	switch strings.TrimSpace(string(out)) {

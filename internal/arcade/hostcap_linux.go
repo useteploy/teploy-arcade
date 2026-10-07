@@ -73,37 +73,57 @@ func memTotalMB() int {
 	return best
 }
 
-// memUsedMB reports memory actually in use, from the same source as memTotalMB
-// so the two agree.
-//
-// MemTotal - MemAvailable, not MemFree: page cache is free for the asking, and
-// reporting it as used makes a healthy box look full.
+// memUsedMB reports usage from /proc/meminfo. This is host/LXC memory, not
+// necessarily the cgroup-limited capacity returned by memTotalMB (R45).
+// MemAvailable includes reclaimable page cache; MemFree alone does not.
 func memUsedMB() int {
 	b, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return 0
 	}
-	var total, avail int
-	for _, ln := range strings.Split(string(b), "\n") {
+	used, _ := parseMemUsedMB(string(b))
+	return used
+}
+
+// parseMemUsedMB separates unavailable/malformed fields from valid zero
+// availability. Subtract in kB before converting to whole MiB; rounding each
+// field first loses the near-exhausted state and can overstate usage.
+func parseMemUsedMB(meminfo string) (int, bool) {
+	var total, avail uint64
+	var haveTotal, haveAvail bool
+	for _, ln := range strings.Split(meminfo, "\n") {
 		f := strings.Fields(ln)
-		if len(f) < 2 {
+		if len(f) == 0 || (f[0] != "MemTotal:" && f[0] != "MemAvailable:") {
 			continue
 		}
-		n, err := strconv.Atoi(f[1])
+		if len(f) != 3 || f[2] != "kB" {
+			return 0, false
+		}
+		n, err := strconv.ParseUint(f[1], 10, 64)
 		if err != nil {
-			continue
+			return 0, false
 		}
 		switch f[0] {
 		case "MemTotal:":
-			total = n / 1024
+			if haveTotal {
+				return 0, false
+			}
+			total, haveTotal = n, true
 		case "MemAvailable:":
-			avail = n / 1024
+			if haveAvail {
+				return 0, false
+			}
+			avail, haveAvail = n, true
 		}
 	}
-	if total <= 0 || avail <= 0 || avail > total {
-		return 0
+	if !haveTotal || !haveAvail || total == 0 || avail > total {
+		return 0, false
 	}
-	return total - avail
+	used := (total - avail) / 1024
+	if used > uint64(^uint(0)>>1) {
+		return 0, false
+	}
+	return int(used), true
 }
 
 // cpuSample is one reading of the host's cumulative CPU counters.
@@ -117,18 +137,41 @@ func readCPUSample() (cpuSample, bool) {
 	if err != nil {
 		return cpuSample{}, false
 	}
-	for _, ln := range strings.Split(string(b), "\n") {
-		if !strings.HasPrefix(ln, "cpu ") {
+	return parseCPUSample(string(b))
+}
+
+func parseCPUSample(stat string) (cpuSample, bool) {
+	for _, ln := range strings.Split(stat, "\n") {
+		fields := strings.Fields(ln)
+		if len(fields) == 0 || fields[0] != "cpu" {
 			continue
 		}
-		var s cpuSample
-		for i, f := range strings.Fields(ln)[1:] {
+		// user, nice, system and idle are required. Linux appends optional
+		// iowait, irq, softirq, steal, guest and guest_nice counters.
+		if len(fields) < 5 || len(fields) > 11 {
+			return cpuSample{}, false
+		}
+		var counters [10]uint64
+		for i, f := range fields[1:] {
 			n, err := strconv.ParseUint(f, 10, 64)
 			if err != nil {
-				continue
+				return cpuSample{}, false
+			}
+			counters[i] = n
+		}
+		// guest/guest_nice are already included in user/nice by the kernel.
+		// Including them again inflates both busy and total CPU time.
+		if counters[8] > counters[0] || counters[9] > counters[1] {
+			return cpuSample{}, false
+		}
+		var s cpuSample
+		for i, n := range counters[:8] {
+			if n > ^uint64(0)-s.total {
+				return cpuSample{}, false
 			}
 			s.total += n
-			// Fields 3 and 4 are idle and iowait; everything else is work.
+			// Keep the existing policy: idle/iowait are non-busy; steal is
+			// busy/unavailable host capacity, alongside user/system/IRQs.
 			if i != 3 && i != 4 {
 				s.busy += n
 			}
