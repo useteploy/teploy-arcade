@@ -366,12 +366,13 @@ func TestR51DuplicateSlugsAndBadGeometryAreRefused(t *testing.T) {
 	write("badspan.json", `{"slug":"badspan","name":"S","image":"e","versions":["1"],"memory_mb":1024,"cpu":1,"port_span":40}`)
 	write("badpath.json", `{"slug":"badpath","name":"D","image":"e","versions":["1"],"memory_mb":1024,"cpu":1,"data_path":"relative/path"}`)
 
+	before := allTemplates()
 	err := LoadTemplates(dataDir)
 	if err == nil || !strings.Contains(err.Error(), "duplicate template slug") {
 		t.Fatalf("duplicate slugs were not reported: %v", err)
 	}
-	if templateBySlug("dup") == nil {
-		t.Error("the surviving duplicate was dropped from the catalog")
+	if templateBySlug("dup") != nil || len(allTemplates()) != len(before) {
+		t.Error("invalid candidate replaced the previous valid catalog")
 	}
 	for _, slug := range []string{"badproto", "badspan", "badpath"} {
 		if templateBySlug(slug) != nil {
@@ -497,9 +498,12 @@ func TestR09MCPRejectsTrailingDataAndBadIDs(t *testing.T) {
 	if _, body := post(`{"jsonrpc":"2.0","id":1,"method":"ping"}{"jsonrpc":"2.0","id":2,"method":"ping"}`); !strings.Contains(body, "exactly one JSON-RPC request") {
 		t.Errorf("concatenated requests were not refused: %s", body)
 	}
-	// MCP forbids null IDs; a notification never gets a response body.
-	if code, body := post(`{"jsonrpc":"2.0","id":null,"method":"ping"}`); code != http.StatusAccepted || body != "" {
-		t.Errorf("null ID: status %d body %q, want 202 with no body", code, body)
+	// MCP forbids null IDs; only an absent ID is a notification.
+	if _, body := post(`{"jsonrpc":"2.0","id":null,"method":"ping"}`); !strings.Contains(body, "id must be a string or an integer") {
+		t.Errorf("null ID accepted: %s", body)
+	}
+	if code, body := post(`{"jsonrpc":"2.0","method":"ping"}`); code != http.StatusAccepted || body != "" {
+		t.Errorf("notification: status %d body %q", code, body)
 	}
 	// Fractional IDs are refused with the standard invalid-request code.
 	if _, body := post(`{"jsonrpc":"2.0","id":1.5,"method":"ping"}`); !strings.Contains(body, "id must be a string or an integer") {

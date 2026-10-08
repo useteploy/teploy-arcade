@@ -2,6 +2,7 @@ package arcade
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -132,20 +133,21 @@ type ImportRequest struct {
 // be an HTTP request: the browser gives up, the operator presses the button
 // again, and two copies race into the same directory.
 type ImportJob struct {
-	ID       string `json:"id"`
-	Path     string `json:"path"`
-	Mode     string `json:"mode"`
-	Name     string `json:"name"`
-	State    string `json:"state"`
-	Total    int64  `json:"total_bytes"`
-	Copied   int64  `json:"copied_bytes"`
-	Percent  int    `json:"percent"`
-	Current  string `json:"current_file"`
-	Skipped  int    `json:"skipped_links"`
-	ServerID string `json:"server_id"`
-	Error    string `json:"error"`
-	Started  int64  `json:"started"`
-	Finished int64  `json:"finished"`
+	RequestHash string `json:"request_hash,omitempty"`
+	ID          string `json:"id"`
+	Path        string `json:"path"`
+	Mode        string `json:"mode"`
+	Name        string `json:"name"`
+	State       string `json:"state"`
+	Total       int64  `json:"total_bytes"`
+	Copied      int64  `json:"copied_bytes"`
+	Percent     int    `json:"percent"`
+	Current     string `json:"current_file"`
+	Skipped     int    `json:"skipped_links"`
+	ServerID    string `json:"server_id"`
+	Error       string `json:"error"`
+	Started     int64  `json:"started"`
+	Finished    int64  `json:"finished"`
 }
 
 // ---------------------------------------------------------------- detection
@@ -771,8 +773,11 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	}
 
 	runtime := req.Runtime
-	if runtime != RuntimeDocker {
+	if runtime == "" {
 		runtime = RuntimeSim
+	}
+	if runtime != RuntimeSim && runtime != RuntimeDocker {
+		return nil, fmt.Errorf("unknown runtime %q", runtime)
 	}
 	if runtime == RuntimeDocker && !dockerAvailable() {
 		return nil, fmt.Errorf("docker is not reachable on this host")
@@ -809,6 +814,24 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	if err := checkJavaMemory(s.Image, s.MemoryMB); err != nil {
 		return nil, err
 	}
+	if err := checkFitsDaemon(s.Runtime, s.MemoryMB, s.CPU); err != nil {
+		return nil, err
+	}
+	if err := checkFitsRuntime(s.Runtime, s.MemoryMB, s.CPU); err != nil {
+		return nil, err
+	}
+	sourceStamp, err := stampImportSource(m.ctx, sc.Path, sc.Jar)
+	if err != nil {
+		return nil, err
+	}
+	if err := stoppedImportSource(sc.Path); err != nil {
+		return nil, err
+	}
+	if content, ok := readSmall(filepath.Join(sc.Path, "server.properties")); ok {
+		if err := validateCanonicalProps(content); err != nil {
+			return nil, err
+		}
+	}
 	applyImportedProps(s, sc, port)
 
 	dst := filepath.Join(m.dataDir, "servers", s.ID)
@@ -821,6 +844,14 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	}
 
 	if mode == ImportAdopt {
+		releaseSource, err := lockImportSource(sc.Path)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseSource()
+		if err := sourceStamp.verify(m.ctx, sc.Path, true); err != nil {
+			return nil, err
+		}
 		// finishImport's writeProps rewrites the operator's OWN
 		// server.properties with the panel's chosen port. If persistence
 		// then fails, the external file must go back exactly as it was -
@@ -845,6 +876,10 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 			return nil, err
 		}
 		job := newImportJob(sc, mode, name)
+		if err := m.trackImportJob(job); err != nil {
+			_ = os.Remove(dst)
+			return nil, err
+		}
 		claimHeld = false // the server now holds the port
 		if err := m.finishImport(job, s, sc, lease, actor); err != nil {
 			if oldExists {
@@ -863,9 +898,49 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	}
 
 	job := newImportJob(sc, mode, name)
+	job.ctx = m.ctx
+	job.sourceDirectory = sourceStamp.directory
+	if err := m.trackImportJob(job); err != nil {
+		return nil, err
+	}
 	claimHeld = false // the goroutine owns the claim now: it releases on failure
-	go func() {
-		defer recoverPanic("import copy of " + sc.Path)
+	if !m.own(func() {
+		defer m.releaseReservation(lease)
+		defer func() {
+			if r := recover(); r != nil {
+				job.fail(fmt.Errorf("import interrupted by internal panic"))
+			}
+		}()
+		release, err := acquireCapacity(m.ctx, m.dataDir)
+		if err != nil {
+			job.fail(err)
+			return
+		}
+		defer release()
+		if free, err := diskFree(m.dataDir); err != nil || free < sc.SizeBytes+importFreeMargin {
+			job.fail(fmt.Errorf("insufficient measurable free space for import"))
+			return
+		}
+		releaseSource, err := lockImportSource(sc.Path)
+		if err != nil {
+			job.fail(err)
+			return
+		}
+		defer releaseSource()
+		if err := sourceStamp.verify(m.ctx, sc.Path, true); err != nil {
+			job.fail(err)
+			return
+		}
+		if err := claimServerDirectory(dst); err != nil {
+			job.fail(err)
+			return
+		}
+		registered := false
+		defer func() {
+			if !registered {
+				_ = os.RemoveAll(dst)
+			}
+		}()
 		if err := copyTree(sc.Path, dst, job); err != nil {
 			// A half-copied tree is a server that boots on a truncated world.
 			// Leave nothing rather than something that looks importable.
@@ -874,6 +949,11 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 			// panel restarts.
 			m.releaseReservation(lease)
 			job.fail(friendlyFSError(err, "the imported server"))
+			return
+		}
+		if err := sourceStamp.verify(m.ctx, dst, false); err != nil {
+			_ = os.RemoveAll(dst)
+			job.fail(err)
 			return
 		}
 		// Copied by root, so the imported tree is root's however the operator's
@@ -886,8 +966,14 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 			_ = os.RemoveAll(dst)
 			m.releaseReservation(lease)
 			job.fail(err)
+		} else {
+			registered = true
 		}
-	}()
+	}) {
+		m.releaseReservation(lease)
+		job.fail(context.Canceled)
+		return nil, context.Canceled
+	}
 
 	view := job.view()
 	return &view, nil
@@ -944,6 +1030,8 @@ func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, lease st
 	// Rollback can then never yank a tree out from under a process the panel
 	// just started. No fsMu is reachable from inside this section.
 	m.lifecycle.Lock()
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	defer m.lifecycle.Unlock()
 
 	m.mu.Lock()
@@ -966,7 +1054,7 @@ func (m *Manager) finishImport(j *importJob, s *Server, sc *ImportScan, lease st
 		m.mu.Unlock()
 	}
 
-	if err := m.Save(); err != nil {
+	if err := m.saveHeld(); err != nil {
 		rollbackRegistration()
 		return fmt.Errorf("could not persist the imported server: %w", err)
 	}
@@ -1009,6 +1097,20 @@ func copyTree(src, dst string, j *importJob) error {
 // copyTreeFiltered copies src to dst, skipping what skip reports. A skipped
 // directory is not descended into.
 func copyTreeFiltered(src, dst string, j *importJob, skip func(rel string, d fs.DirEntry) bool) error {
+	source, err := os.OpenRoot(src)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	if j.sourceDirectory != nil {
+		now, err := source.Stat(".")
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(now, j.sourceDirectory) {
+			return fmt.Errorf("source directory changed before copy")
+		}
+	}
 	buf := make([]byte, copyBufBytes)
 	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -1034,6 +1136,10 @@ func copyTreeFiltered(src, dst string, j *importJob, skip func(rel string, d fs.
 			}
 			return os.MkdirAll(target, perm)
 		}
+		if d.Name() == "session.lock" {
+			j.skip()
+			return nil
+		}
 		if !d.Type().IsRegular() {
 			j.skip()
 			return nil
@@ -1043,7 +1149,26 @@ func copyTreeFiltered(src, dst string, j *importJob, skip func(rel string, d fs.
 			return err
 		}
 		j.setCurrent(rel)
-		return copyFile(p, target, info.Mode().Perm(), buf, j)
+		in, _, err := openRegularIn(source, rel)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		before, err := in.Stat()
+		if err != nil {
+			return err
+		}
+		if err := copyFromFile(in, target, info.Mode().Perm(), buf, j); err != nil {
+			return err
+		}
+		after, err := in.Stat()
+		if err != nil {
+			return err
+		}
+		if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+			return fmt.Errorf("source changed during copy: %s; stop its writer and retry", rel)
+		}
+		return nil
 	})
 }
 
@@ -1053,6 +1178,10 @@ func copyFile(src, dst string, perm os.FileMode, buf []byte, j *importJob) error
 		return err
 	}
 	defer in.Close()
+	return copyFromFile(in, dst, perm, buf, j)
+}
+
+func copyFromFile(in *os.File, dst string, perm os.FileMode, buf []byte, j *importJob) error {
 	// O_EXCL: the destination was verified empty before the copy started, so
 	// anything already at this path means a second import is writing into the
 	// same tree and the result would be two servers interleaved.
@@ -1061,6 +1190,20 @@ func copyFile(src, dst string, perm os.FileMode, buf []byte, j *importJob) error
 		return err
 	}
 	for {
+		if j.ctx != nil {
+			if err := j.ctx.Err(); err != nil {
+				out.Close()
+				return err
+			}
+		}
+		if copied := j.copied.Load(); copied >= j.nextCapacityCheck {
+			free, err := diskFree(filepath.Dir(dst))
+			if err != nil || free < importFreeMargin+int64(len(buf)) {
+				out.Close()
+				return fmt.Errorf("copy stopped before consuming the shared disk safety margin")
+			}
+			j.nextCapacityCheck = copied + (8 << 20)
+		}
 		n, rerr := in.Read(buf)
 		if n > 0 {
 			if _, werr := out.Write(buf[:n]); werr != nil {
@@ -1077,6 +1220,10 @@ func copyFile(src, dst string, perm os.FileMode, buf []byte, j *importJob) error
 			return rerr
 		}
 	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		return err
+	}
 	return out.Close()
 }
 
@@ -1092,19 +1239,19 @@ var importJobs = struct {
 }{jobs: map[string]*importJob{}}
 
 type importJob struct {
-	mu     sync.Mutex
-	pub    ImportJob
-	copied atomic.Int64
+	mu                sync.Mutex
+	ctx               context.Context
+	sourceDirectory   os.FileInfo
+	nextCapacityCheck int64
+	storePath         string
+	pub               ImportJob
+	copied            atomic.Int64
 }
 
 func newImportJob(sc *ImportScan, mode, name string) *importJob {
 	id, err := randomHex(8)
 	if err != nil {
-		// Falling back to a predictable id would let one operator poll another's
-		// import; a clock-derived one is not guessable enough to matter here but
-		// the failure is worth recording.
-		log.Printf("import job id came from the clock, not crypto/rand: %v", err)
-		id = fmt.Sprintf("%d", time.Now().UnixNano())
+		panic("cryptographic entropy unavailable for operation identity")
 	}
 	j := &importJob{pub: ImportJob{
 		ID: id, Path: sc.Path, Mode: mode, Name: name,
@@ -1176,6 +1323,10 @@ func (j *importJob) fail(err error) {
 	j.pub.Error = err.Error()
 	j.pub.Finished = time.Now().Unix()
 	j.mu.Unlock()
+	if err := j.persist(); err != nil {
+		storageUncertain.Store(true)
+		log.Printf("job terminal state persistence failed: %v", err)
+	}
 }
 
 func (j *importJob) done(serverID string) {
@@ -1185,6 +1336,10 @@ func (j *importJob) done(serverID string) {
 	j.pub.Current = ""
 	j.pub.Finished = time.Now().Unix()
 	j.mu.Unlock()
+	if err := j.persist(); err != nil {
+		storageUncertain.Store(true)
+		log.Printf("job terminal state persistence failed: %v", err)
+	}
 }
 
 // ----------------------------------------------------------------- helpers
@@ -1194,12 +1349,21 @@ func (j *importJob) done(serverID string) {
 // accident; reading it into memory to look for "eula=true" would take the panel
 // down with it.
 func readSmall(path string) (string, bool) {
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() || info.Size() > maxEditBytes {
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
 		return "", false
 	}
-	b, err := os.ReadFile(path)
+	defer root.Close()
+	f, info, err := openRegularIn(root, filepath.Base(path))
 	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	if info.Size() > maxEditBytes {
+		return "", false
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxEditBytes+1))
+	if err != nil || len(b) > maxEditBytes {
 		return "", false
 	}
 	return string(b), true
@@ -1207,21 +1371,7 @@ func readSmall(path string) (string, bool) {
 
 // parseProperties reads key=value lines the way the game does: '#' comments and
 // blank lines ignored, first '=' splits.
-func parseProperties(content string) map[string]string {
-	out := map[string]string{}
-	for _, ln := range strings.Split(content, "\n") {
-		ln = strings.TrimSpace(ln)
-		if ln == "" || strings.HasPrefix(ln, "#") || strings.HasPrefix(ln, "!") {
-			continue
-		}
-		k, v, ok := strings.Cut(ln, "=")
-		if !ok {
-			continue
-		}
-		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
-	}
-	return out
-}
+func parseProperties(content string) map[string]string { return parsePropsLines(content) }
 
 // velocityBind reads the listen port out of velocity.toml: bind = "0.0.0.0:25565".
 func velocityBind(content string) int {
@@ -1317,7 +1467,7 @@ func (a *API) RoutesImport(mux *http.ServeMux) {
 
 func (a *API) cloneStart(w http.ResponseWriter, r *http.Request) {
 	var req CloneRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -1333,7 +1483,7 @@ func (a *API) importScan(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -1347,7 +1497,7 @@ func (a *API) importScan(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) importStart(w http.ResponseWriter, r *http.Request) {
 	var req ImportRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -1367,4 +1517,73 @@ func (a *API) importStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, j.view())
+}
+
+// Minecraft uses a FileChannel lock on session.lock. Refuse copying/adopting
+// that tree while its existing owner still holds the write lock.
+func stoppedImportSource(root string) error {
+	release, err := lockImportSource(root)
+	if err != nil {
+		return err
+	}
+	release()
+	return nil
+}
+
+// Keep Java FileChannel locks through the copy, including world/session.lock
+// and sibling dimensions. Another JVM cannot start writing mid-import.
+func lockImportSource(root string) (func(), error) {
+	held := []*os.File{}
+	release := func() {
+		for _, f := range held {
+			f.Close()
+		}
+	}
+	source, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer source.Close()
+	d, err := openDirIn(source, ".")
+	if err != nil {
+		return nil, err
+	}
+	entries, err := d.ReadDir(4097)
+	d.Close()
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if len(entries) > 4096 {
+		return nil, fmt.Errorf("import source has too many top-level entries")
+	}
+	paths := []string{"session.lock"}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			paths = append(paths, filepath.Join(entry.Name(), "session.lock"))
+		}
+	}
+	for _, path := range paths {
+		f, err := source.OpenFile(path, os.O_RDWR|syscall.O_NONBLOCK, 0)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			release()
+			return nil, err
+		}
+		st, err := f.Stat()
+		if err != nil || !st.Mode().IsRegular() {
+			f.Close()
+			release()
+			return nil, fmt.Errorf("source session.lock is not a readable regular file")
+		}
+		lock := syscall.Flock_t{Type: syscall.F_WRLCK, Whence: 0, Len: 0}
+		if syscall.FcntlFlock(f.Fd(), syscall.F_SETLK, &lock) != nil {
+			f.Close()
+			release()
+			return nil, fmt.Errorf("source world is in use; stop its current server before importing")
+		}
+		held = append(held, f)
+	}
+	return release, nil
 }

@@ -7,12 +7,13 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -297,24 +298,72 @@ func (m *Manager) DeletePlugin(s *Server, file string) error {
 	return m.DeletePath(s, rel)
 }
 
-// checkDownloadScheme keeps a download on http(s).
-//
-// Without it, "file:///var/teploy-arcade/users.json" makes the panel read a
-// local file with its own privileges and publish it inside the server
-// directory, where the file manager hands it straight back - an arbitrary
-// local-file read for anyone holding the operator role. The check is explicit
-// rather than leaning on the default transport happening to refuse file://:
-// what a transport supports is not a security boundary.
+// Downloads require TLS and public destinations unless the operator explicitly
+// enables private mirrors. These process policies apply to every redirect and
+// to the IP we actually dial, without an unchecked second DNS lookup.
 func checkDownloadScheme(u *url.URL) error {
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
-		if u.Host == "" {
-			return fmt.Errorf("that URL has no host")
-		}
+	if u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+		return fmt.Errorf("plugin URL needs a host and cannot contain credentials or fragments")
+	}
+	if u.Scheme == "https" {
 		return nil
 	}
-	return fmt.Errorf("only http and https downloads are allowed, not %q", u.Scheme)
+	if u.Scheme == "http" && os.Getenv("TEPLOY_ARCADE_ALLOW_HTTP_PLUGINS") == "1" {
+		return nil
+	}
+	return fmt.Errorf("plugin downloads require HTTPS; private HTTP mirrors require operator opt-in TEPLOY_ARCADE_ALLOW_HTTP_PLUGINS=1")
 }
+func pluginAddressAllowed(ip netip.Addr, allowPrivate bool) bool {
+	ip = ip.Unmap()
+	if !ip.IsValid() || ip.IsUnspecified() || ip.IsMulticast() {
+		return false
+	}
+	if allowPrivate {
+		return true
+	}
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	for _, cidr := range []string{"100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4", "2001:db8::/32"} {
+		if netip.MustParsePrefix(cidr).Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+func pluginDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	allowPrivate := os.Getenv("TEPLOY_ARCADE_ALLOW_PRIVATE_PLUGIN_HOSTS") == "1"
+	// Refuse mixed public/private answers too: do not silently choose an allowed
+	// member while the destination's remaining addresses violate policy.
+	for _, ip := range ips {
+		if !pluginAddressAllowed(ip, allowPrivate) {
+			return nil, fmt.Errorf("plugin destination is not public; private mirrors require TEPLOY_ARCADE_ALLOW_PRIVATE_PLUGIN_HOSTS=1")
+		}
+	}
+	var last error
+	dialer := net.Dialer{Timeout: 30 * time.Second}
+	for _, ip := range ips {
+		conn, e := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if e == nil {
+			return conn, nil
+		}
+		last = e
+	}
+	if last == nil {
+		last = fmt.Errorf("plugin destination has no addresses")
+	}
+	return nil, last
+}
+
+var pluginInstallWork = make(chan struct{}, 2)
 
 // ExpectedSHA256 parses an operator-supplied digest. R64 (audit pass 7): an
 // empty value is genuinely optional, but a MALFORMED one is an error, not a
@@ -398,6 +447,24 @@ func validateJar(data []byte, expectedSHA256 []byte) error {
 // installation whose client timed out and went away cannot complete
 // unobserved after the fact.
 func (m *Manager) InstallPlugin(ctx context.Context, s *Server, rawURL, expectedSHA256 string) (PluginEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return PluginEntry{}, err
+	}
+	workDone, err := m.beginWork()
+	if err != nil {
+		return PluginEntry{}, err
+	}
+	defer workDone()
+	ctx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
+	stopCancellation := context.AfterFunc(m.ctx, cancelWork)
+	defer stopCancellation()
+	select {
+	case pluginInstallWork <- struct{}{}:
+		defer func() { <-pluginInstallWork }()
+	case <-ctx.Done():
+		return PluginEntry{}, ctx.Err()
+	}
 	dir, _, err := pluginDirFor(s)
 	if err != nil {
 		return PluginEntry{}, err
@@ -432,7 +499,15 @@ func (m *Manager) InstallPlugin(ctx context.Context, s *Server, rawURL, expected
 		return PluginEntry{}, err
 	}
 
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = pluginDialContext
+	defer transport.CloseIdleConnections()
+	if os.Getenv("TEPLOY_ARCADE_ALLOW_HTTP_PLUGINS") == "1" || os.Getenv("TEPLOY_ARCADE_ALLOW_PRIVATE_PLUGIN_HOSTS") == "1" {
+		m.audit("operator-policy", "plugin.download_exception", s.ID, "HTTP/private plugin mirrors explicitly enabled")
+	}
 	client := &http.Client{
+		Transport: transport,
 		// Without a deadline the panel holds a goroutine and a socket open for
 		// as long as the far end cares to stall - a free way to pin the process
 		// with a link that never finishes.
@@ -615,7 +690,7 @@ func (a *API) togglePlugin(w http.ResponseWriter, r *http.Request) {
 		File   string `json:"file"`
 		Enable bool   `json:"enable"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -658,8 +733,25 @@ func (a *API) installPlugin(w http.ResponseWriter, r *http.Request) {
 		URL    string `json:"url"`
 		SHA256 string `json:"sha256"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
+		return
+	}
+	if wantsAsync(r) {
+		actor := actorOf(r)
+		job, err := a.mgr.startOperation(s, "plugin-install", actor, r.Header.Get("Idempotency-Key"), body.URL+"\x00"+body.SHA256, func(ctx context.Context) error {
+			e, err := a.mgr.InstallPlugin(ctx, s, body.URL, body.SHA256)
+			if err == nil {
+				a.mgr.audit(actor, "plugin.install", s.ID, e.File)
+			}
+			return err
+		})
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		w.Header().Set("Location", "/api/servers/"+s.ID+"/operations/"+job.ID)
+		writeJSON(w, 202, publicOperation(job))
 		return
 	}
 	// The request's context bounds the download: a client that disconnects

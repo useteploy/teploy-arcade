@@ -3,6 +3,8 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 )
 
 // Tools are prefixed `arcade_` rather than `teploy_`.
@@ -21,7 +23,7 @@ func toolSpecs() []map[string]any {
 		if required == nil {
 			required = []string{}
 		}
-		return map[string]any{"type": "object", "properties": props, "required": required}
+		return map[string]any{"type": "object", "properties": props, "required": required, "additionalProperties": false}
 	}
 
 	return []map[string]any{
@@ -42,14 +44,6 @@ func toolSpecs() []map[string]any {
 				"id":    str("Server id"),
 				"lines": map[string]any{"type": "integer", "description": "How many lines (default 80, max 500)"},
 			}, "id"),
-		},
-		{
-			"name":        "arcade_send_command",
-			"description": "Run a console command on a running game server, as the game's own console would. Returns an acknowledgement, not the output - read it back with arcade_console_tail. Commands that change who has access (op, deop, ban, ban-ip, pardon, whitelist) and 'stop' are refused: use arcade_lifecycle to stop a server, and leave access changes to a human in the panel.",
-			"inputSchema": obj(map[string]any{
-				"id":   str("Server id"),
-				"text": str("Command, without a leading slash"),
-			}, "id", "text"),
 		},
 		{
 			"name":        "arcade_lifecycle",
@@ -81,16 +75,44 @@ func toolSpecs() []map[string]any {
 }
 
 func (h *Handler) call(name string, raw json.RawMessage) (string, error) {
+	allowed := map[string][]string{
+		"arcade_list_servers": {}, "arcade_get_server": {"id"}, "arcade_console_tail": {"id", "lines"}, "arcade_lifecycle": {"id", "action"}, "arcade_list_backups": {"id"}, "arcade_create_backup": {"id", "note"}, "arcade_host_status": {},
+	}
+	keys, known := allowed[name]
+	if !known {
+		return "", fmt.Errorf("unknown tool %q", name)
+	}
+	if len(raw) > 0 {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil || fields == nil {
+			return "", fmt.Errorf("arguments must be an object")
+		}
+		for field := range fields {
+			valid := false
+			for _, key := range keys {
+				if field == key {
+					valid = true
+				}
+			}
+			if !valid {
+				return "", fmt.Errorf("argument %q is not supported by %s", field, name)
+			}
+		}
+	}
 	var args struct {
 		ID     string `json:"id"`
-		Text   string `json:"text"`
 		Action string `json:"action"`
 		Note   string `json:"note"`
 		Lines  int    `json:"lines"`
 	}
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &args); err != nil {
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&args); err != nil {
 			return "", fmt.Errorf("bad arguments: %w", err)
+		}
+		if err := dec.Decode(&struct{}{}); err != io.EOF {
+			return "", fmt.Errorf("arguments need one JSON object")
 		}
 	}
 
@@ -123,16 +145,6 @@ func (h *Handler) call(name string, raw json.RawMessage) (string, error) {
 			n = 500
 		}
 		return h.Backend.ConsoleTail(args.ID, n)
-
-	case "arcade_send_command":
-		if err := needID(); err != nil {
-			return "", err
-		}
-		if args.Text == "" {
-			return "", fmt.Errorf("text is required")
-		}
-		h.logf("mcp: command on %s: %s", args.ID, args.Text)
-		return h.Backend.SendCommand(args.ID, args.Text)
 
 	case "arcade_lifecycle":
 		if err := needID(); err != nil {

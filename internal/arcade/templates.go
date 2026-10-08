@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -57,16 +59,15 @@ const seedLedger = ".seeded.json"
 // fixes.
 //
 // A panel installed before the ledger existed has no record either way. Those
-// files are refreshed, but the old one is kept beside it as
-// `<slug>.json.superseded` rather than discarded, because "the panel could not
-// tell" is not grounds for destroying an edit that might be there.
+// files retain ownership. A content-addressed update candidate is written beside
+// each uncertain file for an explicit operator migration.
 func syncSeededTemplates(dir string) error {
 	ledgerPath := filepath.Join(dir, seedLedger)
 	known := map[string]string{}
-	hadLedger := false
+
 	if b, err := os.ReadFile(ledgerPath); err == nil {
-		if json.Unmarshal(b, &known) == nil {
-			hadLedger = true
+		if json.Unmarshal(b, &known) != nil || known == nil {
+			known = map[string]string{}
 		}
 	}
 
@@ -96,22 +97,21 @@ func syncSeededTemplates(dir string) error {
 			// idea of it.
 			continue
 
-		case !hadLedger:
-			aside := path + ".superseded"
-			if err := os.WriteFile(aside, cur, 0o644); err != nil {
-				return err
-			}
-			log.Printf("template %s: refreshed to the version shipped with this build; "+
-				"the previous file was kept at %s", t.Slug, filepath.Base(aside))
-
 		default:
 			// Edited on purpose. It wins, and the ledger keeps pointing at what
 			// the panel last wrote so a later edit-revert is still detectable.
 			next[t.Slug] = known[t.Slug]
+			if known[t.Slug] == "" {
+				candidate := path + ".update-" + sum[:16]
+				if err := writeTemplateCandidate(candidate, b); err != nil {
+					return err
+				}
+				log.Printf("template %s: ownership unknown; active file retained; update candidate %s", t.Slug, filepath.Base(candidate))
+			}
 			continue
 		}
 
-		if err := os.WriteFile(path, b, 0o644); err != nil {
+		if err := writeFileAtomic(path, b, 0o644); err != nil {
 			return err
 		}
 	}
@@ -120,7 +120,7 @@ func syncSeededTemplates(dir string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(ledgerPath, b, 0o600)
+	return writeFileAtomic(ledgerPath, b, 0o600)
 }
 
 // LoadTemplates reads data/templates/*.json, seeding it from the built-in set
@@ -173,8 +173,8 @@ func LoadTemplates(dataDir string) error {
 	// is published. Two files declaring one slug made templateBySlug depend
 	// on directory ordering rather than identity, and a protocol or span a
 	// template could not actually launch with reached Docker as a start-time
-	// failure naming nothing actionable. Invalid custom additions are
-	// reported; they do not take the working catalog down.
+	// failure naming nothing actionable. Reject the entire candidate and retain
+	// the previous catalog so a partial load cannot silently change identity.
 	seenSlugs := map[string]bool{}
 	deduped := loaded[:0]
 	for _, t := range loaded {
@@ -220,13 +220,13 @@ func LoadTemplates(dataDir string) error {
 		return loaded[i].Name < loaded[j].Name
 	})
 
+	if len(bad) > 0 {
+		return fmt.Errorf("template catalog rejected; previous catalog retained: %s", strings.Join(bad, "; "))
+	}
 	tplMu.Lock()
 	tplLoaded = loaded
 	tplMu.Unlock()
 
-	if len(bad) > 0 {
-		return fmt.Errorf("%d template(s) skipped: %s", len(bad), strings.Join(bad, "; "))
-	}
 	return nil
 }
 
@@ -242,8 +242,22 @@ func validateTemplate(t *Template) error {
 		return fmt.Errorf("at least one version is required")
 	case t.MemoryMB <= 0:
 		return fmt.Errorf("memory_mb must be positive")
-	case t.CPU <= 0:
+	case t.CPU <= 0 || math.IsNaN(t.CPU) || math.IsInf(t.CPU, 0):
 		return fmt.Errorf("cpu must be positive")
+	}
+	if !templateSlug.MatchString(t.Slug) {
+		return fmt.Errorf("slug must use lowercase letters, digits and hyphens")
+	}
+	if strings.TrimSpace(t.Name) == "" || strings.TrimSpace(t.Image) == "" || strings.ContainsAny(t.Image, " \t\r\n\x00") || strings.HasPrefix(t.Image, "-") {
+		return fmt.Errorf("invalid name or container image")
+	}
+	for _, v := range t.Versions {
+		if strings.TrimSpace(v) == "" || strings.ContainsAny(v, "\r\n\x00") {
+			return fmt.Errorf("versions must be nonempty single-line values")
+		}
+	}
+	if t.PortHint < 0 || t.DiskGB < 0 || t.MaxPlayers < 0 {
+		return fmt.Errorf("defaults cannot be negative")
 	}
 	if t.Group == "" {
 		t.Group = "Other"
@@ -277,6 +291,9 @@ func validateTemplateGeometry(t *Template) error {
 			return fmt.Errorf("protocol %q is not supported (tcp or udp)", p)
 		}
 	}
+	if t.PortSpan < 0 {
+		return fmt.Errorf("port_span cannot be negative")
+	}
 	span := t.PortSpan
 	if span < 1 {
 		span = 1
@@ -284,10 +301,92 @@ func validateTemplateGeometry(t *Template) error {
 	if span > 16 {
 		return fmt.Errorf("port_span %d exceeds the 16-port publishing bound", t.PortSpan)
 	}
-	if t.DataPath != "" && !path.IsAbs(t.DataPath) {
+	if t.DataPath != "" && (!path.IsAbs(t.DataPath) || path.Clean(t.DataPath) != t.DataPath || t.DataPath == "/" || strings.ContainsAny(t.DataPath, "\x00\r\n")) {
 		return fmt.Errorf("data_path %q must be an absolute container path", t.DataPath)
 	}
+
+	switch t.Console {
+	case "", ConsoleRCON, ConsoleSend, ConsoleNone:
+	default:
+		return fmt.Errorf("unsupported console capability %q", t.Console)
+	}
+	for _, extra := range t.ExtraPorts {
+		pieces := strings.Split(extra, "/")
+		if len(pieces) != 2 || (pieces[1] != "tcp" && pieces[1] != "udp") {
+			return fmt.Errorf("invalid extra port %q", extra)
+		}
+	}
+	if _, err := candidateBindings(t.PortHint, t.Protocols, t.PortSpan, t.ExtraPorts); err != nil {
+		return err
+	}
+	values := append([]string{}, t.Args...)
+	for key, value := range t.Env {
+		if !templateEnvKey.MatchString(key) {
+			return fmt.Errorf("invalid environment key %q", key)
+		}
+		values = append(values, value)
+	}
+	for _, value := range values {
+		if strings.ContainsRune(value, 0) {
+			return fmt.Errorf("launch value contains NUL")
+		}
+		for rest := value; strings.Contains(rest, "${"); {
+			start := strings.Index(rest, "${")
+			end := strings.Index(rest[start:], "}")
+			if end < 0 {
+				return fmt.Errorf("unterminated launch variable")
+			}
+			variable := rest[start+2 : start+end]
+			switch variable {
+			case "PORT", "PORT_PLUS_1", "MEMORY_MB", "MAX_PLAYERS", "MOTD", "DATA":
+			default:
+				return fmt.Errorf("unknown launch variable %q", variable)
+			}
+			if variable == "PORT_PLUS_1" && t.PortHint >= 65535 {
+				return fmt.Errorf("PORT_PLUS_1 exceeds port range")
+			}
+			rest = rest[start+end+1:]
+		}
+	}
 	return nil
+}
+
+var templateSlug = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+var templateEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func writeTemplateCandidate(name string, body []byte) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if os.IsExist(err) {
+		existing, readErr := os.ReadFile(name)
+		if readErr != nil {
+			return readErr
+		}
+		if string(existing) != string(body) {
+			return fmt.Errorf("update candidate %s already exists with different content", name)
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(body)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	parent, err := os.Open(filepath.Dir(name))
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	return parent.Sync()
 }
 
 func allTemplates() []Template {

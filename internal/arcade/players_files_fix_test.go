@@ -22,6 +22,9 @@ import (
 func TestPlayerListWriteCannotRaceTheStartTransition(t *testing.T) {
 	_, mgr := newTestAgent(t)
 	s := mgr.List()[0]
+	s.mu.Lock()
+	s.Props["online-mode"] = "false"
+	s.mu.Unlock()
 
 	mgr.lifecycle.Lock()
 	added := make(chan error, 1)
@@ -80,6 +83,9 @@ func TestPlayerListWriteCannotRaceTheStartTransition(t *testing.T) {
 func TestPlayerListEditIsRefusedWhileTheServerIsMidTransition(t *testing.T) {
 	_, mgr := newTestAgent(t)
 	s := mgr.List()[0]
+	s.mu.Lock()
+	s.Props["online-mode"] = "false"
+	s.mu.Unlock()
 
 	for _, st := range []string{StatusStarting, StatusStopping, StatusRunning} {
 		s.mu.Lock()

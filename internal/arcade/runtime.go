@@ -2,6 +2,7 @@ package arcade
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -52,13 +54,40 @@ func recoverPanic(what string) {
 // a shared temp name makes them destroy each other: both write it, the first
 // rename consumes it, and the second fails ENOENT having saved nothing. Most of
 // those callers discard the error, so the state change was simply lost.
+type stateWriteResult struct {
+	Published bool
+	Err       error
+}
+
+var storageUncertain atomic.Bool
+var syncStateDirectory = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(d.Sync(), d.Close())
+}
+
+// Once rename publishes a candidate, callers must publish the same candidate
+// in memory even if the durability barrier fails. A visible health flag records
+// uncertain power-loss durability instead of returning a false rejection.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	result := atomicStateWrite(path, data, perm)
+	if result.Published && result.Err != nil {
+		storageUncertain.Store(true)
+		log.Printf("state publication succeeded but directory durability could not be confirmed: %s", filepath.Base(path))
+		return nil
+	}
+	return result.Err
+}
+
+func atomicStateWrite(path string, data []byte, perm os.FileMode) stateWriteResult {
 	// ".arcade-tmp-" is the panel's reserved prefix; the boot sweep removes
 	// only files carrying it, so nothing with a merely .tmp-ish name that a
 	// game or plugin legitimately owns gets deleted at startup.
 	f, err := os.CreateTemp(filepath.Dir(path), ".arcade-tmp-*")
 	if err != nil {
-		return err
+		return stateWriteResult{Err: err}
 	}
 	tmp := f.Name()
 	// CreateTemp always makes 0600; the caller's perm is the mode the file must
@@ -66,16 +95,21 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := f.Chmod(perm); err != nil {
 		f.Close()
 		_ = os.Remove(tmp)
-		return err
+		return stateWriteResult{Err: err}
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		_ = os.Remove(tmp)
-		return err
+		return stateWriteResult{Err: err}
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return stateWriteResult{Err: err}
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
-		return err
+		return stateWriteResult{Err: err}
 	}
 	// The panel runs as root; the game runs as uid 1000. An atomic write
 	// replaces the file with a brand new inode owned by whoever wrote it, so
@@ -87,9 +121,9 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
-		return err
+		return stateWriteResult{Err: err}
 	}
-	return nil
+	return stateWriteResult{Published: true, Err: syncStateDirectory(filepath.Dir(path))}
 }
 
 // Seams, so the ownership logic is testable without being root.

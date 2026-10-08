@@ -249,9 +249,9 @@ func TestMeDoesNotInventAUserOnAnUnclaimedPanel(t *testing.T) {
 	if m["unclaimed"] != true {
 		t.Errorf("unclaimed=%v, want true", m["unclaimed"])
 	}
-	// The authority is still reported, just not as an account.
-	if m["effective_role"] != RoleAdmin {
-		t.Errorf("effective_role=%v, want %q", m["effective_role"], RoleAdmin)
+	// An unclaimed panel has no operational authority until setup completes.
+	if _, ok := m["effective_role"]; ok {
+		t.Errorf("unclaimed panel advertised authority: %v", m["effective_role"])
 	}
 
 	// Claimed and signed in: a real user, and no "unclaimed" flag.

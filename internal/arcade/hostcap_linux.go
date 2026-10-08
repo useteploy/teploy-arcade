@@ -2,8 +2,10 @@ package arcade
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // memTotalMB reports the memory this panel may actually use.
@@ -46,10 +48,7 @@ func memTotalMB() int {
 	}
 
 	// cgroup v2, then v1. "max" means no limit, which is not a number.
-	for _, p := range []string{
-		"/sys/fs/cgroup/memory.max",
-		"/sys/fs/cgroup/memory/memory.limit_in_bytes",
-	} {
+	for _, p := range cgroupMemoryPaths("memory.max", "memory.limit_in_bytes", true) {
 		b, err := os.ReadFile(p)
 		if err != nil {
 			continue
@@ -179,4 +178,61 @@ func parseCPUSample(stat string) (cpuSample, bool) {
 		return s, s.total > 0
 	}
 	return cpuSample{}, false
+}
+
+// Usage carries its own scope instead of pairing physical /proc usage with a
+// cgroup-limited capacity. Unavailable readings are null, never synthetic zero.
+func memoryUsageView() map[string]any {
+	for _, path := range cgroupMemoryPaths("memory.current", "memory.usage_in_bytes", false) {
+		if b, err := os.ReadFile(path); err == nil {
+			if n, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64); err == nil {
+				return map[string]any{"used_mb": int(n / (1 << 20)), "scope": "panel_cgroup", "source": path, "sampled_at": time.Now()}
+			}
+		}
+	}
+	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+		if used, ok := parseMemUsedMB(string(b)); ok {
+			return map[string]any{"used_mb": used, "scope": "proc_visible_host", "source": "/proc/meminfo", "sampled_at": time.Now()}
+		}
+	}
+	return map[string]any{"used_mb": nil, "scope": "unknown", "source": nil, "sampled_at": nil}
+}
+
+func cgroupMemoryPaths(v2, v1 string, ancestors bool) []string {
+	b, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(string(b), "\n") {
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) != 3 {
+			continue
+		}
+		base, name := "/sys/fs/cgroup", v2
+		if fields[0] != "0" {
+			if !strings.Contains(","+fields[1]+",", ",memory,") {
+				continue
+			}
+			base = "/sys/fs/cgroup/memory"
+			name = v1
+		}
+		rel := strings.TrimPrefix(filepath.Clean(fields[2]), "/")
+		if rel == ".." || strings.HasPrefix(rel, "../") {
+			continue
+		}
+		dir := filepath.Join(base, rel)
+		for {
+			paths = append(paths, filepath.Join(dir, name))
+			if !ancestors || dir == base {
+				break
+			}
+			next := filepath.Dir(dir)
+			if next == dir || !strings.HasPrefix(next, base) {
+				break
+			}
+			dir = next
+		}
+	}
+	return paths
 }

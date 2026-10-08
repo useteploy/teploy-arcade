@@ -2,23 +2,34 @@ package arcade
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 // Manager owns every server, the console hub, and persistence.
 type Manager struct {
+	ctx            context.Context
+	cancel         context.CancelFunc
+	operationMu    sync.Mutex
+	workerMu       sync.Mutex
+	workers        sync.WaitGroup
+	closing        bool
+	publicOrigin   string
+	publicGameHost string
+
 	mu      sync.RWMutex
 	servers map[string]*Server
 	order   []string
@@ -28,7 +39,8 @@ type Manager struct {
 	// Reorder can change between two concurrent saves' snapshots, so without
 	// this two saves could lock the same servers in opposite orders and
 	// deadlock; it also stops an older snapshot from winning the final rename.
-	saveMu sync.Mutex
+	saveMu  sync.Mutex
+	orderMu sync.Mutex
 
 	hub     *Hub
 	dataDir string
@@ -81,12 +93,14 @@ type Manager struct {
 	usageMu   sync.RWMutex
 	lastCPU   cpuSample
 	hostCPU   float64
+	hostCPUAt time.Time
 	dirSizes  map[string]int64
 	dirWalked time.Time
 }
 
 func NewManager(dataDir string, hub *Hub) *Manager {
-	m := &Manager{
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &Manager{ctx: ctx, cancel: cancel,
 		servers: map[string]*Server{},
 		hub:     hub,
 		dataDir: dataDir,
@@ -124,21 +138,32 @@ func (m *Manager) Load() error {
 	if err := os.MkdirAll(m.dataDir, 0o700); err != nil {
 		return err
 	}
+	if err := m.loadImportJobs(); err != nil {
+		return err
+	}
 	b, err := os.ReadFile(m.storePath())
 	if os.IsNotExist(err) {
+		intents, ierr := m.deletionIntents()
+		if ierr != nil {
+			return ierr
+		}
+		if len(intents) > 0 {
+			return fmt.Errorf("servers.json is missing while durable deletion intents exist; restore server metadata before recovery")
+		}
 		m.seed()
 		return m.Save()
 	}
 	if err != nil {
 		return err
 	}
+	intents, err := m.deletionIntents()
+	if err != nil {
+		return err
+	}
 	var list []*Server
 	if err := json.Unmarshal(b, &list); err != nil {
-		// Refusing to boot means nobody can reach any server, which is worse
-		// than booting empty with the bad file preserved beside it.
-		quarantine(m.storePath(), err)
-		m.seed()
-		return m.Save()
+		// Authoritative corruption cannot silently create a replacement registry.
+		return fmt.Errorf("servers.json is corrupt; repair it or restore a valid copy before starting: %w", err)
 	}
 	// `[null]` decodes successfully into a slice holding a nil pointer, and
 	// records without an ID cannot be addressed, locked or persisted
@@ -147,6 +172,9 @@ func (m *Manager) Load() error {
 	for i, s := range list {
 		if s == nil {
 			log.Printf("servers.json: dropped a null record at index %d", i)
+			continue
+		}
+		if _, deleted := intents[s.ID]; deleted {
 			continue
 		}
 		if s.ID == "" {
@@ -172,7 +200,13 @@ func (m *Manager) Load() error {
 		// Nothing is running after a panel restart; don't claim otherwise.
 		if s.Status == StatusRunning || s.Status == StatusStarting || s.Status == StatusStopping {
 			wasUp[s.ID] = s.Status != StatusStopping
+			if s.DesiredRunning != nil {
+				wasUp[s.ID] = *s.DesiredRunning
+			}
 			s.Status = StatusStopped
+		}
+		if s.DesiredRunning != nil && *s.DesiredRunning {
+			wasUp[s.ID] = true
 		}
 		if s.Props == nil {
 			s.Props = map[string]string{}
@@ -182,6 +216,13 @@ func (m *Manager) Load() error {
 	}
 	m.mu.Unlock()
 
+	for id, intent := range intents {
+		if err := m.completeDeletion(intent); err != nil {
+			log.Printf("deletion %s remains pending: %v", id, err)
+		} else if err := m.Save(); err == nil {
+			_ = os.Remove(m.deletionPath(id))
+		}
+	}
 	m.backfillVersions()
 	m.recoverInterruptedRestores()
 	m.recoverAfterBoot(wasUp)
@@ -213,7 +254,12 @@ func (m *Manager) Load() error {
 func (m *Manager) recoverInterruptedRestores() {
 	for _, s := range m.List() {
 		dir := m.serverDir(s)
-		ents, err := os.ReadDir(dir)
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			continue
+		}
+		defer root.Close()
+		ents, err := readDirectoryIn(root, ".")
 		if err != nil {
 			continue
 		}
@@ -222,14 +268,24 @@ func (m *Manager) recoverInterruptedRestores() {
 				continue
 			}
 			staging := filepath.Join(dir, e.Name())
-			held := filepath.Join(staging, "old")
-			if _, cerr := os.Stat(filepath.Join(staging, ".committed")); cerr == nil {
-				// The install completed; only the cleanup was interrupted.
-				_ = os.RemoveAll(staging)
-				log.Printf("%s: discarded a completed restore's leftover staging directory %s", s.Name, e.Name())
+			if err := m.requireStoppedContainer(s); err != nil {
+				m.markRecovery(s, err.Error())
 				continue
 			}
-			heldEnts, err := os.ReadDir(held)
+			if _, cerr := root.Lstat(filepath.Join(e.Name(), ".committed")); cerr == nil {
+				s.mu.Lock()
+				s.RecoveryRequired = ""
+				s.mu.Unlock()
+				if err := m.Save(); err != nil {
+					m.markRecovery(s, "committed restore recovery could not persist its cleared interlock")
+					continue
+				}
+				if err := root.RemoveAll(e.Name()); err != nil {
+					m.markRecovery(s, "committed restore cleanup incomplete")
+				}
+				continue
+			}
+			heldEnts, err := readDirectoryIn(root, filepath.Join(e.Name(), "old"))
 			if err != nil {
 				// R18 (audit pass 7): a read error is not evidence that nothing
 				// moved. An I/O or permission failure on old/ used to take the
@@ -237,13 +293,58 @@ func (m *Manager) recoverInterruptedRestores() {
 				// staging tree - which, when old/ was unreadable but full, is the
 				// only remaining copy of the previous world. Retained and said so;
 				// the operator resolves it by hand with everything still there.
+				m.markRecovery(s, "held restore originals could not be read")
 				log.Printf("%s: could not read the held originals in %s (%v); the interrupted restore is RETAINED - resolve it by hand before starting this server",
 					s.Name, e.Name(), err)
 				continue
 			}
-			if len(heldEnts) == 0 {
+			// New-format transactions record when evacuation was complete and
+			// every candidate name, including files absent from the original world.
+			journal, hasJournal, jerr := readRestoreJournalIn(root, e.Name())
+			if jerr != nil {
+				m.markRecovery(s, "restore journal is corrupt or unreadable")
+				continue
+			}
+			if hasJournal && (journal.Phase == "installing" || journal.Phase == "rolling_back") {
+				if journal.Phase == "installing" {
+					journal.Phase = "rolling_back"
+					if err := writeRestoreJournalIn(root, e.Name(), journal); err != nil {
+						m.markRecovery(s, "rollback phase could not be persisted")
+						continue
+					}
+				}
+				originalNames := map[string]bool{}
+				for _, name := range journal.Original {
+					originalNames[name] = true
+				}
+				heldNames := map[string]bool{}
+				for _, entry := range heldEnts {
+					heldNames[entry.Name()] = true
+				}
+				failed := false
+				for _, name := range journal.New {
+					if filepath.Base(name) != name || name == "." || name == ".." {
+						failed = true
+						break
+					}
+					// An original already returned by a prior partial rollback is never
+					// removed again. Extra installed names and held replacements are safe.
+					if originalNames[name] && !heldNames[name] {
+						continue
+					}
+					if err := root.RemoveAll(name); err != nil {
+						failed = true
+						break
+					}
+				}
+				if failed {
+					m.markRecovery(s, "installed entries could not be removed during rollback")
+					continue
+				}
+			}
+			if len(heldEnts) == 0 && !hasJournal {
 				log.Printf("%s: discarded an interrupted restore's staging directory %s (nothing had moved)", s.Name, e.Name())
-				_ = os.RemoveAll(staging)
+				_ = root.RemoveAll(e.Name())
 				continue
 			}
 			heldNames := make(map[string]bool, len(heldEnts))
@@ -253,22 +354,40 @@ func (m *Manager) recoverInterruptedRestores() {
 			// Remove ONLY the live entries whose originals are held: those are
 			// replacements the interrupted install put there, and they block
 			// the originals' return. Everything else live is left untouched.
-			if liveEnts, lerr := os.ReadDir(dir); lerr == nil {
+			if liveEnts, lerr := readDirectoryIn(root, "."); lerr == nil {
 				for _, le := range liveEnts {
 					if le.Name() == e.Name() || !heldNames[le.Name()] {
 						continue
 					}
-					_ = os.RemoveAll(filepath.Join(dir, le.Name()))
+					_ = root.RemoveAll(le.Name())
 				}
 			}
-			if rerr := restoreHeld(held, dir); rerr != nil {
+			if rerr := restoreHeldIn(root, filepath.Join(e.Name(), "old")); rerr != nil {
+				m.markRecovery(s, "restore rollback incomplete")
 				log.Printf("%s: an interrupted restore could not be rolled back fully; the previous world is RETAINED at %s (%v). Resolve it by hand before starting this server.",
 					s.Name, staging, rerr)
 				continue
 			}
+			if hasJournal {
+				s.mu.Lock()
+				s.Port = journal.OldPort
+				s.Props = journal.OldProps
+				s.MaxPlayers = journal.OldMaxPlayers
+				if s.MaxPlayers == 0 {
+					s.MaxPlayers = atoi(journal.OldProps["max-players"])
+				}
+				s.mu.Unlock()
+			}
+			s.mu.Lock()
+			s.RecoveryRequired = ""
+			s.mu.Unlock()
+			if err := m.Save(); err != nil {
+				m.markRecovery(s, "restore metadata rollback could not be persisted")
+				continue
+			}
 			log.Printf("%s: recovered an interrupted restore - the previous world was put back from %s",
 				s.Name, e.Name())
-			_ = os.RemoveAll(staging)
+			_ = root.RemoveAll(e.Name())
 		}
 	}
 }
@@ -360,11 +479,13 @@ func (m *Manager) recoverAfterBoot(wasUp map[string]bool) {
 		return
 	}
 
-	go func() {
+	m.own(func() {
 		defer recoverPanic("boot recovery")
 		deadline := time.Now().Add(bootRecoveryWindow)
 		for time.Now().Before(deadline) {
-			time.Sleep(bootRecoveryPoll)
+			if waitContext(m.ctx, bootRecoveryPoll) != nil {
+				return
+			}
 			if !dockerReachable() {
 				continue
 			}
@@ -378,7 +499,7 @@ func (m *Manager) recoverAfterBoot(wasUp map[string]bool) {
 		log.Printf("docker did not answer within %s of startup; %d server(s) that were running "+
 			"before the panel stopped were NOT restored, and no container was re-adopted",
 			bootRecoveryWindow, len(wasUp))
-	}()
+	})
 }
 
 // resume restarts servers that were running when the panel last saw them and
@@ -400,14 +521,33 @@ func (m *Manager) resume(wasUp map[string]bool) {
 	if len(wasUp) == 0 {
 		return
 	}
-	var pending []*Server
+	type bootIntent struct {
+		server     *Server
+		generation uint64
+	}
+	var pending []bootIntent
 	for _, s := range m.List() {
 		// Docker only. Simulator servers are a development fixture; bringing
 		// five of them back on every `go run` is noise, not recovery.
 		if !wasUp[s.ID] || s.Runtime != RuntimeDocker || s.State() != StatusStopped {
 			continue
 		}
-		pending = append(pending, s)
+		s.mu.Lock()
+		generation := s.IntentGeneration
+		desired := s.DesiredRunning
+		wanted := desired == nil || *desired
+		s.mu.Unlock()
+		if !wanted {
+			continue
+		}
+		if desired == nil || generation == 0 {
+			var err error
+			generation, err = m.persistIntent(s, true)
+			if err != nil {
+				continue
+			}
+		}
+		pending = append(pending, bootIntent{s, generation})
 	}
 	if len(pending) == 0 {
 		return
@@ -416,21 +556,24 @@ func (m *Manager) resume(wasUp map[string]bool) {
 	// Off the boot path, and staggered: these are JVMs, and starting five at
 	// once on a 4-vCPU host means all five take the hit of each other's world
 	// load. The panel answers requests while they come up.
-	go func() {
-		for i, s := range pending {
+	m.own(func() {
+		for i, intent := range pending {
+			s := intent.server
 			if i > 0 {
-				time.Sleep(resumeStagger)
+				if waitContext(m.ctx, resumeStagger) != nil {
+					return
+				}
 			}
 			log.Printf("resuming %s, which was running before the panel stopped", s.Name)
 			m.panelLine(s, "info", "Resuming - this server was running before the panel restarted.")
-			if err := m.Start(s.ID); err != nil {
+			if err := m.startExpected(s.ID, intent.generation); err != nil {
 				log.Printf("could not resume %s: %v", s.Name, err)
 				m.panelLine(s, "error", "Could not resume automatically: "+err.Error())
 				continue
 			}
 			m.audit("panel", "server.resume", s.ID, s.Name)
 		}
-	}()
+	})
 }
 
 // Long enough that two Minecraft worlds are not loading at the same instant,
@@ -449,6 +592,11 @@ func (m *Manager) reconcile() {
 		if s.Runtime != RuntimeDocker || !containerRunning(s.ID) {
 			continue
 		}
+		if err := m.recoverContainerIdentity(s); err != nil {
+			m.markRecovery(s, "live container ownership or bindings require recovery")
+			log.Printf("cannot adopt %s: %v", s.ID, err)
+			continue
+		}
 		emit := func(l Line) { m.emit(s, l) }
 		if err := dr.Adopt(s, emit); err != nil {
 			log.Printf("could not re-attach to %s: %v", s.Name, err)
@@ -461,6 +609,9 @@ func (m *Manager) reconcile() {
 func (m *Manager) Save() error {
 	m.saveMu.Lock()
 	defer m.saveMu.Unlock()
+	return m.saveHeld()
+}
+func (m *Manager) saveHeld() error {
 
 	m.mu.RLock()
 	list := make([]*Server, 0, len(m.order))
@@ -517,45 +668,15 @@ func (m *Manager) seed() {
 
 // ------------------------------------------------------------------ CRUD
 
-var idSeq atomic.Int64
-
-// newID returns an ID no existing server holds.
-//
-// A server's ID is not a label. It names the container (gamepanel-<id>), the
-// server directory and the backup directory, so two servers sharing one is not
-// a display bug - it is one world overwriting another and one server's backups
-// filed under another's name.
-//
-// The old generator was `s<unix%100000><seq%100>` off a process-global counter,
-// and every part of that was reachable: the counter restarts at zero with the
-// panel, so the pair regenerates exactly after a restart within the same
-// 100,000-second window; the increment was an unsynchronised ++ on a shared
-// int64, so two concurrent creates could take the same value outright. Nothing
-// then checked the result against the servers that already existed.
-//
-// Same shape, because the ID is embedded in paths and container names on every
-// deployed host and must keep parsing as what it always was. What changed is
-// that the counter is atomic, entropy replaces the wrap when it has to, and the
-// candidate is checked against the map and the filesystem before it is handed
-// out. Uniqueness is now verified rather than assumed.
+// newID preserves the deployed numeric shape with cryptographic identity.
+// Registration exclusively claims its managed directory before any writes.
 func (m *Manager) newID() string {
-	for attempt := 0; attempt < 50; attempt++ {
-		n := idSeq.Add(1)
-		var id string
-		if attempt < 10 {
-			id = fmt.Sprintf("s%d%02d", time.Now().Unix()%100000, n%100)
-		} else {
-			// The obvious names are taken; stop being predictable about it.
-			id = fmt.Sprintf("s%d%s", time.Now().Unix()%100000, randomDigits(4))
+	for {
+		id := "s" + randomDigits(24)
+		if !m.idTaken(id) {
+			return id
 		}
-		if m.idTaken(id) {
-			continue
-		}
-		return id
 	}
-	// 50 collisions in a row is not a busy panel, it is a broken assumption.
-	// A long random ID is still a valid one, and losing a world is not.
-	return "s" + randomDigits(12)
 }
 
 // idTaken checks both places an ID can already be in use. The map is the
@@ -578,13 +699,11 @@ func (m *Manager) idTaken(id string) bool {
 	return false
 }
 
-// randomDigits returns n cryptographically random decimal digits. Falls back to
-// the counter rather than to a fixed string: a predictable fallback in an ID
-// generator reintroduces exactly the collision it is there to avoid.
+// Entropy failure fails closed instead of generating predictable identities.
 func randomDigits(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%0*d", n, idSeq.Add(1)%1e9)
+		panic("cryptographic entropy unavailable for server identity")
 	}
 	out := make([]byte, n)
 	for i, v := range b {
@@ -610,13 +729,13 @@ func (m *Manager) newServer(name string, t *Template, version string, port int, 
 		// cannot explain it.
 		Image:      imageForVersion(t.Image, version),
 		Port:       port,
-		Protocols:  t.Protocols,
+		Protocols:  slices.Clone(t.Protocols),
 		PortSpan:   t.PortSpan,
-		ExtraPorts: t.ExtraPorts,
+		ExtraPorts: slices.Clone(t.ExtraPorts),
 		ReadyLog:   t.ReadyLog,
 		DataPath:   t.DataPath,
-		Env:        t.Env,
-		Args:       t.Args,
+		Env:        maps.Clone(t.Env),
+		Args:       slices.Clone(t.Args),
 		Console:    t.Console,
 		MemoryMB:   t.MemoryMB,
 		CPU:        t.CPU,
@@ -706,7 +825,7 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	if err := checkServerLimits(port, memMB, cpu); err != nil {
 		return nil, err
 	}
-	if err := checkFitsHost(memMB, cpu); err != nil {
+	if err := checkFitsRuntime(runtime, memMB, cpu); err != nil {
 		return nil, err
 	}
 	// An unknown runtime is refused rather than silently simulated: a typo in
@@ -792,7 +911,7 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	// that rule is about *their* number. Overruling our own suggestion to fit
 	// their machine is not the same act, and a lower CPU quota costs speed
 	// rather than correctness, which is why memory is still refused instead.
-	if cpu == 0 && hostCPUs > 0 && s.CPU > hostCPUs {
+	if s.Runtime != RuntimeDocker && cpu == 0 && hostCPUs > 0 && s.CPU > hostCPUs {
 		log.Printf("%s: template %s suggests %g cores and this host has %g; using %g",
 			name, t.Slug, s.CPU, hostCPUs, hostCPUs)
 		s.CPU = hostCPUs
@@ -809,12 +928,15 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	if err := checkServerLimits(s.Port, s.MemoryMB, s.CPU); err != nil {
 		return nil, err
 	}
-	if err := checkFitsHost(s.MemoryMB, s.CPU); err != nil {
+	if err := checkFitsRuntime(s.Runtime, s.MemoryMB, s.CPU); err != nil {
 		return nil, err
 	}
 	// R46: the effective memory must also leave a JVM its native reserve on
 	// the images that launch one - checked on the effective value, which
 	// includes the template's default.
+	if err := checkFitsDaemon(s.Runtime, s.MemoryMB, s.CPU); err != nil {
+		return nil, err
+	}
 	if err := checkJavaMemory(s.Image, s.MemoryMB); err != nil {
 		return nil, err
 	}
@@ -823,6 +945,12 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	s.Props["motd"] = name
 
 	dir := filepath.Join(m.dataDir, "servers", s.ID)
+	if err := os.MkdirAll(filepath.Dir(dir), 0755); err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(dir, 0755); err != nil {
+		return nil, fmt.Errorf("could not exclusively claim new server directory: %w", err)
+	}
 
 	// Seeded before registration, not after: the old order inserted the server
 	// into the manager first, so a failed seed returned an error while leaving
@@ -848,6 +976,7 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	// committed. Rollback can then never yank a tree out from under a
 	// process the panel just started.
 	m.lifecycle.Lock()
+	m.saveMu.Lock()
 	m.mu.Lock()
 	m.servers[s.ID] = s
 	m.order = append(m.order, s.ID)
@@ -862,7 +991,7 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 	// that vanishes at the next restart is a lie the operator only meets as an
 	// outage. Rolled back the same way the clone path rolls its registration
 	// back, so the two paths stay consistent.
-	if err := m.Save(); err != nil {
+	if err := m.saveHeld(); err != nil {
 		m.mu.Lock()
 		delete(m.servers, s.ID)
 		for i, id := range m.order {
@@ -872,10 +1001,12 @@ func (m *Manager) Create(name, tplSlug, version string, port, memMB int, cpu flo
 			}
 		}
 		m.mu.Unlock()
+		m.saveMu.Unlock()
 		m.lifecycle.Unlock()
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("could not persist the new server: %w", err)
 	}
+	m.saveMu.Unlock()
 	m.lifecycle.Unlock()
 
 	m.broadcastEvent("server.created", s.ID)
@@ -903,7 +1034,10 @@ func (m *Manager) SetResources(s *Server, memMB int, cpu float64) ([]string, err
 	if err := checkServerLimits(0, memMB, cpu); err != nil {
 		return nil, err
 	}
-	if err := checkFitsHost(memMB, cpu); err != nil {
+	if err := checkFitsDaemon(s.Runtime, memMB, cpu); err != nil {
+		return nil, err
+	}
+	if err := checkFitsRuntime(s.Runtime, memMB, cpu); err != nil {
 		return nil, err
 	}
 	if memMB == 0 && cpu == 0 {
@@ -925,7 +1059,15 @@ func (m *Manager) SetResources(s *Server, memMB int, cpu float64) ([]string, err
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
 
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	if err := m.requireRegistered(s); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
+	oldMem, oldCPU, oldPending := s.MemoryMB, s.CPU, slices.Clone(s.PendingRestart)
 	changed := []string{}
 	if memMB > 0 && memMB != s.MemoryMB {
 		s.MemoryMB = memMB
@@ -952,7 +1094,10 @@ func (m *Manager) SetResources(s *Server, memMB int, cpu float64) ([]string, err
 	pending := append([]string(nil), s.PendingRestart...)
 	s.mu.Unlock()
 
-	if err := m.Save(); err != nil {
+	if err := m.saveHeld(); err != nil {
+		s.mu.Lock()
+		s.MemoryMB, s.CPU, s.PendingRestart = oldMem, oldCPU, oldPending
+		s.mu.Unlock()
 		return nil, err
 	}
 	m.broadcastEvent("server.updated", s.ID)
@@ -983,7 +1128,12 @@ func contains(xs []string, want string) bool {
 // created while the operator was dragging. Unknown ids are ignored rather than
 // rejected - a server deleted mid-drag should not fail the whole reorder.
 func (m *Manager) Reorder(ids []string) error {
+	m.orderMu.Lock()
+	defer m.orderMu.Unlock()
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 	m.mu.Lock()
+	previous := slices.Clone(m.order)
 	seen := make(map[string]bool, len(ids))
 	next := make([]string, 0, len(m.order))
 	for _, id := range ids {
@@ -1001,14 +1151,24 @@ func (m *Manager) Reorder(ids []string) error {
 	m.order = next
 	m.mu.Unlock()
 
-	if err := m.Save(); err != nil {
+	if err := m.saveHeld(); err != nil {
+		m.mu.Lock()
+		for _, id := range m.order {
+			if !slices.Contains(previous, id) {
+				previous = append(previous, id)
+			}
+		}
+		m.order = previous
+		m.mu.Unlock()
 		return err
 	}
 	m.broadcastEvent("servers.reordered", "")
 	return nil
 }
 
-func (m *Manager) Delete(id string) error {
+func (m *Manager) Delete(id string) error { return m.DeleteIntent(id, true, true) }
+
+func (m *Manager) DeleteIntent(id string, deleteData, deleteBackups bool) error {
 	// fsMu first, then lifecycle: a stopped server deleted while a backup or
 	// restore owns the exclusive filesystem gate would have its tree (or an
 	// adopted server's operator-owned tree) removed or swapped underneath
@@ -1026,6 +1186,10 @@ func (m *Manager) Delete(id string) error {
 	if st := s.State(); st == StatusRunning || st == StatusStarting {
 		m.lifecycle.Unlock()
 		return fmt.Errorf("stop the server before deleting it")
+	}
+	if err := m.beginDeletion(s, deleteData, deleteBackups); err != nil {
+		m.lifecycle.Unlock()
+		return err
 	}
 	m.mu.Lock()
 	delete(m.servers, id)
@@ -1069,14 +1233,14 @@ func (m *Manager) Delete(id string) error {
 	// adopted server: RemoveAll on the panel's own symlink unlinks the entry,
 	// never the operator's tree behind it.
 	var cleanupErrs []error
-	if err := os.RemoveAll(filepath.Join(m.dataDir, "servers", id)); err != nil {
-		cleanupErrs = append(cleanupErrs, fmt.Errorf("the server directory could not be removed: %w", err))
-	}
-	if err := os.RemoveAll(m.backupDir(id)); err != nil {
-		cleanupErrs = append(cleanupErrs, fmt.Errorf("the backups could not be removed: %w", err))
+	if err := m.completeDeletion(deletionIntent{id, s.Runtime, deleteData, deleteBackups}); err != nil {
+		cleanupErrs = append(cleanupErrs, err)
 	}
 	if err := m.Save(); err != nil {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("the server list could not be persisted: %w", err))
+	}
+	if len(cleanupErrs) == 0 {
+		_ = os.Remove(m.deletionPath(id))
 	}
 	m.broadcastEvent("server.deleted", id)
 	if len(cleanupErrs) > 0 {
@@ -1096,6 +1260,12 @@ func (m *Manager) requireRegistered(s *Server) error {
 	m.mu.RUnlock()
 	if !same {
 		return fmt.Errorf("this server no longer exists")
+	}
+	s.mu.Lock()
+	recovery := s.RecoveryRequired
+	s.mu.Unlock()
+	if recovery != "" {
+		return fmt.Errorf("server recovery is required: %s", recovery)
 	}
 	return nil
 }
@@ -1403,12 +1573,28 @@ var (
 	dockerImageLocal = imagePresent
 )
 
-func (m *Manager) Start(id string) error {
+func (m *Manager) Start(id string) error { return m.startExpected(id, 0) }
+func (m *Manager) startExpected(id string, expected uint64) error {
+	done, err := m.beginWork()
+	if err != nil {
+		return err
+	}
+	defer done()
+	if err := m.ctx.Err(); err != nil {
+		return err
+	}
 	s := m.Get(id)
 	if s == nil {
 		return fmt.Errorf("no such server")
 	}
 
+	if expected == 0 {
+		generation, err := m.persistIntent(s, true)
+		if err != nil {
+			return err
+		}
+		expected = generation
+	}
 	// The preflight runs before the lifecycle lock is taken, deliberately: it
 	// shells out to the docker daemon up to three times and reads no panel
 	// state at all. See the note on Manager.lifecycle for what holding the lock
@@ -1430,7 +1616,18 @@ func (m *Manager) Start(id string) error {
 	s.fsMu.Lock()
 	defer s.fsMu.Unlock()
 
-	if err := m.claimStart(s); err != nil {
+	if err := m.requireRegistered(s); err != nil {
+		return err
+	}
+	if expected != 0 {
+		s.mu.Lock()
+		stale := s.IntentGeneration != expected
+		s.mu.Unlock()
+		if stale {
+			return fmt.Errorf("lifecycle intent was superseded")
+		}
+	}
+	if err := m.claimStart(s, expected); err != nil {
 		return err
 	}
 
@@ -1448,9 +1645,19 @@ func (m *Manager) Start(id string) error {
 // the whole of what the lifecycle lock protects. The flip to StatusStarting is
 // the commit: Delete refuses a starting server and so does a second Start, so
 // everything Start does afterwards is safe with the lock already released.
-func (m *Manager) claimStart(s *Server) error {
+func (m *Manager) claimStart(s *Server, expected ...uint64) error {
+	port, hasGeyser, err := detectGeyser(m.serverDir(s))
+	if err != nil {
+		return err
+	}
+	var dynamic []portBinding
+	if hasGeyser {
+		dynamic = []portBinding{{port, "udp"}}
+	}
 	m.lifecycle.Lock()
 	defer m.lifecycle.Unlock()
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
 
 	// Looked up again under the lock. The preflight above can take minutes, and
 	// Delete may have committed while it ran.
@@ -1474,7 +1681,9 @@ func (m *Manager) claimStart(s *Server) error {
 	// under the manager lock.
 	s.mu.Lock()
 	s.BindPort = s.Port
-	s.DynamicBindings = dynamicBindings(m.dataDir, s.ID)
+	s.Readiness = "pending"
+	s.DynamicBindings = dynamic
+	s.launchBindingsResolved = true
 	s.mu.Unlock()
 
 	// The port is checked at create time, but server.properties can be edited
@@ -1495,18 +1704,59 @@ func (m *Manager) claimStart(s *Server) error {
 	}
 
 	s.mu.Lock()
+	if len(expected) > 0 && expected[0] != 0 && s.IntentGeneration != expected[0] {
+		s.mu.Unlock()
+		return fmt.Errorf("lifecycle intent was superseded")
+	}
+	oldPending, oldStarted, oldStatus := s.PendingRestart, s.StartedAt, s.Status
+	oldDesired, oldGeneration := s.DesiredRunning, s.IntentGeneration
 	s.PendingRestart = nil
+	desired := true
+	s.DesiredRunning = &desired
+	if len(expected) == 0 {
+		s.IntentGeneration++
+	}
 	s.StartedAt = time.Now()
+	s.Status = StatusStarting
 	s.mu.Unlock()
-
-	m.setStatus(s, StatusStarting, 0, "")
+	if err := m.saveHeld(); err != nil {
+		s.mu.Lock()
+		s.PendingRestart = oldPending
+		s.StartedAt = oldStarted
+		s.Status = oldStatus
+		s.DesiredRunning = oldDesired
+		s.IntentGeneration = oldGeneration
+		s.BindPort = 0
+		s.DynamicBindings = nil
+		s.launchBindingsResolved = false
+		s.mu.Unlock()
+		return fmt.Errorf("could not persist start claim: %w", err)
+	}
+	m.broadcastEvent("server.status", s.ID)
+	m.hub.PublishRaw(s.ID, map[string]any{"t": "status", "server": s.Snapshot()})
 	return nil
 }
 
-func (m *Manager) Stop(id string) error {
+func (m *Manager) Stop(id string) error { return m.stopIntent(id, true) }
+func (m *Manager) stopIntent(id string, updateIntent bool) error {
+	done, err := m.beginWork()
+	if err != nil {
+		return err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			done()
+		}
+	}()
 	s := m.Get(id)
 	if s == nil {
 		return fmt.Errorf("no such server")
+	}
+	if updateIntent {
+		if _, err := m.persistIntent(s, false); err != nil {
+			return err
+		}
 	}
 	if st := s.State(); st == StatusStopped || st == StatusFailed {
 		return fmt.Errorf("not running")
@@ -1526,7 +1776,9 @@ func (m *Manager) Stop(id string) error {
 	m.setStatus(s, StatusStopping, 0, "")
 	m.panelLine(s, "info", "Stopping the server gracefully.")
 
+	transferred = true
 	go func() {
+		defer done()
 		defer recoverPanic("stop worker for " + s.ID)
 		defer s.fsMu.Unlock()
 		if err := m.runnerFor(s).Stop(s); err != nil {
@@ -1563,12 +1815,27 @@ func (m *Manager) Stop(id string) error {
 }
 
 func (m *Manager) Kill(id string) error {
+	done, err := m.beginWork()
+	if err != nil {
+		return err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			done()
+		}
+	}()
 	s := m.Get(id)
 	if s == nil {
 		return fmt.Errorf("no such server")
 	}
+	if _, err := m.persistIntent(s, false); err != nil {
+		return err
+	}
 	m.panelLine(s, "warn", "Kill requested - the process is being terminated without a clean shutdown. Unsaved chunks are lost.")
+	transferred = true
 	go func() {
+		defer done()
 		defer recoverPanic("kill worker for " + s.ID)
 		if err := m.runnerFor(s).Kill(s); err != nil {
 			m.panelLine(s, "error", "Kill failed: "+err.Error())
@@ -1612,10 +1879,16 @@ func (m *Manager) Restart(id string) error {
 	if st := s.State(); st == StatusStopped || st == StatusFailed {
 		return m.Start(id)
 	}
+	generation, err := m.persistIntent(s, true)
+	if err != nil {
+		return err
+	}
 	m.panelLine(s, "info", "Restart requested.")
-	go func() {
+	if !m.own(func() {
 		defer recoverPanic("restart worker for " + s.ID)
-		_ = m.Stop(id)
+		if err := m.stopIntent(id, false); err != nil {
+			return
+		}
 		// Start refuses a server that is still stopping, so waiting a fixed
 		// time and then starting anyway turns a slow stop into a silent
 		// stop-only: the operator's restart is accepted, logged nowhere they
@@ -1635,18 +1908,27 @@ func (m *Manager) Restart(id string) error {
 				log.Printf("restart %s: never reached a stopped state", id)
 				return
 			}
-			time.Sleep(500 * time.Millisecond)
+			if waitContext(m.ctx, 500*time.Millisecond) != nil {
+				return
+			}
 		}
-		time.Sleep(400 * time.Millisecond)
-		if err := m.Start(id); err != nil {
+		if waitContext(m.ctx, 400*time.Millisecond) != nil {
+			return
+		}
+		if err := m.startExpected(id, generation); err != nil {
 			m.panelLine(s, "error", "Restart failed: "+err.Error())
 			log.Printf("restart %s: %v", id, err)
 		}
-	}()
+	}) {
+		return context.Canceled
+	}
 	return nil
 }
 
 func (m *Manager) Send(id, cmd, mode, actor string) error {
+	if err := m.ctx.Err(); err != nil {
+		return err
+	}
 	s := m.Get(id)
 	if s == nil {
 		return fmt.Errorf("no such server")
@@ -1665,6 +1947,11 @@ func (m *Manager) Send(id, cmd, mode, actor string) error {
 		return fmt.Errorf("console commands are temporarily blocked: a backup, restore or lifecycle operation owns this server's window; try again when it finishes")
 	}
 	defer s.fsMu.RUnlock()
+	if mode != "say" && (consoleVerb(cmd) == "stop" || consoleVerb(cmd) == "end") {
+		if _, err := m.persistIntent(s, false); err != nil {
+			return err
+		}
+	}
 	line := cmd
 	if mode == "say" {
 		line = "say " + cmd
@@ -1845,7 +2132,13 @@ func (m *Manager) trackPlayer(s *Server, name string, joined bool) {
 			}
 		}
 		if !found {
-			s.players = append(s.players, Player{Name: name, UUID: fakeUUID(name), PingMS: 30, JoinedAt: time.Now().Unix()})
+			p := Player{Name: name, Source: "log", JoinedAt: time.Now().Unix()}
+			if s.Runtime == RuntimeSim {
+				p.UUID = fakeUUID(name)
+				p.PingMS = 30
+				p.Source = "simulation"
+			}
+			s.players = append(s.players, p)
 		}
 	} else {
 		for i, p := range s.players {
@@ -1951,7 +2244,12 @@ func (m *Manager) metricsLoop() {
 	defer recoverPanic("metrics loop")
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-t.C:
+		}
 		m.sampleHostCPU()
 		m.refreshDirSizes()
 		if len(m.List()) == 0 {
@@ -1981,6 +2279,7 @@ func (m *Manager) sampleHostCPU() {
 	m.lastCPU = cur
 	if usage, ok := cpuUsagePercent(prev, cur); ok {
 		m.hostCPU = usage
+		m.hostCPUAt = time.Now()
 	}
 	m.usageMu.Unlock()
 }
@@ -2050,6 +2349,9 @@ func (m *Manager) refreshDirSizes() {
 		var total int64
 		root := m.serverDir(s)
 		_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+			if m.ctx.Err() != nil {
+				return filepath.SkipAll
+			}
 			if err != nil {
 				return nil // an unreadable corner should not abandon the total
 			}
@@ -2089,6 +2391,7 @@ func (m *Manager) Host() map[string]any {
 	// running". What an operator actually watches is what is in use now.
 	m.usageMu.RLock()
 	cpuPct := m.hostCPU
+	cpuAt := m.hostCPUAt
 	m.usageMu.RUnlock()
 
 	var players, usedMem int
@@ -2109,14 +2412,17 @@ func (m *Manager) Host() map[string]any {
 		}
 	}
 
+	memoryUsage := memoryUsageView()
 	return map[string]any{
 		"cpu": map[string]any{
 			"allocated_vcpu": allocCPU, "total_vcpu": hostCPUs,
-			"used_percent": round1(cpuPct),
+			"used_percent": nullableCPU(cpuPct, cpuAt),
+			"sampled_at":   cpuAt, "scope": "panel_host", "source": "platform_cpu_counters", "stale": cpuAt.IsZero() || time.Since(cpuAt) > 30*time.Second,
 		},
 		"memory": map[string]any{
 			"allocated_mb": allocMem, "total_mb": hostMemMB,
-			"used_mb": memUsedMB(), "servers_mb": usedMem,
+			"used_mb": memoryUsage["used_mb"], "servers_mb": usedMem,
+			"usage": memoryUsage, "capacity_scope": "panel_process_limit",
 		},
 		"disk": map[string]any{
 			"allocated_gb": disk, "total_gb": hostDiskGB,
@@ -2124,8 +2430,12 @@ func (m *Manager) Host() map[string]any {
 		},
 		"players": players,
 		"servers": len(m.List()), "running": running,
-		"docker": dockerAvailable(),
-		"agent":  map[string]any{"version": agentVersion, "healthy": true},
+		"docker":           dockerAvailable(),
+		"public_game_host": m.publicGameHost,
+		"capacity_scope":   "panel_host",
+		"docker_capacity":  daemonCapacityView(),
+		"agent":            map[string]any{"version": agentVersion, "healthy": !storageUncertain.Load(), "storage_uncertain": storageUncertain.Load()},
+		"audit":            m.auth.AuditHealth(),
 	}
 }
 
@@ -2218,6 +2528,13 @@ func (m *Manager) changeServerPort(s *Server, port int) error {
 
 // ApplySettings writes changes and reports which need a restart.
 func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string, error) {
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	return m.applySettingsHeld(s, changes)
+}
+func (m *Manager) applySettingsHeld(s *Server, changes map[string]string) ([]string, error) {
 	var needRestart []string
 
 	// Validate before taking the lock: a rejected change must not have
@@ -2242,13 +2559,15 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 	// the container a memory/CPU/port configuration that no longer matches
 	// what was just persisted. The port move happens INSIDE it - outside,
 	// Start could read the old port for -p and the new one for SERVER_PORT.
-	s.fsMu.RLock()
-	defer s.fsMu.RUnlock()
+
 	// Serialized against the other cooperating configuration writers (file
 	// edits, plugin publication) for the same reason WriteFile takes it.
-	s.editMu.Lock()
-	defer s.editMu.Unlock()
 
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	if err := m.requireRegistered(s); err != nil {
+		return nil, err
+	}
 	// R24 (audit pass 7): the pre-edit values are captured BEFORE the port
 	// moves. changeServerPort writes the new port into s.Props, so the
 	// restart comparison below used to see the port as already-unchanged and
@@ -2261,8 +2580,40 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 	for k, v := range s.Props {
 		oldProps[k] = v
 	}
+	oldPort, oldMax := s.Port, s.MaxPlayers
 	priorPending := append([]string(nil), s.PendingRestart...)
 	s.mu.Unlock()
+
+	releaseOld := func() {}
+	if newPort > 0 && newPort != oldPort {
+		lease, err := randomHex(16)
+		if err != nil {
+			return nil, err
+		}
+		oldBindings := serverBindings(s)
+		m.mu.Lock()
+		m.reservedByWho[lease] = &portLease{label: s.Name, ports: portsOf(oldBindings)}
+		for _, b := range oldBindings {
+			m.reservedPorts[b.port] = lease
+		}
+		m.mu.Unlock()
+		releaseOld = func() { m.releaseReservation(lease) }
+	}
+	defer releaseOld()
+	rollback := func(cause error) ([]string, error) {
+		s.mu.Lock()
+		s.Port, s.MaxPlayers, s.Props, s.PendingRestart = oldPort, oldMax, oldProps, priorPending
+		s.mu.Unlock()
+		if err := m.writePropsHeld(s); err != nil {
+			m.markRecoveryHeld(s, "settings rollback could not restore properties")
+			return nil, errors.Join(cause, err)
+		}
+		if err := m.saveHeld(); err != nil {
+			m.markRecoveryHeld(s, "settings rollback could not persist model")
+			return nil, errors.Join(cause, err)
+		}
+		return nil, cause
+	}
 
 	// The port moves first and atomically. If it is taken, the whole request
 	// is refused before any other setting has been applied.
@@ -2313,11 +2664,11 @@ func (m *Manager) ApplySettings(s *Server, changes map[string]string) ([]string,
 	s.PendingRestart = needRestart
 	s.mu.Unlock()
 
-	if err := m.Save(); err != nil {
-		return nil, err
-	}
 	if err := m.writePropsHeld(s); err != nil {
-		return nil, err
+		return rollback(err)
+	}
+	if err := m.saveHeld(); err != nil {
+		return rollback(err)
 	}
 	m.broadcastEvent("server.updated", s.ID)
 
@@ -2363,7 +2714,9 @@ func (m *Manager) pullImage(s *Server) {
 		"Image %s is not on this host yet. Downloading it now - a large game image can take a while, "+
 			"and progress appears below.", s.Image))
 
-	cmd := exec.Command("docker", "pull", s.Image)
+	ctx, cancel := context.WithTimeout(m.ctx, 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "pull", s.Image)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Printf("pull %s: %v", s.Image, err)
@@ -2400,4 +2753,17 @@ func (m *Manager) pullImage(s *Server) {
 		return
 	}
 	m.panelLine(s, "info", "Image downloaded. Starting the server.")
+}
+
+func nullableCPU(value float64, at time.Time) any {
+	if at.IsZero() || time.Since(at) > 30*time.Second {
+		return nil
+	}
+	return round1(value)
+}
+func checkFitsRuntime(runtime string, mem int, cpu float64) error {
+	if runtime == RuntimeDocker {
+		return checkFitsDaemon(runtime, mem, cpu)
+	}
+	return checkFitsHost(mem, cpu)
 }

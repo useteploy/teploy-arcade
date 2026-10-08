@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"math/rand"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -53,14 +52,18 @@ var simNames = []string{
 }
 
 func (r *simRunner) Start(s *Server, emit func(Line)) error {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(r.mgr.ctx)
 	p := &simProc{cancel: cancel, in: make(chan string, 16), done: make(chan struct{})}
 	s.mu.Lock()
 	s.proc = p
 	s.players = nil
+	s.logCursor = ""
 	s.mu.Unlock()
 
-	go r.run(ctx, s, p, emit)
+	if !r.mgr.own(func() { r.run(ctx, s, p, emit) }) {
+		cancel()
+		return context.Canceled
+	}
 	return nil
 }
 
@@ -159,7 +162,7 @@ func (r *simRunner) ambient(s *Server, emit func(Line)) {
 		}
 		if !dup && len(s.players) < s.MaxPlayers {
 			s.players = append(s.players, Player{
-				Name: name, UUID: fakeUUID(name),
+				Name: name, UUID: fakeUUID(name), Source: "simulation",
 				PingMS: 15 + rand.Intn(90), JoinedAt: time.Now().Unix(),
 			})
 		}
@@ -321,30 +324,33 @@ func (r *simRunner) handleCommand(s *Server, cmd string, emit func(Line)) {
 		// Every one of these reaches hub.Publish, so a viewer disconnecting at
 		// the wrong moment used to take the panel down from a bare `go`
 		// statement with nobody left to recover it.
-		go func() {
+		r.mgr.own(func() {
 			defer recoverPanic("simulator stop for " + s.ID)
 			_ = r.mgr.Stop(s.ID)
-		}()
+		})
 
 	case "flood":
 		// Deliberate backpressure test: floods the room so the dropped-line
 		// counter and the console's gap marker can be seen doing their job.
 		emit(Line{Level: "warn", Text: "flooding console with 5000 lines"})
-		go func() {
+		r.mgr.own(func() {
 			defer recoverPanic("simulator flood for " + s.ID)
 			for i := 1; i <= 5000; i++ {
+				if r.mgr.ctx.Err() != nil {
+					return
+				}
 				emit(Line{Text: fmt.Sprintf("[flood] line %d of 5000 - backpressure test", i)})
 			}
-		}()
+		})
 
 	case "crash":
 		// Forces the failure path so the failed state is reachable on demand.
 		emit(Line{Level: "error", Text: "java.lang.OutOfMemoryError: Java heap space"})
 		emit(Line{Level: "error", Text: "\tat net.minecraft.server.MinecraftServer.tickChildren(MinecraftServer.java:1579)"})
-		go func() {
+		r.mgr.own(func() {
 			defer recoverPanic("simulator crash for " + s.ID)
 			r.mgr.fail(s, 137, "OOM")
-		}()
+		})
 
 	default:
 		emit(Line{Level: "error", Text: fmt.Sprintf("Unknown or incomplete command, see below for error%s<--[HERE]", cmd)})
@@ -531,7 +537,7 @@ var rconThreadRe = regexp.MustCompile(`^Thread RCON Client .* (started|shutting 
 
 var rconIssuedRe = regexp.MustCompile(`Rcon issued server command:`)
 
-var joinRe = regexp.MustCompile(`(\w{3,16}) (joined|left) the game`)
+var joinRe = regexp.MustCompile(`^(?:\[[^\]\r\n]*\]: )?(\w{3,16}) (joined|left) the game$`)
 
 // "X joined the game" is a chat broadcast, and a plugin can cancel it.
 //
@@ -551,8 +557,8 @@ var joinRe = regexp.MustCompile(`(\w{3,16}) (joined|left) the game`)
 // dedupes an arrival by name and a removal for an absent player does nothing,
 // so a server that prints both is counted once.
 var (
-	loginRe    = regexp.MustCompile(`(\w{3,16})\[/[^\]]*\] logged in with entity id`)
-	lostConnRe = regexp.MustCompile(`(\w{3,16}) lost connection:`)
+	loginRe    = regexp.MustCompile(`^(?:\[[^\]\r\n]*\]: )?(\w{3,16})\[/[^\]]*\] logged in with entity id\b`)
+	lostConnRe = regexp.MustCompile(`^(?:\[[^\]\r\n]*\]: )?(\w{3,16}) lost connection:`)
 )
 
 // A proxy does not say "joined the game" - it never runs a world, so nobody
@@ -574,7 +580,7 @@ var (
 // which is the player being handed to a backend, not a second player arriving.
 // Matching loosely counts one player twice, and counts them out again when they
 // hop between backends.
-var proxyJoinRe = regexp.MustCompile(`\[connected player\] (\w{3,16}) \([^)]*\) has (connected|disconnected)`)
+var proxyJoinRe = regexp.MustCompile(`^(?:\[[^\]\r\n]*\]: )?\[connected player\] (\w{3,16}) \([^)]*\) has (connected|disconnected)$`)
 
 // dockerRunArgs builds the container command for a server. Extracted from Start
 // so a test can assert on what the image is actually told: the interesting
@@ -727,7 +733,11 @@ func publishArgs(s *Server, dir string) []string {
 	}
 	// Geyser is a plugin and its port belongs to the server that has it
 	// installed, whichever that is - a proxy or a Paper server. See geyserPort.
-	if port, ok := geyserPort(dir); ok {
+	if s.launchBindingsResolved {
+		for _, b := range s.DynamicBindings {
+			add(b.port, b.proto)
+		}
+	} else if port, ok, err := detectGeyser(dir); err == nil && ok {
 		add(port, "udp")
 	}
 	return out
@@ -751,62 +761,8 @@ func publishArgs(s *Server, dir string) []string {
 // plugin is clearly present but its config is not readable yet - which is the
 // normal state on the very first boot, before Geyser has written one.
 func geyserPort(dir string) (int, bool) {
-	if dir == "" {
-		return 0, false
-	}
-	plugins := filepath.Join(dir, "plugins")
-	ents, err := os.ReadDir(plugins)
-	if err != nil {
-		return 0, false
-	}
-	found := false
-	var cfg string
-	for _, e := range ents {
-		name := strings.ToLower(e.Name())
-		if !strings.HasPrefix(name, "geyser") {
-			continue
-		}
-		found = true
-		if e.IsDir() {
-			cfg = filepath.Join(plugins, e.Name(), "config.yml")
-		}
-	}
-	if !found {
-		return 0, false
-	}
-	if cfg == "" {
-		return geyserDefaultPort, true
-	}
-	b, err := os.ReadFile(cfg)
-	if err != nil {
-		return geyserDefaultPort, true
-	}
-	// A deliberately small YAML read: find the `bedrock:` block and take the
-	// first `port:` indented under it. Pulling in a YAML parser to read one
-	// integer out of one optional file is not a trade worth making, and a
-	// mis-read falls back to the default rather than failing a start.
-	inBedrock := false
-	for _, line := range strings.Split(string(b), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
-			continue
-		}
-		indented := line != strings.TrimLeft(line, " \t")
-		if !indented {
-			inBedrock = strings.HasPrefix(trimmed, "bedrock:")
-			continue
-		}
-		if !inBedrock {
-			continue
-		}
-		if rest, ok := strings.CutPrefix(trimmed, "port:"); ok {
-			if p := atoi(strings.TrimSpace(rest)); p > 0 && p <= 65535 {
-				return p, true
-			}
-			break
-		}
-	}
-	return geyserDefaultPort, true
+	port, found, err := detectGeyser(dir)
+	return port, found && err == nil
 }
 
 const geyserDefaultPort = 19132
@@ -860,7 +816,7 @@ func dockerRunArgs(s *Server, name, mountPath, rconSecret string) []string {
 		//
 		// Detached means the daemon owns the container's lifetime. Console
 		// input then goes over RCON, which is why it is forced on below.
-		"run", "-d", "--rm", "--name", name,
+		"run", "-d", "--rm", "--name", name, "--label", "io.teploy.arcade.server=" + s.ID,
 	}
 	args = append(args, publishArgs(s, mountPath)...)
 
@@ -985,7 +941,7 @@ func (r *dockerRunner) Start(s *Server, emit func(Line)) error {
 	// The context is created only once this call is committed to starting a
 	// container. Created above the guard, the early return walks away from a
 	// cancel func nobody will ever call.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(r.mgr.ctx)
 
 	// Resolve symlinks before handing the path to docker. On macOS /tmp and
 	// /var are symlinks into /private, and the daemon refuses the unresolved
@@ -1008,7 +964,7 @@ func (r *dockerRunner) Start(s *Server, emit func(Line)) error {
 
 	// `docker run -d` returns as soon as the container is created, so this call
 	// owns nothing afterwards - which is the entire point.
-	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+	out, err := dockerOutput(ctx, 2*time.Minute, true, args...)
 	if err != nil {
 		cancel()
 		return fmt.Errorf("docker run: %w: %s", err, strings.TrimSpace(string(out)))
@@ -1045,19 +1001,24 @@ const (
 var containerState = func(id string) ContainerState {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	engineInspector.RLock()
+	client, base := engineInspector.client, engineInspector.base
+	engineInspector.RUnlock()
+	if client != nil {
+		return inspectEngineContainer(ctx, client, base, id)
+	}
 	return inspectContainerState(ctx, id)
 }
 
 // inspectContainerState keeps inspection container-only: generic inspect can
 // fall through to images/networks and issue extra daemon requests. Until the
-// typed Engine inspector (A24) lands, accept only the exact CLI not-found
+// a Run-configured local Engine inspector is available, accept only the exact CLI not-found
 // response for this name, with status 1 and no successful output. Never use a
 // substring such as "not found": missing sockets, credentials or contexts do
 // not prove that a container is absent. Unrecognized CLI variants fail closed.
 func inspectContainerState(ctx context.Context, id string) ContainerState {
 	name := containerPrefix + "-" + id
-	out, err := exec.CommandContext(ctx, "docker", "inspect", "--type", "container",
-		"-f", "{{.State.Running}}", name).Output()
+	out, err := dockerOutput(ctx, 10*time.Second, false, "inspect", "--type", "container", "-f", "{{.State.Running}}", name)
 	if ctx.Err() != nil {
 		return ContainerUnknown
 	}
@@ -1109,15 +1070,15 @@ func (r *dockerRunner) Adopt(s *Server, emit func(Line)) error {
 // starting one and finding one already running differ only in how much history
 // the console wants and whether the server is known to be ready.
 func (r *dockerRunner) attach(s *Server, emit func(Line), adopted bool) error {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(r.mgr.ctx)
 	name := containerPrefix + "-" + s.ID
 
-	logArgs := []string{"logs", "-f", name}
+	logArgs := []string{"logs", "-f", "--timestamps", name}
 	if adopted {
 		// Give the console some history back; the in-memory ring buffer died
 		// with the previous process. On a fresh start there is no history to
 		// recover and the container's whole log is new output.
-		logArgs = []string{"logs", "-f", "--tail", "200", name}
+		logArgs = []string{"logs", "-f", "--timestamps", "--tail", "200", name}
 	}
 	cmd := exec.CommandContext(ctx, "docker", logArgs...)
 	stdout, err := cmd.StdoutPipe()
@@ -1136,27 +1097,21 @@ func (r *dockerRunner) attach(s *Server, emit func(Line), adopted bool) error {
 	s.proc = p
 	s.mu.Unlock()
 
-	go func() {
-		r.stream(s, stdout, emit, adopted)
-		// `docker logs -f` is our own child process. Nothing else waits on it,
-		// so without this it sits as a zombie until the panel exits - one per
-		// adopted server.
+	if !r.mgr.own(func() { r.followLogs(ctx, s, name, cmd, stdout, emit, adopted) }) {
+		cancel()
 		_ = cmd.Wait()
-	}()
-	go r.pollStats(ctx, s, name)
-	go func() {
-		// Nothing else cancels this context: the adopt path has no cmd.Wait
-		// handler to do it, and until it happens pollStats keeps ticking every
-		// 3s against a container that is gone, forever.
-		defer cancel()
-		r.watchExit(ctx, s, name)
-	}()
-
+		return context.Canceled
+	}
+	r.mgr.own(func() { r.pollStats(ctx, s, name) })
+	r.mgr.own(func() { defer cancel(); r.watchExit(ctx, s, name) })
 	if !adopted {
-		go r.watchReady(ctx, s, name)
+		r.mgr.own(func() { r.watchReady(ctx, s, name) })
 	}
 
 	if adopted {
+		s.mu.Lock()
+		s.Readiness = "unverified"
+		s.mu.Unlock()
 		r.mgr.setStatus(s, StatusRunning, 0, "")
 		r.mgr.panelLine(s, "info",
 			"Re-attached to a container that was already running - the panel restarted, this server never stopped.")
@@ -1173,10 +1128,11 @@ func (r *dockerRunner) attach(s *Server, emit func(Line), adopted bool) error {
 		// another goroutine and re-adds whoever it sees, so a reconcile that
 		// wins the race gets overwritten by history it was there to correct.
 		// The game's answer has to be the last word, not the first.
-		go func() {
-			time.Sleep(replaySettle)
-			r.mgr.reconcilePlayers(s)
-		}()
+		r.mgr.own(func() {
+			if waitContext(ctx, replaySettle) == nil {
+				r.mgr.reconcilePlayers(s)
+			}
+		})
 	}
 	return nil
 }
@@ -1232,6 +1188,9 @@ func (r *dockerRunner) watchReady(ctx context.Context, s *Server, name string) {
 		"Still running after %s and this server never printed %s, which is the line its template says means ready. "+
 			"Treating it as running. If it is in fact up, that template's ready_log is wrong - the correct line is in the console above.",
 		readyFallbackFor, want))
+	s.mu.Lock()
+	s.Readiness = "unverified"
+	s.mu.Unlock()
 	r.mgr.setStatus(s, StatusRunning, 0, "")
 }
 
@@ -1250,7 +1209,7 @@ func (r *dockerRunner) watchExit(ctx context.Context, s *Server, name string) {
 
 	backoff := time.Second
 	for {
-		out, err := exec.CommandContext(ctx, "docker", "wait", name).Output()
+		out, err := dockerOutput(ctx, time.Minute, false, "wait", name)
 		if err != nil {
 			if ctx.Err() != nil {
 				// We tore it down ourselves, so the kill is not a container
@@ -1264,7 +1223,8 @@ func (r *dockerRunner) watchExit(ctx context.Context, s *Server, name string) {
 				// panel restart, which clears the status on load.
 				//
 				// If the container is gone, the server has stopped. Say so.
-				if !containerRunning(s.ID) {
+				switch containerState(s.ID) {
+				case ContainerStopped, ContainerMissing:
 					r.mgr.processExited(s, nil)
 				}
 				return
@@ -1321,8 +1281,7 @@ func (r *dockerRunner) watchExit(ctx context.Context, s *Server, name string) {
 var containerOOMKilled = func(id string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.OOMKilled}}",
-		containerPrefix+"-"+id).Output()
+	out, err := dockerOutput(ctx, 10*time.Second, false, "inspect", "-f", "{{.State.OOMKilled}}", containerPrefix+"-"+id)
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
@@ -1340,8 +1299,7 @@ func (r *dockerRunner) pollStats(ctx context.Context, s *Server, name string) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			out, err := exec.Command("docker", "stats", "--no-stream",
-				"--format", "{{.CPUPerc}} {{.MemUsage}}", name).Output()
+			out, err := dockerOutput(ctx, 15*time.Second, false, "stats", "--no-stream", "--format", "{{.CPUPerc}} {{.MemUsage}}", name)
 			if err != nil {
 				continue
 			}
@@ -1427,6 +1385,14 @@ func (r *dockerRunner) stream(s *Server, stdout io.Reader, emit func(Line), alre
 			continue
 		}
 		text := string(raw)
+		if stamp, body, ok := strings.Cut(text, " "); ok {
+			if _, err := time.Parse(time.RFC3339Nano, stamp); err == nil {
+				s.mu.Lock()
+				s.logCursor = stamp
+				s.mu.Unlock()
+				text = body
+			}
+		}
 
 		// Transport churn is never worth showing. The middle line - the command
 		// echo - is kept when an operator typed it and dropped when the panel
@@ -1454,6 +1420,9 @@ func (r *dockerRunner) stream(s *Server, stdout io.Reader, emit func(Line), alre
 		}
 		if !ready && isReady(s, text) {
 			ready = true
+			s.mu.Lock()
+			s.Readiness = "observed"
+			s.mu.Unlock()
 			r.mgr.setStatus(s, StatusRunning, 0, "")
 		}
 		emit(Line{Level: classify(text), Source: src, Text: text})
@@ -1472,7 +1441,7 @@ func (r *dockerRunner) Stop(s *Server) error {
 	// Reported, not discarded: the caller cancels its log/wait supervision on
 	// nil, and a discarded failure leaves a live container the panel has
 	// deliberately stopped watching while it shows "stopping" forever.
-	if out, err := exec.Command("docker", "stop", "-t", "45", name).CombinedOutput(); err != nil {
+	if out, err := dockerOutput(r.mgr.ctx, time.Minute, true, "stop", "-t", "45", name); err != nil {
 		return fmt.Errorf("could not stop the container: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	r.cancelProc(s)
@@ -1482,7 +1451,7 @@ func (r *dockerRunner) Stop(s *Server) error {
 func (r *dockerRunner) Kill(s *Server) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", "kill", containerPrefix+"-"+s.ID).CombinedOutput()
+	out, err := dockerOutput(ctx, 30*time.Second, true, "kill", containerPrefix+"-"+s.ID)
 	if err != nil {
 		// Supervision is retained on failure, exactly as Stop retains it: the
 		// container may still be running, and cancelling the watchers of a
@@ -1531,7 +1500,9 @@ func (r *dockerRunner) Send(s *Server, cmd string) error {
 	// them, which means the panel never holds their stdin - every command goes
 	// in through the image's own console tool.
 	name := containerPrefix + "-" + s.ID
-	out, err := exec.Command("docker", "exec", name, consoleTool(s.Image), cmd).CombinedOutput()
+	ctx, cancel := context.WithTimeout(r.mgr.ctx, 30*time.Second)
+	defer cancel()
+	out, err := dockerOutput(ctx, 30*time.Second, true, "exec", name, consoleTool(s.Image), cmd)
 	if err != nil {
 		return fmt.Errorf("the command could not be delivered to the server console: %s",
 			strings.TrimSpace(string(out)))
@@ -1584,6 +1555,9 @@ func hasRCON(image string) bool { return consoleTool(image) == "rcon-cli" }
 // command's reply reaches the operator through the log stream, so returning it
 // there would print everything twice.
 func (r *dockerRunner) query(s *Server, cmd string) (string, error) {
+	return r.queryContext(r.mgr.ctx, s, cmd)
+}
+func (r *dockerRunner) queryContext(parent context.Context, s *Server, cmd string) (string, error) {
 	s.mu.Lock()
 	p, _ := s.proc.(*dockerProc)
 	s.mu.Unlock()
@@ -1600,7 +1574,9 @@ func (r *dockerRunner) query(s *Server, cmd string) (string, error) {
 	s.mu.Lock()
 	s.quietRCONUntil = time.Now().Add(rconQuietWindow)
 	s.mu.Unlock()
-	out, err := exec.Command("docker", "exec", name, consoleTool(s.Image), cmd).CombinedOutput()
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	out, err := dockerOutput(ctx, 30*time.Second, true, "exec", name, consoleTool(s.Image), cmd)
 	if err != nil {
 		return "", fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -1697,11 +1673,84 @@ func fakeUUID(seed string) string {
 	return fmt.Sprintf("%08x-%04x-4%03x-8%03x-%012x", h, h&0xffff, h&0xfff, (h>>4)&0xfff, uint64(h)*7919)
 }
 
+var dockerHealthCache = struct {
+	sync.Mutex
+	at      time.Time
+	healthy bool
+}{}
+
 func dockerAvailable() bool {
-	return exec.Command("docker", "info").Run() == nil
+	engineInspector.RLock()
+	configured := engineInspector.client != nil
+	engineInspector.RUnlock()
+	if configured {
+		dockerHealthCache.Lock()
+		defer dockerHealthCache.Unlock()
+		if time.Since(dockerHealthCache.at) < 5*time.Second {
+			return dockerHealthCache.healthy
+		}
+	}
+	_, err := dockerOutput(context.Background(), 10*time.Second, false, "info", "--format", "{{.ServerVersion}}")
+	if configured {
+		dockerHealthCache.at = time.Now()
+		dockerHealthCache.healthy = err == nil
+	}
+	return err == nil
 }
 
 func imagePresent(image string) bool {
-	out, err := exec.Command("docker", "images", "-q", image).Output()
+	out, err := dockerOutput(context.Background(), 15*time.Second, false, "images", "-q", image)
 	return err == nil && len(strings.TrimSpace(string(out))) > 0
+}
+
+// Reconnect console transport independently of container supervision. Docker
+// timestamps provide a replay cursor; the boundary line may repeat, but an
+// outage never gets guessed into game death or an unbounded child process.
+func (r *dockerRunner) followLogs(ctx context.Context, s *Server, name string, cmd *exec.Cmd, stdout io.ReadCloser, emit func(Line), ready bool) {
+	backoff := time.Second
+	for {
+		r.stream(s, stdout, emit, ready)
+		_ = cmd.Wait()
+		_ = stdout.Close()
+		if ctx.Err() != nil {
+			return
+		}
+		switch containerState(s.ID) {
+		case ContainerStopped, ContainerMissing:
+			return
+		}
+		if waitContext(ctx, backoff) != nil {
+			return
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+		s.mu.Lock()
+		cursor := s.logCursor
+		s.mu.Unlock()
+		args := []string{"logs", "-f", "--timestamps"}
+		if cursor != "" {
+			args = append(args, "--since", cursor)
+		} else {
+			args = append(args, "--tail", "200")
+		}
+		args = append(args, name)
+		cmd = exec.CommandContext(ctx, "docker", args...)
+		var err error
+		stdout, err = cmd.StdoutPipe()
+		if err != nil {
+			return
+		}
+		cmd.Stderr = cmd.Stdout
+		if err = cmd.Start(); err != nil {
+			stdout.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+	}
 }

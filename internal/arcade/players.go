@@ -1,9 +1,14 @@
 package arcade
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -72,6 +77,7 @@ type ListEntry struct {
 	Source  string `json:"source,omitempty"`
 	Created string `json:"created,omitempty"`
 	Expires string `json:"expires,omitempty"`
+	extra   map[string]json.RawMessage
 }
 
 // Key is what identifies the entry to the user and to a remove command.
@@ -87,17 +93,30 @@ func (m *Manager) readList(s *Server, l PlayerList) ([]ListEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir, err := m.ensureServerDir(s)
+	root, err := os.OpenRoot(m.serverDir(s))
 	if err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(filepath.Join(dir, name))
+	defer root.Close()
+	f, st, err := openRegularIn(root, name)
 	if os.IsNotExist(err) {
 		return []ListEntry{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
+	if st.Size() > maxBodyBytes {
+		return nil, fmt.Errorf("player list exceeds size limit")
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxBodyBytes {
+		return nil, fmt.Errorf("player list exceeds size limit")
+	}
+
 	var out []ListEntry
 	if err := json.Unmarshal(b, &out); err != nil {
 		// A hand-edited file that no longer parses should say so rather than
@@ -118,6 +137,8 @@ func (m *Manager) writeList(s *Server, l PlayerList, entries []ListEntry) error 
 	// Start's fsMu -> lifecycle order.
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
 	return m.writeListHeld(s, l, entries)
 }
 
@@ -207,9 +228,14 @@ func (m *Manager) routeListChange(s *Server, l PlayerList, edit func() error) (v
 	// the same server deadlocked the whole process (lifecycle is global).
 	s.fsMu.RLock()
 	defer s.fsMu.RUnlock()
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
 
 	m.lifecycle.Lock()
 	defer m.lifecycle.Unlock()
+	if err := m.requireRegistered(s); err != nil {
+		return false, err
+	}
 
 	switch st := s.State(); st {
 	case StatusRunning:
@@ -227,6 +253,13 @@ func (m *Manager) routeListChange(s *Server, l PlayerList, edit func() error) (v
 
 func (m *Manager) AddToList(s *Server, l PlayerList, who, reason, actor string) error {
 	who = strings.TrimSpace(who)
+	if l == ListBannedIPs {
+		ip, err := netip.ParseAddr(who)
+		if err != nil {
+			return fmt.Errorf("a valid IPv4 or IPv6 address is required")
+		}
+		who = ip.Unmap().String()
+	}
 	if who == "" {
 		return fmt.Errorf("a name or IP is required")
 	}
@@ -240,13 +273,13 @@ func (m *Manager) AddToList(s *Server, l PlayerList, who, reason, actor string) 
 	}
 
 	viaConsole, err := m.routeListChange(s, l, func() error {
-		return m.applyListAdd(s, l, who, reason)
+		return m.applyListAddHeld(s, l, who, reason)
 	})
 	if err != nil {
 		return err
 	}
 	if viaConsole {
-		if err := m.runnerFor(s).Send(s, gameCommand(l, true, who, reason)); err != nil {
+		if err := m.Send(s.ID, gameCommand(l, true, who, reason), "command", actor); err != nil {
 			return err
 		}
 	}
@@ -258,12 +291,17 @@ func (m *Manager) AddToList(s *Server, l PlayerList, who, reason, actor string) 
 // simulator when it handles a whitelist/op/ban command - a simulator that
 // acknowledges a command without applying it is worse than one that refuses.
 func (m *Manager) applyListAdd(s *Server, l PlayerList, who, reason string) error {
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	return m.applyListAddHeld(s, l, who, reason)
+}
+func (m *Manager) applyListAddHeld(s *Server, l PlayerList, who, reason string) error {
 	entries, err := m.readList(s, l)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
-		if strings.EqualFold(e.Key(), who) {
+		if playerListKeyEqual(l, e.Key(), who) {
 			return fmt.Errorf("%s is already on the %s", who, l.label())
 		}
 	}
@@ -274,11 +312,18 @@ func (m *Manager) applyListAdd(s *Server, l PlayerList, who, reason string) erro
 		Reason:  reason,
 	}
 	if l == ListBannedIPs {
-		e.IP = who
+		ip, err := netip.ParseAddr(who)
+		if err != nil {
+			return fmt.Errorf("a valid IPv4 or IPv6 address is required")
+		}
+		e.IP = ip.Unmap().String()
 	} else {
 		e.Name = who
-		// The game fills the real UUID on first contact; offline placeholders
-		// would be worse than an empty field.
+		uuid, err := m.playerListUUID(s, who)
+		if err != nil {
+			return err
+		}
+		e.UUID = uuid
 		if l == ListOps {
 			e.Level = 4
 		}
@@ -290,6 +335,17 @@ func (m *Manager) applyListAdd(s *Server, l PlayerList, who, reason string) erro
 }
 
 func (m *Manager) RemoveFromList(s *Server, l PlayerList, who, actor string) error {
+	who = strings.TrimSpace(who)
+	if who == "" || strings.Contains(who, " ") {
+		return fmt.Errorf("a valid name or IP is required")
+	}
+	if l == ListBannedIPs {
+		ip, err := netip.ParseAddr(who)
+		if err != nil {
+			return fmt.Errorf("a valid IPv4 or IPv6 address is required")
+		}
+		who = ip.Unmap().String()
+	}
 	// The remove path composes a console command too, so "x\nop attacker" is the
 	// same escalation as a poisoned ban reason.
 	if hasControl(who) {
@@ -297,13 +353,13 @@ func (m *Manager) RemoveFromList(s *Server, l PlayerList, who, actor string) err
 	}
 
 	viaConsole, err := m.routeListChange(s, l, func() error {
-		return m.applyListRemove(s, l, who)
+		return m.applyListRemoveHeld(s, l, who)
 	})
 	if err != nil {
 		return err
 	}
 	if viaConsole {
-		if err := m.runnerFor(s).Send(s, gameCommand(l, false, who, "")); err != nil {
+		if err := m.Send(s.ID, gameCommand(l, false, who, ""), "command", actor); err != nil {
 			return err
 		}
 	}
@@ -312,6 +368,11 @@ func (m *Manager) RemoveFromList(s *Server, l PlayerList, who, actor string) err
 }
 
 func (m *Manager) applyListRemove(s *Server, l PlayerList, who string) error {
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	return m.applyListRemoveHeld(s, l, who)
+}
+func (m *Manager) applyListRemoveHeld(s *Server, l PlayerList, who string) error {
 	entries, err := m.readList(s, l)
 	if err != nil {
 		return err
@@ -319,7 +380,7 @@ func (m *Manager) applyListRemove(s *Server, l PlayerList, who string) error {
 	out := entries[:0]
 	found := false
 	for _, e := range entries {
-		if strings.EqualFold(e.Key(), who) {
+		if playerListKeyEqual(l, e.Key(), who) {
 			found = true
 			continue
 		}
@@ -505,7 +566,7 @@ func (m *Manager) reconcilePlayers(s *Server) {
 		// Same count, different people is still a change - a swap during the
 		// window the panel was not watching would otherwise go unlogged.
 		changed = true
-		next = append(next, Player{Name: n, UUID: fakeUUID(n), PingMS: 30, JoinedAt: time.Now().Unix()})
+		next = append(next, Player{Name: n, Source: "rcon", JoinedAt: time.Now().Unix()})
 	}
 	s.players = next
 	s.mu.Unlock()
@@ -570,7 +631,12 @@ func (m *Manager) playerSyncLoop() {
 	defer recoverPanic("player sync")
 	t := time.NewTicker(playerSyncInterval)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-t.C:
+		}
 		for _, s := range m.List() {
 			if m.hub.Viewers(s.ID) == 0 {
 				continue
@@ -578,4 +644,156 @@ func (m *Manager) playerSyncLoop() {
 			m.reconcilePlayers(s)
 		}
 	}
+}
+
+func (e *ListEntry) UnmarshalJSON(b []byte) error {
+	type fields ListEntry
+	var value fields
+	if err := json.Unmarshal(b, &value); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(b, &value.extra); err != nil {
+		return err
+	}
+	for _, key := range []string{"name", "uuid", "ip", "level", "reason", "source", "created", "expires"} {
+		delete(value.extra, key)
+	}
+	*e = ListEntry(value)
+	return nil
+}
+func (e ListEntry) MarshalJSON() ([]byte, error) {
+	type fields ListEntry
+	b, err := json.Marshal(fields(e))
+	if err != nil {
+		return nil, err
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(b, &values); err != nil {
+		return nil, err
+	}
+	for key, value := range e.extra {
+		values[key] = value
+	}
+	return json.Marshal(values)
+}
+
+// Stopped edits never invent an online identity. Local cache/list records are
+// the only permitted evidence; conflicts or unknown identities require the
+// game to resolve them while running. Offline UUIDs exactly match Java's
+// UUID.nameUUIDFromBytes(UTF8("OfflinePlayer:" + case-sensitive name)).
+func offlinePlayerUUID(name string) string {
+	sum := md5.Sum([]byte("OfflinePlayer:" + name)) // Java's required identity format, not a credential hash.
+	sum[6] = (sum[6] & 0x0f) | 0x30
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
+}
+func canonicalPlayerUUID(raw string) (string, error) {
+	if len(raw) != 36 || raw[8] != '-' || raw[13] != '-' || raw[18] != '-' || raw[23] != '-' {
+		return "", fmt.Errorf("player UUID must use canonical 8-4-4-4-12 form")
+	}
+	bytes, err := hex.DecodeString(strings.ReplaceAll(raw, "-", ""))
+	if err != nil || len(bytes) != 16 {
+		return "", fmt.Errorf("invalid player UUID")
+	}
+	zero := true
+	for _, b := range bytes {
+		if b != 0 {
+			zero = false
+		}
+	}
+	if zero {
+		return "", fmt.Errorf("nil player UUID is not an identity")
+	}
+	return strings.ToLower(raw), nil
+}
+
+const maxIdentityCacheBytes = 1 << 20
+
+func (m *Manager) playerListUUID(s *Server, who string) (string, error) {
+	if s.Runtime == RuntimeSim && s.State() == StatusRunning {
+		return fakeUUID(who), nil
+	} // simulator owns resolution of its live commands
+	switch strings.ToLower(strings.TrimSpace(s.Prop("online-mode"))) {
+	case "false":
+		return offlinePlayerUUID(who), nil
+	case "", "true":
+	default:
+		return "", fmt.Errorf("online-mode must be true or false before editing player identities")
+	}
+	found := ""
+	consider := func(name, raw string) error {
+		if !strings.EqualFold(name, who) {
+			return nil
+		}
+		uuid, err := canonicalPlayerUUID(raw)
+		if err != nil {
+			return fmt.Errorf("known record for %s has an invalid UUID; repair it before editing lists", who)
+		}
+		if found != "" && found != uuid {
+			return fmt.Errorf("conflicting known UUIDs for %s; repair local identity records", who)
+		}
+		found = uuid
+		return nil
+	}
+	root, err := os.OpenRoot(m.serverDir(s))
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	f, info, err := openRegularIn(root, "usercache.json")
+	if err == nil {
+		if info.Size() > maxIdentityCacheBytes {
+			f.Close()
+			return "", fmt.Errorf("usercache.json exceeds identity lookup limit")
+		}
+		body, readErr := io.ReadAll(io.LimitReader(f, maxIdentityCacheBytes+1))
+		closeErr := f.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return "", err
+		}
+		if len(body) > maxIdentityCacheBytes {
+			return "", fmt.Errorf("usercache.json exceeds identity lookup limit")
+		}
+		var profiles []*struct {
+			Name string `json:"name"`
+			UUID string `json:"uuid"`
+		}
+		if json.Unmarshal(body, &profiles) != nil || profiles == nil || len(profiles) > 10000 {
+			return "", fmt.Errorf("usercache.json is not a bounded profile array")
+		}
+		for _, profile := range profiles {
+			if profile == nil {
+				return "", fmt.Errorf("usercache.json contains a null profile")
+			}
+			if err := consider(profile.Name, profile.UUID); err != nil {
+				return "", err
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	for _, list := range []PlayerList{ListWhitelist, ListOps, ListBanned} {
+		entries, err := m.readList(s, list)
+		if err != nil {
+			return "", err
+		}
+		for _, entry := range entries {
+			if err := consider(entry.Name, entry.UUID); err != nil {
+				return "", err
+			}
+		}
+	}
+	if found == "" {
+		return "", fmt.Errorf("online identity for %s is unknown; start the server so the game can resolve it, or provide a known matching profile in usercache.json", who)
+	}
+	return found, nil
+}
+
+func playerListKeyEqual(list PlayerList, a, b string) bool {
+	if list == ListBannedIPs {
+		ipA, errA := netip.ParseAddr(a)
+		ipB, errB := netip.ParseAddr(b)
+		return errA == nil && errB == nil && ipA.Unmap() == ipB.Unmap()
+	}
+	return strings.EqualFold(a, b)
 }

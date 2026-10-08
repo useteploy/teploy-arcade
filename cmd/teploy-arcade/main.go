@@ -39,11 +39,13 @@ func main() {
 		// directories, and evaluating it during flag setup meant --version,
 		// --help and even a run carrying an explicit -data all touched
 		// /var/teploy-arcade first. "" means "resolve the default at startup".
-		dataDir  = flag.String("data", "", "Data directory for servers, backups and users (default resolved at startup)")
-		noAuth   = flag.Bool("no-auth", false, "Disable authentication (development only)")
-		dataHost = flag.String("data-host", "", "Host-side path matching -data, when the panel itself runs in a container")
-		origins  = flag.String("origin", "", "Extra hostnames allowed to open the console socket, comma separated (for a proxied deploy)")
-		showVer  = flag.Bool("version", false, "Print version and exit")
+		dataDir      = flag.String("data", "", "Data directory for servers, backups and users (default resolved at startup)")
+		noAuth       = flag.Bool("no-auth", false, "Disable authentication (development only)")
+		dataHost     = flag.String("data-host", "", "Host-side path matching -data, when the panel itself runs in a container")
+		origins      = flag.String("origin", "", "Extra hostnames allowed to open the console socket, comma separated (for a proxied deploy)")
+		publicOrigin = flag.String("public-origin", os.Getenv("TEPLOY_ARCADE_PUBLIC_ORIGIN"), "HTTPS browser origin when TLS terminates at a trusted proxy")
+		gameHost     = flag.String("game-host", os.Getenv("TEPLOY_ARCADE_GAME_HOST"), "Hostname game clients should use; independent of the panel URL")
+		showVer      = flag.Bool("version", false, "Print version and exit")
 
 		// Provisioning the first admin here skips the first-run setup flow and
 		// its token entirely, which is how most deployments should run: the
@@ -82,15 +84,16 @@ func main() {
 	}
 
 	if err := arcade.Run(arcade.Config{
-		Host:     *host,
-		Port:     *port,
-		DataDir:  *dataDir,
-		Web:      web,
-		Version:  version,
-		Commit:   commit,
-		NoAuth:   *noAuth,
-		Origins:  splitList(*origins),
-		DataHost: *dataHost,
+		Host:         *host,
+		Port:         *port,
+		DataDir:      *dataDir,
+		Web:          web,
+		Version:      version,
+		Commit:       commit,
+		NoAuth:       *noAuth,
+		Origins:      splitList(*origins),
+		DataHost:     *dataHost,
+		PublicOrigin: *publicOrigin, PublicGameHost: *gameHost,
 
 		AdminUser:     *adminUser,
 		AdminPassword: *adminPass,

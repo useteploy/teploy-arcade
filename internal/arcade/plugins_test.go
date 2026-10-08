@@ -245,6 +245,8 @@ func truncatedJarBytes() []byte { return []byte("PK\x03\x04" + "truncated nonsen
 // each guard is tested for what it prevents: an arbitrary local read, an
 // arbitrary write into the server directory, and a full disk.
 func TestPluginInstallRefusesEverythingThatIsNotAJarDownload(t *testing.T) {
+	t.Setenv("TEPLOY_ARCADE_ALLOW_HTTP_PLUGINS", "1")
+	t.Setenv("TEPLOY_ARCADE_ALLOW_PRIVATE_PLUGIN_HOSTS", "1")
 	_, mgr := newTestAgent(t)
 	s := newPluginServer(t, mgr, "paper")
 	dir := filepath.Join(mgr.serverDir(s), "plugins")

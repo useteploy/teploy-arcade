@@ -111,7 +111,12 @@ func (m *Manager) sampleLoop() {
 	defer recoverPanic("metrics sampler")
 	t := time.NewTicker(sampleEvery)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-t.C:
+		}
 		now := time.Now().Unix()
 		var hostCPU float64
 		var hostMem, hostPlayers int
@@ -152,7 +157,12 @@ func (m *Manager) guardLoop() {
 	defer t.Stop()
 	warned := map[string]time.Time{}
 
-	for range t.C {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-t.C:
+		}
 		for _, s := range m.List() {
 			s.mu.Lock()
 			mem, limit, status := s.memMB, s.MemoryMB, s.Status //nolint:gocritic // already under s.mu

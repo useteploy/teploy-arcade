@@ -141,11 +141,7 @@ func cleanRel(rel string) (string, error) {
 // adopted server's tree is moved or replaced, which is exactly the confusion
 // the panel is supposed to save an operator from.
 func (m *Manager) serverRoot(s *Server) (*os.Root, error) {
-	dir, err := m.ensureServerDir(s)
-	if err != nil {
-		return nil, err
-	}
-	return os.OpenRoot(dir)
+	return os.OpenRoot(m.serverDir(s))
 }
 
 // rootedPath is the (root, name) pair every operation below works from.
@@ -346,10 +342,13 @@ func openRegularIn(r *os.Root, name string) (*os.File, os.FileInfo, error) {
 // The rest of the file (comments, other keys, spacing) is not this function's
 // business; only the managed identity is restricted.
 func propsPortValue(content string) (int, bool, error) {
+	if err := validateCanonicalProps(content); err != nil {
+		return 0, false, err
+	}
 	seen := 0
 	var last string
 	for _, ln := range strings.Split(content, "\n") {
-		ln = strings.TrimSpace(ln)
+		ln = strings.TrimLeft(strings.TrimSuffix(ln, "\r"), " \t\f")
 		if ln == "" || strings.HasPrefix(ln, "#") || strings.HasPrefix(ln, "!") {
 			continue
 		}
@@ -367,7 +366,10 @@ func propsPortValue(content string) (int, bool, error) {
 			continue
 		}
 		seen++
-		last = strings.TrimSpace(v)
+		last = strings.TrimLeft(v, " \t\f")
+		if last != strings.TrimSpace(last) {
+			return 0, false, fmt.Errorf("server-port must not contain trailing whitespace")
+		}
 	}
 	if seen == 0 {
 		return 0, false, nil
@@ -503,6 +505,11 @@ func (m *Manager) WriteFile(s *Server, rel, content string) error {
 	// successful edit's bytes.
 	s.editMu.Lock()
 	defer s.editMu.Unlock()
+
+	return m.writeFileHeld(s, rel, content)
+}
+
+func (m *Manager) writeFileHeld(s *Server, rel, content string) error {
 
 	if err := m.requireRegistered(s); err != nil {
 		return err
@@ -760,12 +767,12 @@ func (m *Manager) validatePropsPort(s *Server, content string) error {
 func parsePropsLines(content string) map[string]string {
 	parsed := map[string]string{}
 	for _, ln := range strings.Split(content, "\n") {
-		ln = strings.TrimSpace(ln)
+		ln = strings.TrimLeft(strings.TrimSuffix(ln, "\r"), " \t\f")
 		if ln == "" || strings.HasPrefix(ln, "#") || strings.HasPrefix(ln, "!") {
 			continue
 		}
 		if k, v, ok := strings.Cut(ln, "="); ok {
-			parsed[strings.TrimSpace(k)] = strings.TrimSpace(v)
+			parsed[strings.TrimSpace(k)] = strings.TrimLeft(v, " \t\f")
 		}
 	}
 	return parsed
@@ -828,6 +835,9 @@ func (m *Manager) reloadProps(s *Server, content string) error {
 // seedServerFiles gives a new server a plausible tree so the file manager has
 // something real to browse before the game has ever run.
 func (m *Manager) seedServerFiles(s *Server) error {
+	if _, err := m.ensureServerDir(s); err != nil {
+		return err
+	}
 	r, err := m.serverRoot(s)
 	if err != nil {
 		return err
@@ -881,4 +891,29 @@ func (m *Manager) seedServerFiles(s *Server) error {
 	write("banned-players.json", "[]\n")
 	write("banned-ips.json", "[]\n")
 	return werr
+}
+
+// Managed files use explicit key=value lines. Reject alternate Java key
+// encodings before publication rather than treating a hidden managed key as
+// absent. Unknown values remain verbatim for lossless extension preservation.
+func validateCanonicalProps(content string) error {
+	for index, line := range strings.Split(content, "\n") {
+		line = strings.TrimLeft(strings.TrimSuffix(line, "\r"), " \t\f")
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
+			continue
+		}
+		key, _, ok := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" || strings.ContainsAny(key, "\\: \t\f") {
+			return fmt.Errorf("properties line %d must use an unescaped key=value; normalize Java alternate separators or escaped keys before importing/editing", index+1)
+		}
+		trailing := 0
+		for pos := len(line) - 1; pos >= 0 && line[pos] == '\\'; pos-- {
+			trailing++
+		}
+		if trailing%2 != 0 {
+			return fmt.Errorf("properties line %d uses continuation; normalize it to one key=value line", index+1)
+		}
+	}
+	return nil
 }

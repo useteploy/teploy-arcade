@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"encoding/json"
 	"slices"
 	"strconv"
 	"strings"
@@ -73,15 +74,19 @@ type Server struct {
 	CreatedAt  time.Time         `json:"created_at"`
 
 	// Runtime state - persisted so a panel restart doesn't forget a crash.
-	Status       string    `json:"status"`
-	ExitCode     int       `json:"exit_code"`
-	ExitReason   string    `json:"exit_reason"`
-	Restarts     int       `json:"restarts"`
-	FirstFailure time.Time `json:"first_failure"`
-	StartedAt    time.Time `json:"started_at"`
+	Readiness        string    `json:"-"`
+	Status           string    `json:"status"`
+	ExitCode         int       `json:"exit_code"`
+	ExitReason       string    `json:"exit_reason"`
+	DesiredRunning   *bool     `json:"desired_running,omitempty"`
+	IntentGeneration uint64    `json:"intent_generation,omitempty"`
+	Restarts         int       `json:"restarts"`
+	FirstFailure     time.Time `json:"first_failure"`
+	StartedAt        time.Time `json:"started_at"`
 
 	// Set on save when a change needs a restart to take effect.
-	PendingRestart []string `json:"pending_restart"`
+	PendingRestart   []string `json:"pending_restart"`
+	RecoveryRequired string   `json:"recovery_required,omitempty"`
 
 	mu      sync.Mutex
 	proc    procHandle // whatever the runner needs to control this server
@@ -111,7 +116,9 @@ type Server struct {
 	// DynamicBindings are runtime-derived ports the launch path adds beyond
 	// the template's static geometry (Geyser's Bedrock UDP port). Captured
 	// at Start so admission conflicts are checkable from pure state.
-	DynamicBindings []portBinding `json:"-"`
+	DynamicBindings        []portBinding `json:"-"`
+	launchBindingsResolved bool
+	logCursor              string
 	// While set, the panel is mid-query on this server's RCON and the console
 	// churn that produces is its own, not the operator's. Not persisted: it
 	// describes the next second, not the server.
@@ -122,8 +129,9 @@ type Server struct {
 
 type Player struct {
 	Name     string `json:"name"`
-	UUID     string `json:"uuid"`
-	PingMS   int    `json:"ping_ms"`
+	UUID     string `json:"-"`
+	PingMS   int    `json:"-"`
+	Source   string `json:"source"`
 	JoinedAt int64  `json:"joined_at"`
 }
 
@@ -184,6 +192,10 @@ func (s *Server) Snapshot() map[string]any {
 		uptime = int64(time.Since(s.StartedAt).Seconds())
 	}
 
+	var desired any
+	if s.DesiredRunning != nil {
+		desired = *s.DesiredRunning
+	}
 	players := make([]Player, len(s.players))
 	copy(players, s.players)
 
@@ -210,6 +222,13 @@ func (s *Server) Snapshot() map[string]any {
 		}
 	}
 
+	readiness := s.Readiness
+	if readiness == "" {
+		readiness = "unverified"
+		if s.Runtime == RuntimeSim && s.Status == StatusRunning {
+			readiness = "simulation"
+		}
+	}
 	return map[string]any{
 		"id":          s.ID,
 		"name":        s.Name,
@@ -219,6 +238,7 @@ func (s *Server) Snapshot() map[string]any {
 		"version":     s.Version,
 		"runtime":     s.Runtime,
 		"status":      s.Status,
+		"readiness":   readiness,
 		"uptime":      uptime,
 		"players":     pc,
 		"player_list": players,
@@ -236,13 +256,15 @@ func (s *Server) Snapshot() map[string]any {
 		"disk_gb": s.DiskGB,
 		// So the console screen can refuse input up front rather than take a
 		// command and report that it could not be delivered.
-		"console":         consoleMode(s),
-		"address":         map[string]any{"host": hostAddr, "port": s.Port},
-		"motd":            s.motdLocked(),
-		"last_exit":       lastExit,
-		"pending_restart": slices.Clone(s.PendingRestart),
-		"created_at":      s.CreatedAt,
-		"settings":        props,
+		"console":           consoleMode(s),
+		"address":           map[string]any{"host": hostAddr, "port": s.Port},
+		"motd":              s.motdLocked(),
+		"last_exit":         lastExit,
+		"pending_restart":   slices.Clone(s.PendingRestart),
+		"recovery_required": s.RecoveryRequired,
+		"desired_running":   desired, "intent_generation": s.IntentGeneration,
+		"created_at": s.CreatedAt,
+		"settings":   props,
 	}
 }
 
@@ -681,4 +703,15 @@ func atoi(s string) int {
 		return 0
 	}
 	return n
+}
+
+func (p Player) MarshalJSON() ([]byte, error) {
+	var uuid, ping any
+	if p.UUID != "" {
+		uuid = p.UUID
+	}
+	if p.Source == "simulation" {
+		ping = p.PingMS
+	}
+	return json.Marshal(map[string]any{"name": p.Name, "uuid": uuid, "ping_ms": ping, "joined_at": p.JoinedAt, "source": p.Source})
 }

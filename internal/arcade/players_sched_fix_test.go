@@ -14,6 +14,9 @@ import (
 func TestPlayerListArgsCannotSmuggleASecondConsoleCommand(t *testing.T) {
 	_, mgr := newTestAgent(t)
 	s := mgr.List()[0]
+	s.mu.Lock()
+	s.Props["online-mode"] = "false"
+	s.mu.Unlock()
 
 	for _, reason := range []string{
 		"cheating\nop attacker",

@@ -106,7 +106,7 @@ func TestStateFilesAreWrittenAtomically(t *testing.T) {
 	}
 	mgr.audit("admin", "test", "x", "")
 
-	for _, f := range []string{"users.json", "mcp-tokens.json", "audit.json"} {
+	for _, f := range []string{"users.json", "mcp-tokens.json"} {
 		p := filepath.Join(mgr.dataDir, f)
 		b, err := os.ReadFile(p)
 		if err != nil {
@@ -147,17 +147,17 @@ func TestAuditAppendsAreNotLost(t *testing.T) {
 		t.Errorf("in-memory audit has %d entries, want %d", got, n)
 	}
 
-	b, err := os.ReadFile(mgr.auth.auditPath())
-	if err != nil {
+	reloaded := NewAuth(mgr.dataDir)
+	if err := reloaded.Load(); err != nil {
 		t.Fatal(err)
 	}
-	var onDisk []AuditEntry
-	if err := json.Unmarshal(b, &onDisk); err != nil {
-		t.Fatalf("audit.json unreadable after concurrent appends: %v", err)
+	if got := len(reloaded.Audit(0)); got != n {
+		t.Errorf("durable JSONL audit has %d entries, want %d", got, n)
 	}
-	if len(onDisk) != n {
-		t.Errorf("audit.json has %d entries, want %d - appends were lost", len(onDisk), n)
+	if healthy, _ := reloaded.AuditHealth()["healthy"].(bool); !healthy {
+		t.Fatal("audit health degraded after concurrent appends")
 	}
+
 }
 
 // C5. Snapshot and reloadProps touch the same map from different goroutines.

@@ -199,8 +199,8 @@ func TestNullRecordsQuarantineInsteadOfPanicking(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := NewAuth(dir)
-	if err := a.Load(); err != nil {
-		t.Fatalf("load: %v", err)
+	if err := a.Load(); err == nil {
+		t.Fatal("invalid user records enabled empty setup")
 	}
 	if len(a.Users()) != 0 {
 		t.Errorf("a null user record became %d account(s)", len(a.Users()))
@@ -358,6 +358,8 @@ func TestNextRunUsesCivilTimeOnDSTDays(t *testing.T) {
 // publish used to be two steps, and the last rename silently won. Exactly one
 // install may land.
 func TestConcurrentInstallsCannotOverwrite(t *testing.T) {
+	t.Setenv("TEPLOY_ARCADE_ALLOW_HTTP_PLUGINS", "1")
+	t.Setenv("TEPLOY_ARCADE_ALLOW_PRIVATE_PLUGIN_HOSTS", "1")
 	_, mgr := newTestAgent(t)
 	s := newPluginServer(t, mgr, "paper")
 

@@ -2,6 +2,7 @@ package arcade
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -151,7 +152,7 @@ func TestALoginDoesNotDisturbLiveSessions(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				if _, err := mgr.auth.Login("boss", "correct-horse-battery"); err != nil {
+				if _, err := mgr.auth.Login("boss", "correct-horse-battery"); err != nil && !errors.Is(err, ErrSessionLimit) {
 					t.Errorf("login failed mid-flight: %v", err)
 					return
 				}
@@ -400,8 +401,12 @@ func TestReadyWatchdogPromotesAServerThatIsActuallyUp(t *testing.T) {
 
 	r := &dockerRunner{mgr: mgr}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go r.watchReady(ctx, s, "gamepanel-"+s.ID)
+	finished := make(chan struct{})
+	defer func() { cancel(); <-finished }()
+	go func() {
+		defer close(finished)
+		r.watchReady(ctx, s, "gamepanel-"+s.ID)
+	}()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {

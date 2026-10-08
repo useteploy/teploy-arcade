@@ -21,6 +21,10 @@ func TestMCPLifecycleSurvivesAConcurrentDelete(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	waitFor(t, 12*time.Second, func() bool { return mgr.Get(id).State() == StatusRunning })
+	// Running is published before the start transaction completes its final
+	// event broadcasts. Wait for its filesystem window to finish before pinning audit.
+	mgr.Get(id).fsMu.Lock()
+	mgr.Get(id).fsMu.Unlock()
 
 	type outcome struct {
 		msg     string
@@ -29,11 +33,11 @@ func TestMCPLifecycleSurvivesAConcurrentDelete(t *testing.T) {
 	}
 	res := make(chan outcome, 1)
 
-	// Audit.Append holds this lock across its whole marshal-and-write, so
+	// Audit.Append holds its own lock across durable append publication, so
 	// taking it first pins Lifecycle between the action and the status
 	// read-back. That makes the delete land inside the window on every run
 	// instead of once in a thousand.
-	mgr.auth.mu.Lock()
+	mgr.auth.auditMu.Lock()
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -56,7 +60,7 @@ func TestMCPLifecycleSurvivesAConcurrentDelete(t *testing.T) {
 	mgr.mu.Lock()
 	delete(mgr.servers, id)
 	mgr.mu.Unlock()
-	mgr.auth.mu.Unlock()
+	mgr.auth.auditMu.Unlock()
 
 	select {
 	case got := <-res:

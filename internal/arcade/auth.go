@@ -1,6 +1,8 @@
 package arcade
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -10,12 +12,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -69,11 +77,21 @@ type AuditEntry struct {
 }
 
 type Auth struct {
-	mu       sync.RWMutex
-	dataDir  string
-	users    map[string]*User
-	sessions map[string]*Session
-	audit    []AuditEntry
+	mu                  sync.RWMutex
+	dataDir             string
+	users               map[string]*User
+	sessions            map[string]*Session
+	audit               []AuditEntry
+	auditMu             sync.RWMutex
+	auditReady          bool
+	auditSequence       uint64
+	auditWritten        uint64
+	auditSegment        uint64
+	auditSegmentLimit   int
+	auditPending        []auditRecord
+	auditStatus         auditHealth
+	auditHealthSnapshot atomic.Pointer[auditSnapshot]
+	loginBuckets        map[string]loginBucket
 	// Disabled when the panel binds to loopback and no password was ever set,
 	// so a local run needs no ceremony. Any user created turns it on.
 	enabled bool
@@ -108,6 +126,8 @@ type Auth struct {
 const bootstrapTokenTTL = 30 * time.Minute
 
 const sessionTTL = 12 * time.Hour
+
+var ErrSessionLimit = errors.New("session limit reached; sign out an existing session before signing in again")
 
 func NewAuth(dataDir string) *Auth {
 	return &Auth{
@@ -149,7 +169,6 @@ func (a *Auth) Load() error {
 			// install; unreadable means the file exists and the panel cannot
 			// know who it describes, which is a repair-it-yourself state, not
 			// a pretend-fresh one.
-			quarantine(a.usersPath(), err)
 			return fmt.Errorf("users file exists but cannot be read; repair %s: %w", a.usersPath(), err)
 		}
 	} else {
@@ -171,22 +190,26 @@ func (a *Auth) Load() error {
 			}
 		}
 		if bad {
-			// Quarantine rather than refuse to boot - but the empty user set
-			// this leaves is NOT an open panel: BeginSetup arms the setup
-			// gate, so every operational route stays closed until an admin is
-			// claimed through the machine-local bootstrap token.
-			quarantine(a.usersPath(), errors.New("invalid user records"))
+			// Keep the authoritative source in place. Renaming it away would make
+			// the next restart mistake corruption for a fresh unclaimed installation.
+			if err := a.preserveCorruptUsers(b); err != nil {
+				log.Printf("auth: corrupt users backup failed: %v", err)
+			}
+			return fmt.Errorf("users state is corrupt; repair users.json explicitly before startup")
 		} else {
 			for _, u := range list {
 				a.users[strings.ToLower(u.Name)] = u
 			}
 		}
 	}
-	if b, err := os.ReadFile(a.auditPath()); err == nil {
-		if err := json.Unmarshal(b, &a.audit); err != nil {
-			quarantine(a.auditPath(), err)
-		}
+	a.auditMu.Lock()
+	if err := a.loadAuditLocked(); err != nil {
+		a.auditFailureLocked(err)
+		log.Printf("audit: initialization failed: %v", err)
 	}
+	a.publishAuditHealthLocked()
+	a.auditMu.Unlock()
+
 	a.enabled = len(a.users) > 0
 	return nil
 }
@@ -344,7 +367,11 @@ func pbkdf2Key(password, salt []byte, iter, keyLen int) []byte {
 	return out[:keyLen]
 }
 
+var credentialWork = make(chan struct{}, 4)
+
 func hashPassword(pw, salt string) string {
+	credentialWork <- struct{}{}
+	defer func() { <-credentialWork }()
 	return hex.EncodeToString(pbkdf2Key([]byte(pw), []byte(salt), 120_000, 32))
 }
 
@@ -506,9 +533,9 @@ func (a *Auth) Login(name, password string) (*Session, error) {
 	// theoretical one. Four fields is a cheap copy.
 	a.mu.RLock()
 	u, ok := a.users[strings.ToLower(name)]
-	var uname, role, salt, hash string
+	var uname, salt, hash string
 	if ok {
-		uname, role, salt, hash = u.Name, u.Role, u.Salt, u.Hash
+		uname, salt, hash = u.Name, u.Salt, u.Hash
 	}
 	a.mu.RUnlock()
 
@@ -537,7 +564,22 @@ func (a *Auth) Login(name, password string) (*Session, error) {
 		a.mu.Unlock()
 		return nil, fmt.Errorf("invalid credentials")
 	}
-	s := &Session{Token: tok, User: uname, Role: role,
+	now := time.Now()
+	active := 0
+	for token, existing := range a.sessions {
+		if !now.Before(existing.Expires) {
+			delete(a.sessions, token)
+			continue
+		}
+		if strings.EqualFold(existing.User, uname) {
+			active++
+		}
+	}
+	if active >= 32 || len(a.sessions) >= 4096 {
+		a.mu.Unlock()
+		return nil, ErrSessionLimit
+	}
+	s := &Session{Token: tok, User: uname, Role: u2.Role,
 		Expires: time.Now().Add(sessionTTL)}
 	a.sessions[s.Token] = s
 	a.mu.Unlock()
@@ -743,6 +785,7 @@ const auditKept = 2000
 // append into a rewrite of all of it under the auth mutex. Truncation is
 // visible so a record that was cut can be recognised as cut.
 func auditText(s string, max int) string {
+	s = strings.ToValidUTF8(s, "�")
 	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= max {
 		return s
@@ -755,39 +798,62 @@ func auditText(s string, max int) string {
 }
 
 func (a *Auth) Append(e AuditEntry) {
-	// R05: the byte caps are enforced here, at the one sink every audit
-	// record passes through, rather than at the individual callers that
-	// remember to have a cap. Field limits keep the retained set bounded in
-	// bytes as well as in entries.
-	e.Actor = auditText(e.Actor, 128)
-	e.Action = auditText(e.Action, 128)
-	e.Target = auditText(e.Target, 256)
-	e.Detail = auditText(e.Detail, 4096)
-
-	// Marshal and write inside the lock. Snapshotting under the lock and
-	// writing outside it lets two appends interleave so the later write lands
-	// an older snapshot, silently dropping an entry - and the audit log is the
-	// only record of who did what.
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
+	e = boundedAuditEntry(e)
+	a.auditMu.Lock()
+	defer a.auditMu.Unlock()
+	defer a.publishAuditHealthLocked()
+	if !a.auditReady {
+		if err := a.loadAuditLocked(); err != nil {
+			a.auditFailureLocked(err)
+		}
+	}
 	a.audit = append(a.audit, e)
 	if len(a.audit) > auditKept {
-		a.audit = a.audit[len(a.audit)-auditKept:]
+		a.audit = append([]AuditEntry{}, a.audit[len(a.audit)-auditKept:]...)
 	}
-	b, err := json.MarshalIndent(a.audit, "", "  ")
-	if err != nil {
-		log.Printf("audit: encode failed, entry not persisted: %v", err)
+	a.auditSequence++
+	a.auditPending = append(a.auditPending, auditRecord{Sequence: a.auditSequence, Entry: e})
+	if len(a.auditPending) > auditKept {
+		a.auditPending = a.auditPending[1:]
+		a.auditStatus.Dropped++
+	}
+	a.publishAuditHealthLocked()
+	if !a.auditReady {
+		if err := a.saveAuditHealthLocked(); err != nil {
+			log.Printf("audit: pending health persistence failed: %v", err)
+		}
 		return
 	}
-	if err := writeFileAtomic(a.auditPath(), b, 0o600); err != nil {
-		log.Printf("audit: write failed, entry not persisted: %v", err)
+	if a.auditReady {
+		for len(a.auditPending) > 0 {
+			if err := a.appendAuditLocked(a.auditPending[0]); err != nil {
+				a.auditFailureLocked(err)
+				return
+			}
+			a.auditPending = a.auditPending[1:]
+		}
+		// Persist sticky failure/drop counters after recovery. Ordinary successful
+		// appends only sync their record, never rewrite retained audit history.
+		if a.auditStatus.LastError != "" {
+			a.auditStatus.LastError = ""
+			if err := a.saveAuditHealthLocked(); err != nil {
+				a.auditFailureLocked(err)
+			}
+		}
 	}
 }
 
+func boundedAuditEntry(e AuditEntry) AuditEntry {
+	e.Actor = auditText(redactAudit(e.Actor), 128)
+	e.Action = auditText(redactAudit(e.Action), 128)
+	e.Target = auditText(redactAudit(e.Target), 256)
+	e.Detail = auditText(redactAudit(e.Detail), 4096)
+	return e
+}
+
 func (a *Auth) Audit(limit int) []AuditEntry {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.auditMu.RLock()
+	defer a.auditMu.RUnlock()
 	if limit <= 0 || limit > len(a.audit) {
 		limit = len(a.audit)
 	}
@@ -903,4 +969,478 @@ func (a *Auth) attach(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// Login admission uses the connection peer, never attacker-controlled forwarded
+// headers. Unknown peers fail closed; stale buckets expire and the table is bounded.
+type loginBucket struct {
+	start    time.Time
+	attempts int
+}
+
+func (a *Auth) AllowLoginOrigin(peer string) bool {
+	if host, _, err := net.SplitHostPort(peer); err == nil {
+		peer = host
+	}
+	if ip := net.ParseIP(peer); ip != nil {
+		peer = ip.String()
+	} else {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.allowLoginKeyLocked("ip:"+peer, 60, time.Now())
+}
+func (a *Auth) AllowLoginAccount(name string) bool {
+	sum := sha256.Sum256([]byte(strings.ToLower(name)))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.allowLoginKeyLocked(fmt.Sprintf("account:%x", sum), 20, time.Now())
+}
+func (a *Auth) allowLoginKeyLocked(key string, limit int, now time.Time) bool {
+	if a.loginBuckets == nil {
+		a.loginBuckets = map[string]loginBucket{}
+	}
+	for k, b := range a.loginBuckets {
+		if now.Sub(b.start) >= time.Minute {
+			delete(a.loginBuckets, k)
+		}
+	}
+	b, exists := a.loginBuckets[key]
+	if !exists {
+		if len(a.loginBuckets) >= 4096 {
+			return false
+		}
+		b.start = now
+	}
+	if b.attempts >= limit {
+		return false
+	}
+	b.attempts++
+	a.loginBuckets[key] = b
+	return true
+}
+
+// The audit store owns its lock and performs no credential/session locking.
+// Four 4MiB segments bound disk retention; the newest 2000 records bound the
+// UI cache and retry backlog. Every accepted append is fsynced in order.
+const auditSegmentBytes = 4 << 20
+const auditSegmentsKept = 4
+
+type auditRecord struct {
+	Sequence uint64     `json:"sequence"`
+	Entry    AuditEntry `json:"entry"`
+}
+type auditHealth struct {
+	Failures        uint64 `json:"write_failures"`
+	Dropped         uint64 `json:"dropped_records"`
+	IncompleteTails uint64 `json:"recovered_incomplete_tails"`
+	LastError       string `json:"last_error,omitempty"`
+	PendingFirst    uint64 `json:"pending_first,omitempty"`
+	PendingCount    uint64 `json:"pending_count,omitempty"`
+}
+
+func (a *Auth) auditDir() string        { return filepath.Join(a.dataDir, "audit-log") }
+func (a *Auth) auditHealthPath() string { return filepath.Join(a.auditDir(), "health.json") }
+func (a *Auth) auditSegmentPath(n uint64) string {
+	return filepath.Join(a.auditDir(), fmt.Sprintf("records-%020d.jsonl", n))
+}
+
+type auditSnapshot struct {
+	Ready   bool
+	Status  auditHealth
+	Pending int
+	Budget  int
+}
+
+func (a *Auth) publishAuditHealthLocked() {
+	a.auditHealthSnapshot.Store(&auditSnapshot{Ready: a.auditReady, Status: a.auditStatus, Pending: len(a.auditPending), Budget: a.auditByteBudget()})
+}
+func (a *Auth) AuditHealth() map[string]any {
+	snapshot := a.auditHealthSnapshot.Load()
+	if snapshot == nil {
+		snapshot = &auditSnapshot{Budget: auditSegmentBytes}
+	}
+	status := snapshot.Status
+	return map[string]any{"healthy": snapshot.Ready && status.LastError == "" && snapshot.Pending == 0 && status.Dropped == 0 && status.IncompleteTails == 0, "write_failures": status.Failures, "dropped_records": status.Dropped, "recovered_incomplete_tails": status.IncompleteTails, "pending_records": snapshot.Pending, "last_error": status.LastError, "format": "rotated-jsonl", "retention_bytes": snapshot.Budget * auditSegmentsKept}
+}
+
+func (a *Auth) auditFailureLocked(err error) {
+	a.auditStatus.Failures++
+	a.auditStatus.LastError = "audit persistence unavailable; inspect local logs"
+	log.Printf("audit: persistence degraded: %v", err)
+	if healthErr := a.saveAuditHealthLocked(); healthErr != nil {
+		log.Printf("audit: health persistence also failed: %v", healthErr)
+	}
+}
+func (a *Auth) saveAuditHealthLocked() error {
+	a.auditStatus.PendingCount = uint64(len(a.auditPending))
+	a.auditStatus.PendingFirst = 0
+	if len(a.auditPending) > 0 {
+		a.auditStatus.PendingFirst = a.auditPending[0].Sequence
+	}
+	b, err := json.Marshal(a.auditStatus)
+	if err != nil {
+		return err
+	}
+	result := atomicStateWrite(a.auditHealthPath(), b, 0600)
+	return result.Err
+}
+func (a *Auth) loadAuditLocked() error {
+	if a.auditReady {
+		return nil
+	}
+	dir := a.auditDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return err
+	}
+	if err := syncStateDirectory(a.dataDir); err != nil {
+		return err
+	}
+	if b, err := os.ReadFile(a.auditHealthPath()); err == nil {
+		var status auditHealth
+		if json.Unmarshal(b, &status) != nil {
+			return fmt.Errorf("invalid audit health file")
+		}
+		if status.Failures > a.auditStatus.Failures {
+			a.auditStatus = status
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	marker := filepath.Join(dir, ".migrated")
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		var legacy []AuditEntry
+		f, readErr := os.Open(a.auditPath())
+		if readErr == nil {
+			if err := f.Chmod(0600); err != nil {
+				f.Close()
+				return err
+			}
+			b, e := io.ReadAll(io.LimitReader(f, 64<<20+1))
+			closeErr := f.Close()
+			if e != nil {
+				return e
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			if len(b) > 64<<20 {
+				return fmt.Errorf("legacy audit exceeds migration bound")
+			}
+			if json.Unmarshal(b, &legacy) != nil {
+				return fmt.Errorf("legacy audit is invalid; source retained for repair")
+			}
+		} else if !os.IsNotExist(readErr) {
+			return readErr
+		}
+		if len(legacy) > auditKept {
+			legacy = legacy[len(legacy)-auditKept:]
+		}
+		// A marker is published last. Until then no new appends are accepted, so
+		// interrupted migration can rebuild identical segments from untouched source.
+		var segment bytes.Buffer
+		index := uint64(1)
+		flush := func() error {
+			if segment.Len() == 0 {
+				return nil
+			}
+			result := atomicStateWrite(a.auditSegmentPath(index), segment.Bytes(), 0600)
+			if result.Err != nil {
+				return result.Err
+			}
+			segment.Reset()
+			index++
+			return nil
+		}
+		for i, e := range legacy {
+			record := auditRecord{Sequence: uint64(i + 1), Entry: boundedAuditEntry(e)}
+			b, e := json.Marshal(record)
+			if e != nil {
+				return e
+			}
+			if segment.Len()+len(b)+1 > a.auditByteBudget() {
+				if e := flush(); e != nil {
+					return e
+				}
+			}
+			segment.Write(b)
+			segment.WriteByte('\n')
+		}
+		if err := flush(); err != nil {
+			return err
+		}
+		result := atomicStateWrite(marker, []byte("rotated-jsonl-v1\n"), 0600)
+		if result.Err != nil {
+			return result.Err
+		}
+	} else if err != nil {
+		return err
+	} else {
+		b, err := os.ReadFile(marker)
+		if err != nil {
+			return err
+		}
+		if string(b) != "rotated-jsonl-v1\n" {
+			return fmt.Errorf("invalid audit migration marker")
+		}
+	}
+	files, err := a.auditFilesLocked()
+	if err != nil {
+		return err
+	}
+	var loaded []AuditEntry
+	sequence := uint64(0)
+	for _, name := range files {
+		info, err := os.Lstat(name)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Size() > int64(a.auditByteBudget()) {
+			return fmt.Errorf("invalid audit segment %s", filepath.Base(name))
+		}
+		if err := os.Chmod(name, 0600); err != nil {
+			return err
+		}
+		f, err := os.Open(name)
+		if err != nil {
+			return err
+		}
+		reader := bufio.NewReader(f)
+		offset := int64(0)
+		for {
+			line, readErr := reader.ReadBytes('\n')
+			if len(line) > 64<<10 {
+				f.Close()
+				return fmt.Errorf("audit record exceeds bound")
+			}
+			if len(line) > 0 {
+				if line[len(line)-1] != '\n' && readErr == io.EOF {
+					f.Close()
+					repair, err := os.OpenFile(name, os.O_WRONLY, 0600)
+					if err != nil {
+						return err
+					}
+					err = errors.Join(repair.Truncate(offset), repair.Sync(), repair.Close())
+					if err != nil {
+						return err
+					}
+					a.auditStatus.Failures++
+					a.auditStatus.IncompleteTails++
+					a.auditStatus.LastError = "incomplete audit tail recovered; record may be missing"
+					break
+				}
+				var record auditRecord
+				if json.Unmarshal(line, &record) != nil || record.Sequence == 0 {
+					f.Close()
+					return fmt.Errorf("corrupt audit record in %s", filepath.Base(name))
+				}
+				if record.Sequence <= sequence {
+					f.Close()
+					return fmt.Errorf("out-of-order audit record")
+				}
+				sequence = record.Sequence
+				loaded = append(loaded, boundedAuditEntry(record.Entry))
+				if len(loaded) > auditKept {
+					loaded = loaded[len(loaded)-auditKept:]
+				}
+				offset += int64(len(line))
+			}
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				f.Close()
+				return readErr
+			}
+		}
+		if err := f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			return err
+		}
+		base := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(name), "records-"), ".jsonl")
+		n, _ := strconv.ParseUint(base, 10, 64)
+		if n > a.auditSegment {
+			a.auditSegment = n
+		}
+	}
+	if a.auditSegment == 0 {
+		a.auditSegment = 1
+	}
+	a.auditWritten = sequence
+	if len(a.auditPending) == 0 && a.auditStatus.PendingCount > 0 {
+		end := a.auditStatus.PendingFirst + a.auditStatus.PendingCount - 1
+		if end < a.auditStatus.PendingFirst {
+			return fmt.Errorf("invalid audit pending health range")
+		}
+		if sequence < end {
+			base := sequence
+			if base < a.auditStatus.PendingFirst {
+				base = a.auditStatus.PendingFirst - 1
+			}
+			a.auditStatus.Dropped += end - base
+			a.auditStatus.LastError = "unpersisted audit records were lost before restart"
+		}
+		if end > a.auditSequence {
+			a.auditSequence = end
+		}
+		a.auditStatus.PendingFirst = 0
+		a.auditStatus.PendingCount = 0
+	}
+	if sequence > a.auditSequence {
+		a.auditSequence = sequence
+	}
+	// A failed initialization may already have admitted in-memory records. Preserve
+	// and renumber those after migrated disk records before flushing them.
+	if len(a.auditPending) > 0 {
+		for i := range a.auditPending {
+			a.auditSequence++
+			a.auditPending[i].Sequence = a.auditSequence
+			loaded = append(loaded, a.auditPending[i].Entry)
+		}
+		if len(loaded) > auditKept {
+			loaded = loaded[len(loaded)-auditKept:]
+		}
+	}
+	a.audit = loaded
+	if err := a.retainAuditSegmentsLocked(); err != nil {
+		return err
+	}
+	if err := a.saveAuditHealthLocked(); err != nil {
+		return err
+	}
+	a.auditReady = true
+	return nil
+}
+func (a *Auth) auditFilesLocked() ([]string, error) {
+	ents, err := os.ReadDir(a.auditDir())
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, entry := range ents {
+		name := entry.Name()
+		if strings.HasPrefix(name, "records-") && strings.HasSuffix(name, ".jsonl") {
+			digits := strings.TrimSuffix(strings.TrimPrefix(name, "records-"), ".jsonl")
+			if len(digits) != 20 {
+				return nil, fmt.Errorf("invalid audit segment name")
+			}
+			if _, err := strconv.ParseUint(digits, 10, 64); err != nil {
+				return nil, err
+			}
+			names = append(names, filepath.Join(a.auditDir(), name))
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+func (a *Auth) retainAuditSegmentsLocked() error {
+	names, err := a.auditFilesLocked()
+	if err != nil {
+		return err
+	}
+	removed := false
+	for len(names) > auditSegmentsKept {
+		if err := os.Remove(names[0]); err != nil {
+			return err
+		}
+		names = names[1:]
+		removed = true
+	}
+	if removed {
+		return syncStateDirectory(a.auditDir())
+	}
+	return nil
+}
+func (a *Auth) appendAuditLocked(record auditRecord) error {
+	name := a.auditSegmentPath(a.auditSegment)
+	b, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	info, err := os.Lstat(name)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if info != nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("audit segment is not regular")
+	}
+	if info != nil && info.Size()+int64(len(b)) > int64(a.auditByteBudget()) && record.Sequence > a.auditWritten {
+		a.auditSegment++
+		name = a.auditSegmentPath(a.auditSegment)
+		info = nil
+	}
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		return err
+	}
+	if record.Sequence > a.auditWritten {
+		size := int64(0)
+		if info != nil {
+			size = info.Size()
+		}
+		n, writeErr := f.Write(b)
+		if writeErr != nil || n != len(b) {
+			if writeErr == nil {
+				writeErr = io.ErrShortWrite
+			}
+			repairErr := f.Truncate(size)
+			closeErr := f.Close()
+			return errors.Join(writeErr, repairErr, closeErr)
+		}
+		a.auditWritten = record.Sequence
+	}
+	if err := errors.Join(f.Sync(), f.Close()); err != nil {
+		return err
+	}
+	if err := syncStateDirectory(a.auditDir()); err != nil {
+		return err
+	}
+	return a.retainAuditSegmentsLocked()
+}
+
+var auditCredentialPair = regexp.MustCompile(`(?i)((?:rcon[._-])?(?:password|passwd|token|secret|authorization|session[_-]?token|cookie|api[_-]?key)["']?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;}]+)`)
+var auditBearer = regexp.MustCompile(`(?i)Bearer\s+[^\s,;]+`)
+var auditMCPSecret = regexp.MustCompile(`tpa_[a-fA-F0-9]{48}`)
+
+func redactAudit(s string) string {
+	s = auditBearer.ReplaceAllString(s, "Bearer [redacted]")
+	s = auditCredentialPair.ReplaceAllString(s, "${1}[redacted]")
+	return auditMCPSecret.ReplaceAllString(s, "[redacted MCP token]")
+}
+func (a *Auth) preserveCorruptUsers(body []byte) error {
+	if err := os.Chmod(a.usersPath(), 0600); err != nil {
+		return err
+	}
+	// One content-addressed backup per corrupt source; no replacing previous
+	// evidence and no deleting the authoritative source or user workloads.
+	digest := sha256.Sum256(body)
+	name := a.usersPath() + fmt.Sprintf(".corrupt-%x", digest[:8])
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if os.IsExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(body)
+	err = errors.Join(writeErr, f.Sync(), f.Close())
+	if err != nil {
+		return err
+	}
+	return syncStateDirectory(a.dataDir)
+}
+
+func (a *Auth) auditByteBudget() int {
+	if a.auditSegmentLimit > 0 {
+		return a.auditSegmentLimit
+	}
+	return auditSegmentBytes
 }

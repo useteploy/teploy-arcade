@@ -12,31 +12,26 @@ import (
 	"time"
 )
 
-// A corrupt state file must not stop the panel from booting. This is an ops
-// tool: refusing to start means nobody can reach any server, which is strictly
-// worse than starting with a loud warning and the bad file set aside.
-func TestCorruptStateFilesDoNotPreventBoot(t *testing.T) {
+// Corrupt authoritative state must remain evidence and require explicit repair.
+func TestCorruptStateFilesRequireExplicitRecovery(t *testing.T) {
 	dir := t.TempDir()
-
 	for _, f := range []string{"servers.json", "tasks.json", "users.json", "mcp-tokens.json"} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("{{{ not json"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("{{{ not json"), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	hub := NewHub()
-	mgr := NewManager(dir, hub)
-	if err := mgr.auth.Load(); err != nil {
-		t.Fatalf("auth refused to load past a corrupt users.json: %v", err)
+	mgr := NewManager(dir, NewHub())
+	defer mgr.Close()
+	if err := mgr.auth.Load(); err == nil {
+		t.Fatal("corrupt credentials silently enabled fresh setup")
 	}
-	if err := mgr.Load(); err != nil {
-		t.Fatalf("panel refused to boot past a corrupt servers.json: %v", err)
+	if err := mgr.Load(); err == nil {
+		t.Fatal("corrupt server state silently created an empty/demo registry")
 	}
-
-	// The bad data must be preserved, not silently overwritten.
-	quarantined, _ := filepath.Glob(filepath.Join(dir, "servers.json.corrupt-*"))
-	if len(quarantined) == 0 {
-		t.Error("corrupt servers.json was not quarantined; the original data is gone")
+	for _, f := range []string{"servers.json", "users.json"} {
+		if b, err := os.ReadFile(filepath.Join(dir, f)); err != nil || string(b) != "{{{ not json" {
+			t.Fatal("corrupt source was overwritten or removed")
+		}
 	}
 }
 
@@ -136,18 +131,29 @@ func TestExpiredSessionsAreReaped(t *testing.T) {
 // still be noticed afterwards. Uses a trivial container rather than a real
 // Minecraft image so the test runs in seconds.
 func TestAdoptedContainerExitIsNoticed(t *testing.T) {
+	if os.Getenv("TEPLOY_ARCADE_LIVE_ACCEPTANCE") != "1" {
+		t.Skip("explicit live Docker acceptance required")
+	}
+	image := os.Getenv("TEPLOY_ARCADE_FIXTURE_IMAGE")
+	if image == "" {
+		t.Fatal("TEPLOY_ARCADE_FIXTURE_IMAGE must identify a preloaded image")
+	}
 	if !dockerAvailable() {
-		t.Skip("docker not available")
+		t.Fatal("assigned Docker daemon not available")
+	}
+	if err := exec.Command("docker", "image", "inspect", image).Run(); err != nil {
+		t.Fatalf("preloaded fixture image required: %v", err)
 	}
 	_, mgr := newTestAgent(t)
+	defer mgr.Close()
 	s := mgr.List()[0]
 	s.Runtime = RuntimeDocker
 
 	name := containerPrefix + "-" + s.ID
-	_ = exec.Command("docker", "rm", "-f", name).Run()
-	if err := exec.Command("docker", "run", "-d", "--name", name,
-		"alpine:3.20", "sh", "-c", "sleep 300").Run(); err != nil {
-		t.Skipf("could not start a probe container: %v", err)
+	// Never delete a pre-existing workload: run must claim its name exclusively.
+	if err := exec.Command("docker", "run", "--pull=never", "-d", "--name", name,
+		image, "sh", "-c", "sleep 300").Run(); err != nil {
+		t.Fatalf("could not start own probe container: %v", err)
 	}
 	defer exec.Command("docker", "rm", "-f", name).Run()
 

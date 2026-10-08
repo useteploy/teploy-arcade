@@ -57,7 +57,7 @@ function run(name, { target = 'test', node = true, goStatus = 0,
     // Deliberately omit inherited MAKEFLAGS, MAKEFILES and NODE_OPTIONS too.
     env: { PATH: bin, HOME: directory, LC_ALL: 'C' },
     encoding: 'utf8',
-    timeout: 10000,
+    timeout: 30000, // Parallel Go race/build work can saturate the host.
   });
   assert.ifError(result.error);
   assert.equal(result.signal, null, `${name}: make was terminated`);

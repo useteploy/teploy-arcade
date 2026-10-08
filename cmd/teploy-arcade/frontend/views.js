@@ -72,12 +72,22 @@ async function viewFiles(id) {
   let cwd = '';
   const list = $('#fileList', root);
 
-  const load = async () => {
+  let generation = 0, disposed = false, request = null, entries = [];
+  root.addEventListener('gss:teardown', () => { disposed = true; ++generation; request?.abort(); });
+  const load = async (cursor = '') => {
+    if (disposed) return;
+    const current = ++generation;
+    request?.abort();
+    const controller = new AbortController();
+    request = controller;
     list.innerHTML = `<div class="row"><span class="spin"></span></div>`;
     $('#crumbs', root).textContent = '/' + cwd;
     try {
-      const data = await api(`/api/servers/${id}/files?path=${encodeURIComponent(cwd)}`);
-      if (!data.entries.length) {
+      const data = await api(`/api/servers/${id}/files?path=${encodeURIComponent(cwd)}${cursor ? '&cursor=' + encodeURIComponent(cursor) : ''}`, {signal: controller.signal});
+      if (disposed || current !== generation) return;
+      entries = cursor ? entries.concat(data.entries) : data.entries;
+      data.entries = entries;
+      if (!data.entries.length && !data.next_cursor && !cursor) {
         list.innerHTML = `<div class="row muted">This folder is empty.</div>`;
         return;
       }
@@ -93,13 +103,14 @@ async function viewFiles(id) {
             <button type="button" class="btn btn-ghost btn-sm btn-icon" data-rm title="Delete"><i class="ico ico-sm ico-trash"></i></button>
           </span>
         </div>`).join('');
-      // R63 (audit pass 7): a truncated listing used to render as the whole
-      // directory, so files past the cap were invisible with nothing saying
-      // they exist. Say the listing is incomplete; the stable-cursor
-      // pagination that reaches the rest is tracked in AUDIT_OPEN.
-      if (data.truncated) {
-        list.innerHTML += `<div class="row" style="color:var(--amber)"><i class="ico ico-sm ico-warning"></i>
-          This listing is incomplete: the directory exceeds the current page limit.</div>`;
+      if (data.next_cursor || cursor) {
+        list.innerHTML += `<div class="row"><span class="muted">Directory entries${data.next_cursor ? ' — more entries available' : ' — last page'}</span><span class="spacer"></span>
+          ${cursor ? '<button type="button" class="btn btn-sm" id="firstPage">First page</button>' : ''}
+          ${data.next_cursor ? '<button type="button" class="btn btn-sm" id="nextPage">Load more</button>' : ''}</div>`;
+        $('#firstPage', root)?.addEventListener('click', () => load());
+        $('#nextPage', root)?.addEventListener('click', () => load(data.next_cursor));
+      } else if (data.truncated) {
+        list.innerHTML += `<div class="row" style="color:var(--amber)">This listing is incomplete; refresh with a panel version that supports directory cursors.</div>`;
       }
 
       list.querySelectorAll('.filerow').forEach((row) => {
@@ -122,7 +133,9 @@ async function viewFiles(id) {
         });
       });
     } catch (e) {
-      list.innerHTML = `<div class="row" style="color:var(--offline)">${esc(e.message)}</div>`;
+      if (disposed || current !== generation) return;
+      list.innerHTML = `<div class="row" style="color:var(--offline)">${esc(e.message)}${e.status === 409 ? '<button type="button" class="btn btn-sm" id="refreshListing">Refresh changed directory</button>' : ''}</div>`;
+      $('#refreshListing', root)?.addEventListener('click', () => load());
     }
   };
 
@@ -178,23 +191,35 @@ async function openEditor(id, path, onSaved) {
   $('#modalHost').appendChild(modal);
   const ta = $('#ed', modal);
   ta.value = data.content;
-  const close = () => modal.remove();
+  let etag = data.etag, saving = false, closed = false;
+  const close = () => { closed = true; window.removeEventListener('hashchange', close); modal.remove(); };
+  window.addEventListener('hashchange', close);
   $('#x', modal).addEventListener('click', close);
   $('#cancel', modal).addEventListener('click', close);
   ta.addEventListener('input', () => {
     $('#edNote', modal).textContent = `${ta.value.split('\n').length} lines - unsaved`;
   });
   $('#save', modal).addEventListener('click', async () => {
+    if (saving || closed) return;
+    saving = true;
     try {
       await api(`/api/servers/${id}/file`, {
-        method: 'PUT', body: JSON.stringify({ path, content: ta.value }),
+        method: 'PUT', headers: etag ? {'If-Match': etag} : {}, body: JSON.stringify({ path, content: ta.value }),
       });
+      if (closed) return;
       toast(`Saved ${path}`);
       close();
       if (onSaved) onSaved();
-    } catch (e) { toast(e.message, 'err'); }
+    } catch (e) {
+      if (closed) return;
+      if (e.status === 412) showEditConflict($('.modal', modal),
+        () => api(`/api/servers/${id}/file?path=${encodeURIComponent(path)}`),
+        current => current.content,
+        current => { ta.value = current.content; etag = current.etag; $('#edNote', modal).textContent = 'Reloaded current saved version'; });
+      else toast(e.message, 'err');
+    } finally { saving = false; }
   });
-  setTimeout(() => ta.focus(), 30);
+  setTimeout(() => { if (modal.isConnected) ta.focus(); }, 30);
 }
 
 // ----------------------------------------------------------- backups view
@@ -237,6 +262,8 @@ async function viewBackups(id) {
 
   wireHeaderActions(root, id);
   const list = $('#bkList', root);
+  let backupAction = null;
+  const restoreActions = new Map();
 
   const load = async () => {
     list.innerHTML = `<div class="row"><span class="spin"></span></div>`;
@@ -266,9 +293,9 @@ async function viewBackups(id) {
       list.querySelectorAll('.row[data-bid]').forEach((row) => {
         const bid = row.dataset.bid;
         row.querySelector('[data-restore]').addEventListener('click', async () => {
+          if (restoreActions.has(bid)) { restoreActions.get(bid).retry(); return; }
           if (!confirm(`Restore ${bid}?\n\nThe current world is replaced. The server must be stopped.`)) return;
-          try { await api(`/api/servers/${id}/backups/${bid}/restore`, { method: 'POST' }); toast('Restored'); }
-          catch (e) { toast(e.message, 'err'); }
+          restoreActions.set(bid, startAsyncAction(root, row.querySelector('[data-restore]'), {serverId: id, url: `/api/servers/${id}/backups/${bid}/restore`, label: 'Restoring…', onFinish(job) { restoreActions.delete(bid); if (job.state === 'done') toast('Restored'); }}));
         });
         row.querySelector('[data-del]').addEventListener('click', async () => {
           if (!confirm(`Delete backup ${bid}?`)) return;
@@ -291,18 +318,17 @@ async function viewBackups(id) {
   });
 
   $('#mkBackup', root).addEventListener('click', async () => {
+    if (backupAction) { backupAction.retry(); return; }
     // R66 (audit pass 7): cancelling the note prompt cancels the backup.
     // `prompt(...) || ''` turned null (Cancel) into an empty note and ran on.
     const note = prompt('Note for this backup (optional)');
     if (note === null) return;
     const btn = $('#mkBackup', root);
-    btn.disabled = true;
-    btn.innerHTML = `<span class="spin"></span> Backing up…`;
-    try { await api(`/api/servers/${id}/backups`, { method: 'POST', body: JSON.stringify({ note }) }); toast('Backup created'); }
-    catch (e) { toast(e.message, 'err'); }
-    btn.disabled = false;
-    btn.innerHTML = `<i class="ico ico-sm ico-download"></i> Back up now`;
-    load();
+    backupAction = startAsyncAction(root, btn, {serverId: id, url: `/api/servers/${id}/backups`, body: {note}, label: 'Backing up…', onFinish(job) {
+      backupAction = null;
+      if (job.state === 'done') toast('Backup created');
+      load();
+    }});
   });
 
   load();
@@ -316,7 +342,7 @@ async function viewAdmin() {
   let me, users = [], audit = [], tokens = [];
   try {
     me = await api('/api/me');
-    if ((me.user && me.user.role === 'admin') || me.unclaimed) {
+    if ((me.user && me.user.role === 'admin') || (me.auth_disabled && me.effective_role === 'admin')) {
       try { users = (await api('/api/users')).users; } catch {}
       try { tokens = (await api('/api/mcp-tokens')).tokens || []; } catch {}
     }
@@ -324,9 +350,8 @@ async function viewAdmin() {
   } catch (e) { /* audit needs a session when auth is on */ }
 
   const host = state.host;
-  // An unclaimed panel has no accounts, so nobody is an admin - but everyone
-  // can do everything, which is what the admin affordances need to reflect.
-  const isAdmin = !!(me && (me.unclaimed || (me.user && me.user.role === 'admin')));
+  // Setup grants no operational role. Explicit no-auth development mode does.
+  const isAdmin = !!(me && ((me.auth_disabled && me.effective_role === 'admin') || (me.user && me.user.role === 'admin')));
   // Everyone except you. Resetting your own password through the admin row
   // always failed: the agent reads a self-target as a self-change and asks for
   // the current password, which that row has no field for - so the control
@@ -341,7 +366,8 @@ async function viewAdmin() {
       <h3>Agent</h3>
       <div class="row"><span class="k">Version</span><span>${host ? esc(host.agent.version) : '-'}</span></div>
       <div class="row"><span class="k">Docker</span><span>${host && host.docker ? 'reachable' : 'not reachable'}</span></div>
-      <div class="row"><span class="k">Host CPU</span><span>${host ? host.cpu.total_vcpu : '-'} vCPU</span></div>
+      <div class="row"><span class="k">Panel CPU capacity</span><span title="Panel process CPU allocation">${host && capKnown(host.cpu.total_vcpu) ? host.cpu.total_vcpu + ' vCPU' : 'unknown'}</span></div>
+      <div class="row"><span class="k">Docker capacity</span><span>${host ? esc(capacityLabel(host, 'docker')) : 'unknown'}</span></div>
       <div class="row"><span class="k">Signed in as</span><span>${
         me && me.user ? `${esc(me.user.name)} <span class="badge-mute">${esc(me.user.role)}</span>`
         : me && me.unclaimed ? `<span style="color:var(--amber)">nobody - this panel has no accounts yet</span>`
@@ -404,7 +430,7 @@ async function viewAdmin() {
       <h3>Access</h3>
       ${me && me.needs_setup ? `
         <div class="row"><span class="k">Status</span>
-          <span style="color:var(--amber)">No users yet - the panel is open to anyone who can reach it.</span></div>
+          <span style="color:var(--amber)">No users yet — operational routes remain locked until setup is completed.</span></div>
         <div class="row"><span class="k">Setup token</span>
           <span class="spacer"></span>
           <input class="inp" id="suToken" placeholder="from the panel's log" style="width:330px">
@@ -467,14 +493,15 @@ async function viewAdmin() {
     <div class="panelbox">
       <h3>Agent access (MCP)</h3>
       <div class="row"><span class="muted" style="font-size:12px;line-height:1.5">
-        Tokens let an AI agent drive this panel over MCP: reads, the lifecycle
-        verbs and backups. Deliberately narrower than the HTTP API &mdash; no
+        Tokens grant only selected servers and typed actions. Reads are the default;
+        lifecycle verbs and backups require explicit selection. Raw console commands are unavailable. Deliberately narrower than the HTTP API &mdash; no
         delete, no restore, no user management, no kill. A token is shown once
         and stored only as a hash, so it cannot be recovered later.
       </span></div>
       ${!isAdmin ? '<div class="row muted">Admins only.</div>' : `
         ${tokens.map((tk) => `<div class="row">
             <span class="k">${esc(tk.name)}</span>
+            <span class="muted">${tk.requires_reissue ? "Reissue required (legacy token disabled)" : esc((tk.actions || []).join(", "))}</span>
             <span class="muted" style="font-size:12px">created ${new Date(tk.created * 1000).toLocaleDateString()}</span>
             <span class="muted" style="font-size:12px">${tk.last_use ? 'last used ' + new Date(tk.last_use * 1000).toLocaleString() : 'never used'}</span>
             <span class="spacer"></span>
@@ -484,6 +511,14 @@ async function viewAdmin() {
           <span class="spacer"></span>
           <input class="inp" id="mtName" placeholder="what will use it, e.g. claude-desktop" style="width:250px">
           <button type="button" class="btn btn-sm" id="mtBtn">Create</button>
+        </div>
+        <div class="row"><label class="k" for="mtServers">Servers</label>
+          <select class="inp" id="mtServers" multiple size="4" aria-label="Servers this token can access">
+            ${state.servers.map(s => `<option value="${esc(s.id)}" selected>${esc(s.name)}</option>`).join('')}
+          </select><span class="muted">Select existing servers; future servers are excluded.</span>
+        </div>
+        <div class="row"><span class="k">Allowed actions</span>
+          ${['server.read','host.read','server.start','server.stop','server.restart','server.backup'].map(action => `<label><input type="checkbox" data-mcp-action="${action}" ${action === 'server.read' ? 'checked' : ''}> ${action}</label>`).join('')}
         </div>
         <div class="row" id="mtOut" hidden></div>
       `}
@@ -589,7 +624,7 @@ async function viewAdmin() {
     try {
       const res = await api('/api/mcp-tokens', {
         method: 'POST',
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name, server_ids: [...$('#mtServers', root).selectedOptions].map(o => o.value), actions: [...root.querySelectorAll('[data-mcp-action]:checked')].map(el => el.dataset.mcpAction) }),
       });
       // Shown once, deliberately: only a hash is stored. Rendered rather than
       // toasted so it can be selected and copied without racing a timeout.

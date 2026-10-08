@@ -4,7 +4,8 @@ project_name: teploy-arcade
 
 before:
   hooks:
-    - go mod tidy
+    - go mod verify
+    - git diff --exit-code -- go.mod go.sum
 
 builds:
   - id: teploy-arcade

@@ -122,7 +122,7 @@ func TestMCPHandshakeAndTools(t *testing.T) {
 
 	list := rpc(t, srv, tok, "tools/list", nil)
 	tools := list["result"].(map[string]any)["tools"].([]any)
-	if len(tools) < 8 {
+	if len(tools) != 7 {
 		t.Fatalf("only %d tools registered", len(tools))
 	}
 	// Every tool must be arcade_-prefixed: teploy-dash owns `teploy_`, and both
@@ -138,7 +138,14 @@ func TestMCPHandshakeAndTools(t *testing.T) {
 func TestMCPToolsDriveThePanel(t *testing.T) {
 	srv, mgr := newTestAgent(t)
 	defer srv.Close()
-	tok, _ := mgr.mcp.Issue("test-agent")
+	ids := []string{}
+	for _, server := range mgr.List() {
+		ids = append(ids, server.ID)
+	}
+	tok, err := mgr.mcp.IssueScoped("test-agent", ids, []string{"server.read", "server.start", "server.stop", "server.restart", "server.backup", "host.read"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	call := func(name string, args map[string]any) (string, bool) {
 		return toolText(t, rpc(t, srv, tok, "tools/call",
@@ -154,8 +161,8 @@ func TestMCPToolsDriveThePanel(t *testing.T) {
 
 	// A bad id must explain itself rather than returning empty.
 	out, isErr = call("arcade_get_server", map[string]any{"id": "nope"})
-	if !isErr || !strings.Contains(out, "arcade_list_servers") {
-		t.Errorf("unknown id should point at the discovery tool, got %q", out)
+	if !isErr || !strings.Contains(out, "outside") {
+		t.Errorf("unknown id should be rejected outside scoped server IDs, got %q", out)
 	}
 
 	if out, isErr = call("arcade_lifecycle", map[string]any{"id": id, "action": "start"}); isErr {

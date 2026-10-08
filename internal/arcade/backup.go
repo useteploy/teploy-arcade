@@ -3,10 +3,12 @@ package arcade
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -146,8 +148,8 @@ func (m *Manager) quiesceForBackup(s *Server) (func() error, error) {
 		// The panel believes the game is down. For a Docker server the
 		// container is the truth, and a still-running container means the
 		// tree is being written under whatever the panel believes.
-		if s.Runtime == RuntimeDocker && containerRunning(s.ID) {
-			return nil, fmt.Errorf("this server's container is still running; stop it before backing it up")
+		if err := m.requireStoppedContainer(s); err != nil {
+			return nil, err
 		}
 		return func() error { return nil }, nil
 	default:
@@ -164,8 +166,28 @@ func (m *Manager) quiesceForBackup(s *Server) (func() error, error) {
 	// discard the reply, and delivery of the bytes was all "verified" meant.
 	sendQuiesce := func(cmd string) error {
 		if dr, ok := r.(*dockerRunner); ok {
-			_, err := dr.query(s, cmd)
-			return err
+			queryCtx := m.ctx
+			if cmd == "save-on" {
+				queryCtx = context.Background()
+			}
+			reply, err := dr.queryContext(queryCtx, s, cmd)
+			if err != nil {
+				return err
+			}
+			reply = strings.ToLower(reply)
+			confirmed := false
+			switch cmd {
+			case "save-off":
+				confirmed = strings.Contains(reply, "saving is now disabled") || strings.Contains(reply, "saving is already turned off")
+			case "save-on":
+				confirmed = strings.Contains(reply, "saving is now enabled") || strings.Contains(reply, "saving is already turned on")
+			case "save-all flush":
+				confirmed = strings.Contains(reply, "saved the game") || strings.Contains(reply, "saved the world")
+			}
+			if !confirmed {
+				return fmt.Errorf("game did not acknowledge %s; stop it before taking a snapshot", cmd)
+			}
+			return nil
 		}
 		return r.Send(s, cmd)
 	}
@@ -179,16 +201,23 @@ func (m *Manager) quiesceForBackup(s *Server) (func() error, error) {
 		return nil
 	}
 	if err := sendQuiesce("save-all flush"); err != nil {
-		_ = resume()
-		return nil, fmt.Errorf("could not flush the world, backup aborted (the world is untouched): %w", err)
+		resumeErr := resume()
+		return nil, fmt.Errorf("could not flush the world, backup aborted: %w", errors.Join(err, resumeErr))
 	}
 	// Give the game a moment to actually flush before we read the tree.
-	time.Sleep(1500 * time.Millisecond)
+	if err := waitContext(m.ctx, 1500*time.Millisecond); err != nil {
+		return nil, errors.Join(context.Canceled, resume())
+	}
 	return resume, nil
 }
 
 // CreateBackup runs the full quiesce -> archive -> resume cycle.
 func (m *Manager) CreateBackup(s *Server, note, actor string) (b *Backup, retErr error) {
+	workDone, err := m.beginWork()
+	if err != nil {
+		return nil, err
+	}
+	defer workDone()
 	// The whole archive window is exclusive on the server's filesystem gate:
 	// file and plugin mutations hold it shared from before their backup-state
 	// check through their completed write, so nothing can pass the check and
@@ -213,6 +242,11 @@ func (m *Manager) CreateBackup(s *Server, note, actor string) (b *Backup, retErr
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	release, err := acquireCapacity(m.ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	// Refuse a backup the disk cannot hold, the same way create, clone and
 	// import already do - this was the one path writing gigabytes with nothing
@@ -282,7 +316,7 @@ func (m *Manager) CreateBackup(s *Server, note, actor string) (b *Backup, retErr
 		now := time.Now()
 		id = fmt.Sprintf("%s-%03d-%s", now.Format("20060102-150405"), now.Nanosecond()/1e6, s.ID)
 		dst = filepath.Join(dir, id+".tar.gz")
-		size, err = tarGz(src, dst)
+		size, err = tarGzContext(m.ctx, src, dst)
 		if !errors.Is(err, os.ErrExist) {
 			break
 		}
@@ -358,10 +392,23 @@ func (m *Manager) SetBackupKeep(s *Server, keep int, actor string) error {
 	if keep < 0 || keep > 1000 {
 		return fmt.Errorf("keep must be between 0 (keep everything) and 1000")
 	}
+	s.fsMu.RLock()
+	defer s.fsMu.RUnlock()
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	if err := m.requireRegistered(s); err != nil {
+		return err
+	}
 	s.mu.Lock()
+	previous := s.BackupKeep
 	s.BackupKeep = keep
 	s.mu.Unlock()
-	if err := m.Save(); err != nil {
+	if err := m.saveHeld(); err != nil {
+		s.mu.Lock()
+		s.BackupKeep = previous
+		s.mu.Unlock()
 		return err
 	}
 	m.audit(actor, "backup.retention", s.ID, fmt.Sprintf("keep=%d", keep))
@@ -372,6 +419,11 @@ func (m *Manager) SetBackupKeep(s *Server, keep int, actor string) error {
 // server must be stopped: restoring under a running game would have the process
 // writing into a tree being replaced beneath it.
 func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
+	workDone, err := m.beginWork()
+	if err != nil {
+		return err
+	}
+	defer workDone()
 	// The filesystem gate comes BEFORE the state check: Start commits under
 	// the same gate, so with the check first a server could launch between
 	// the two and the restore would swap files under a live game.
@@ -380,6 +432,13 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 
 	if st := s.State(); st != StatusStopped && st != StatusFailed {
 		return fmt.Errorf("stop the server before restoring a backup")
+	}
+
+	if err := m.requireRegistered(s); err != nil {
+		return err
+	}
+	if err := m.requireStoppedContainer(s); err != nil {
+		return err
 	}
 
 	if !m.lockBackup(s.ID) {
@@ -408,6 +467,12 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	if err != nil {
 		return err
 	}
+
+	release, err := acquireCapacity(m.ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	// A restore extracts into a staging directory on the same filesystem before
 	// anything live is touched, so running out of room part way through cannot
@@ -473,7 +538,7 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		return err
 	}
 
-	if err := untarGz(archive, extracted); err != nil {
+	if err := untarGzContext(m.ctx, archive, extracted, defaultRestoreLimits); err != nil {
 		return fmt.Errorf("restore failed, the live world was not touched: %w", err)
 	}
 
@@ -487,8 +552,30 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		}
 	}
 
+	stagedEntries, err := os.ReadDir(extracted)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	journal := restoreJournal{Phase: "evacuating", OldPort: s.Port, OldMaxPlayers: s.MaxPlayers, OldProps: maps.Clone(s.Props)}
+	s.mu.Unlock()
+	for _, e := range stagedEntries {
+		journal.New = append(journal.New, e.Name())
+	}
+	if err := writeRestoreJournal(staging, journal); err != nil {
+		return err
+	}
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.Name() != stagingName {
+			journal.Original = append(journal.Original, e.Name())
+		}
+	}
+	if err := writeRestoreJournal(staging, journal); err != nil {
 		return err
 	}
 	for _, e := range entries {
@@ -498,12 +585,28 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		if err := os.Rename(filepath.Join(dir, e.Name()), filepath.Join(held, e.Name())); err != nil {
 			// Put back whatever moved. If even that fails, the staging tree
 			// is RETAINED - it holds the only copies of what moved out.
-			if rerr := restoreHeld(held, dir); rerr != nil {
+			if rerr := rollbackRestoreJournal(nil, held, dir, staging, journal); rerr != nil {
 				keepStaging = true
+				m.markRecovery(s, "restore rollback incomplete; retained originals require recovery")
 				return fmt.Errorf("could not clear the live world, and the previous world is retained at %s: %w", staging, rerr)
 			}
 			return fmt.Errorf("could not clear the live world, nothing was changed: %w", err)
 		}
+	}
+
+	if err := syncDirectories(dir, held); err != nil {
+		keepStaging = true
+		m.markRecovery(s, "evacuation namespace durability could not be confirmed")
+		return err
+	}
+	journal.Phase = "installing"
+	if err := writeRestoreJournal(staging, journal); err != nil {
+		if rerr := rollbackRestoreJournal(nil, held, dir, staging, journal); rerr != nil {
+			keepStaging = true
+			m.markRecovery(s, "restore phase could not be persisted or rolled back")
+			return rerr
+		}
+		return err
 	}
 
 	// Installed entries are tracked so a failure part way through the install
@@ -515,16 +618,18 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 	var installed []string
 	staged, err := os.ReadDir(extracted)
 	if err != nil {
-		if rerr := rollbackRestore(installed, held, dir); rerr != nil {
+		if rerr := rollbackRestoreJournal(installed, held, dir, staging, journal); rerr != nil {
 			keepStaging = true
+			m.markRecovery(s, "restore rollback incomplete; retained originals require recovery")
 			return fmt.Errorf("restore failed and the previous world is retained at %s: %w", staging, rerr)
 		}
 		return err
 	}
 	for _, e := range staged {
 		if err := os.Rename(filepath.Join(extracted, e.Name()), filepath.Join(dir, e.Name())); err != nil {
-			if rerr := rollbackRestore(installed, held, dir); rerr != nil {
+			if rerr := rollbackRestoreJournal(installed, held, dir, staging, journal); rerr != nil {
 				keepStaging = true
+				m.markRecovery(s, "restore rollback incomplete; retained originals require recovery")
 				return fmt.Errorf("restore failed part way, and the previous world is retained at %s: %w", staging, rerr)
 			}
 			return fmt.Errorf("restore failed part way, the previous world was put back: %w", err)
@@ -543,7 +648,9 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 		// Best-effort on the restore path: the tree is already installed,
 		// and a persistence failure must not unwind a completed restore.
 		if err := m.reloadProps(s, string(content)); err != nil {
-			log.Printf("%s: restored server.properties applied in memory but not persisted: %v", s.ID, err)
+			keepStaging = true
+			m.markRecovery(s, "restored metadata could not be persisted")
+			return fmt.Errorf("restore metadata could not be persisted; retained journal requires recovery: %w", err)
 		}
 		// If the restored port was refused (another server claimed it in the
 		// window between the pre-swap validation and this commit), the model
@@ -556,21 +663,27 @@ func (m *Manager) RestoreBackup(s *Server, backupID, actor string) error {
 			log.Printf("%s: restored server.properties names a port the panel refused; republishing the panel's port %s",
 				s.ID, modelPort)
 			if err := m.writePropsHeld(s); err != nil {
-				log.Printf("%s: could not republish the panel's port after a refused restore: %v", s.ID, err)
+				keepStaging = true
+				m.markRecovery(s, "restored port reconciliation failed")
+				return fmt.Errorf("restore port reconciliation failed; retained journal requires recovery: %w", err)
 			}
 		}
 	}
 
+	if err := syncDirectories(dir, held, extracted); err != nil {
+		keepStaging = true
+		m.markRecovery(s, "restored namespace durability could not be confirmed")
+		return err
+	}
 	// Commit marker LAST - after ownership repair and props reload: a marker
 	// written earlier let boot recovery treat a restore as complete when
 	// only the renames had finished. Crash before this point and recovery
 	// puts the previous world back; crash after it and recovery only drops
 	// the staging tree.
-	if err := os.WriteFile(filepath.Join(staging, ".committed"), []byte("1"), 0o644); err != nil {
-		// The world IS restored; failing the request now would roll nothing
-		// back but leave the marker missing, so boot recovery would undo a
-		// finished restore. Log loudly instead.
-		log.Printf("%s: restore completed but its commit marker could not be written: %v", s.Name, err)
+	if err := writeDurable(filepath.Join(staging, ".committed"), []byte("1")); err != nil {
+		keepStaging = true
+		m.markRecovery(s, "restore installed but commit durability could not be confirmed; inspect retained transaction before starting")
+		return fmt.Errorf("restored world is installed but its commit could not be durably recorded: %w", err)
 	}
 
 	m.audit(actor, "backup.restore", s.ID, backupID)
@@ -667,7 +780,8 @@ func (m *Manager) DeleteBackup(s *Server, backupID, actor string) error {
 // could feed the archiver a file from outside the server tree, and a special
 // file could block it forever. Files are opened nonblocking and must be
 // regular.
-func tarGz(src, dst string) (int64, error) {
+func tarGz(src, dst string) (int64, error) { return tarGzContext(context.Background(), src, dst) }
+func tarGzContext(ctx context.Context, src, dst string) (int64, error) {
 	root, err := os.OpenRoot(src)
 	if err != nil {
 		return 0, err
@@ -759,7 +873,7 @@ func tarGz(src, dst string) (int64, error) {
 				in.Close()
 				return err
 			}
-			_, err = io.CopyN(tw, in, st.Size())
+			_, err = io.CopyN(tw, contextReader{ctx: ctx, reader: in}, st.Size())
 			in.Close()
 			if err != nil {
 				return fmt.Errorf("%s changed size under the archive: %w", child, err)
@@ -844,13 +958,16 @@ func untarGz(archive, dst string) error {
 }
 
 func untarGzLimited(archive, dst string, lim restoreLimits) error {
+	return untarGzContext(context.Background(), archive, dst, lim)
+}
+func untarGzContext(ctx context.Context, archive, dst string, lim restoreLimits) error {
 	f, err := os.Open(archive)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	gz, err := gzip.NewReader(f)
+	gz, err := gzip.NewReader(contextReader{ctx: ctx, reader: f})
 	if err != nil {
 		return err
 	}

@@ -28,7 +28,7 @@ async function viewPlugins(id) {
         <div class="panelbox" style="margin:0">
           <h3>Installing</h3>
           <div class="row"><span class="k">From a URL</span><span class="muted">Paste a direct link to a
-            <span class="mono">.jar</span> in the bar below. The download is capped, must be http or https,
+            <span class="mono">.jar</span> in the bar below. The download is capped, uses public HTTPS by default,
             and must actually be a jar.</span></div>
           <div class="row"><span class="k">Finding a plugin</span><span class="muted">Copy the download link
             from Modrinth, Hangar or SpigotMC and paste it below. The panel does not proxy those
@@ -143,8 +143,9 @@ async function viewPlugins(id) {
   // R66: one in-flight guard shared by the click and Enter paths - the old
   // shape only disabled the button, so pressing Enter mid-download started a
   // second one against the same target.
-  let installing = false;
+  let installing = false, installAction = null;
   const install = async () => {
+    if (installAction) { installAction.retry(); return; }
     if (installing) return;
     const url = $('#plURL', root).value.trim();
     if (!url) return;
@@ -155,22 +156,17 @@ async function viewPlugins(id) {
     }
     installing = true;
     const btn = $('#plInstall', root);
-    btn.disabled = true;
-    btn.textContent = 'Downloading…';
-    try {
-      const res = await api(`/api/servers/${id}/plugins/install`, {
-        method: 'POST',
-        body: JSON.stringify({ url, sha256: sha }),
-      });
-      $('#plURL', root).value = '';
-      $('#plSHA', root).value = '';
-      toast(`Installed ${res.plugin.name}`);
-      flagRestart(res);
-    } catch (e) { toast(e.message, 'err'); }
-    installing = false;
-    btn.disabled = false;
-    btn.textContent = 'Install';
-    load();
+    installAction = startAsyncAction(root, btn, {serverId: id, url: `/api/servers/${id}/plugins/install`, body: {url, sha256: sha}, label: 'Installing…', onFinish(job) {
+      installing = false;
+      installAction = null;
+      if (job.state === 'done') {
+        $('#plURL', root).value = '';
+        $('#plSHA', root).value = '';
+        toast('Plugin installed');
+        flagRestart({requires_restart: s.status === 'running', note: 'Reload the plugin inventory to inspect the installed file.'});
+      }
+      load();
+    }});
   };
 
   $('#plInstall', root).addEventListener('click', install);

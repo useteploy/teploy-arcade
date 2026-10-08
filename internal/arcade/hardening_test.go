@@ -408,6 +408,10 @@ func writeJar(t *testing.T, path string, files map[string]string) {
 // that had already been installed. v0.18.0's Bedrock, Rust and Valheim fixes
 // all landed in a build that could not reach the deployed panel's own copies.
 func TestSeededTemplatesRefreshButNeverClobberAnEdit(t *testing.T) {
+	tplMu.RLock()
+	previous := append([]Template{}, tplLoaded...)
+	tplMu.RUnlock()
+	defer func() { tplMu.Lock(); tplLoaded = previous; tplMu.Unlock() }()
 	dir := t.TempDir()
 
 	// First run seeds and records what it wrote.
@@ -438,19 +442,16 @@ func TestSeededTemplatesRefreshButNeverClobberAnEdit(t *testing.T) {
 		t.Fatalf("second load: %v", err)
 	}
 	got := templateBySlug("bedrock")
-	if got == nil || len(got.Versions) == 0 || got.Versions[0] != "LATEST" {
-		t.Fatalf("a stale seeded template was not refreshed: %+v", got)
+	if got == nil || got.Versions[0] != "1.20.71" {
+		t.Fatalf("unknown ownership changed active template: %+v", got)
 	}
-	if len(got.Protocols) == 0 || got.Protocols[0] != "udp" {
-		t.Error("the refreshed template still does not publish UDP")
-	}
-	// Nothing is thrown away when the panel cannot tell whose file it was.
-	if _, err := os.Stat(tpl + ".superseded"); err != nil {
-		t.Errorf("the previous file was discarded rather than kept aside: %v", err)
+	candidates, err := filepath.Glob(tpl + ".update-*")
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("missing unique update candidate: %v %v", candidates, err)
 	}
 
 	// Now an operator edits it on purpose, with the ledger in place.
-	edited := strings.Replace(string(mustRead(t, tpl)), `"max_players": 10`, `"max_players": 44`, 1)
+	edited := strings.Replace(string(mustRead(t, tpl)), `"max_players":10`, `"max_players":44`, 1)
 	if edited == string(mustRead(t, tpl)) {
 		t.Fatal("test did not actually change the file")
 	}

@@ -10,15 +10,20 @@ on:
   # main runs.
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26'
       - run: gofmt -l . | tee /dev/stderr | (! read)
+      - run: go mod verify
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - run: go vet ./...
       # The panel mutates server state from runner goroutines while HTTP
       # handlers read it, and the detector has found real races on Server.Status
@@ -26,7 +31,35 @@ jobs:
       - run: go test -race ./...
       # The frontend is plain files served from the binary, so its guards are a
       # dependency-free Node scripts rather than a frontend build framework.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
       - run: make test-frontend
+      - run: for script in cmd/teploy-arcade/frontend/*.js; do node --check "$script"; done
+      - run: git diff --exit-code -- go.mod go.sum
+
+  image-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build --tag teploy-arcade:ci --build-arg VERSION=ci .
+      - name: Scan the exact candidate image
+        run: >-
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa
+          image --exit-code 1 --severity HIGH,CRITICAL teploy-arcade:ci
+      - name: Embedded frontend and CLI artifact contract
+        run: |
+          docker run --rm teploy-arcade:ci -help
+          fixture=$(mktemp -d)
+          chmod 700 "$fixture"
+          docker run --detach --name arcade-ci --publish 127.0.0.1:3457:3457 \
+            --volume "$fixture:$fixture" teploy-arcade:ci -host 0.0.0.0 -port 3457 -data "$fixture"
+          trap 'docker rm -f arcade-ci; rm -rf "$fixture"' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3457/api/health; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:3457/ | grep 'Teploy Arcade'
+          curl --fail --silent http://127.0.0.1:3457/app.js | grep 'function loseSession'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3457/api/servers)" = 503

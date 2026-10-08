@@ -1,5 +1,70 @@
 # Open audit items
 
+
+## Current implementation reconciliation (2026-10-07; acceptance/publication pending)
+
+This section supersedes the historical design deferrals below. The October
+prepared changes are adopted at `a77c4cc`; the following implementation is local
+and uncommitted. Source implementation does not imply deployed acceptance.
+
+- October **A-01–A-08** and reopened **ARCADE-R43** have source repairs: exact
+  missing classification, authoritative stopped snapshot/restore admission,
+  admitted player-list commands, owned clone/task dialogs, correct host memory
+  and guest CPU arithmetic, and frontend test failure propagation.
+- **R04/R05/R08/R09/R50/R51/R65/R73; A11/A27/A37:** reject-new session caps and
+  rate limits preserve live sessions; audit writes use their own bounded durable
+  rotated store with observable health; MCP is typed/scoped with origin and
+  protocol checks; catalog publication is atomic and seed ownership conservative;
+  plugin network policy is HTTPS/public by default with explicit operator opt-ins;
+  corrupt credential/server authority requires recovery with evidence retained.
+- **R06/R07/R12/R59/R67/R68/R71/R72; A13/A33/A34/A40;
+  useteploy__teploy-arcade-03:** explicit HTTPS origin and public game host,
+  strict mutation decoding/content type/cross-origin protection, pre-bound
+  cancellable application with joined workers, centralized auth transition,
+  keyboard/focus controls and immutable release/build dependency pins.
+- **R10/R34; A38:** persisted bounded import/clone/operation registry, owned
+  cancellable workers and periodic terminal metadata retention. Backup, restore
+  and install support `Prefer: respond-async` with durable 202 IDs and scoped
+  idempotency keys; the shipped UI uses them. Interrupted jobs are visible and
+  require inspection/retry; they are never replayed automatically. Legacy
+  synchronous API clients remain supported during migration.
+- **R14/R16/R25/R32/R33/R38/R39/R40/R52/R53:** rooted descriptor readers,
+  registered/edit-serialized mutations, supported canonical property-key syntax
+  with alternate Java key encodings/continuations refused before publication,
+  import source identity and launch-file hashes with held world locks, frozen
+  clone launch geometry, one dynamic binding admission, strict bounded Geyser
+  detection, random identities with exclusive directory claims, known online or
+  standard offline player identities, and source-marked nullable observations.
+- **R17/R19/R20/R21/R23/R27/R30/R42/R54/R56; A06/A07/A10/A21/A32:**
+  publication-aware durable private state, complete restore phases/manifests
+  and retryable rollback with metadata recovery, persistent recovery interlocks,
+  durable deletion intent, serialized settings/resources/order/retention commits,
+  recognized live game save-state acknowledgements, shared filesystem capacity
+  admission, durable lifecycle intent generations, pending task occurrences and
+  cancellation/lifecycle-completion-aware task execution.
+- **R35/R36/R37/R41/R45; A24/A25/A26:** typed local Engine observation,
+  bounded Docker command capture/admission/deadlines, separate wait admission,
+  cached daemon health, actual mount/image/ownership/binding re-adoption,
+  reconnect cursors/backoff, explicit observed/unverified readiness, and separate
+  nullable/freshness-aware panel/cgroup/daemon capacity observations. Managed
+  Docker bind mounts require a local Unix endpoint.
+- **R62; A17:** original revision ETags and explicit draft-preserving conflicts;
+  stable bounded directory cursor pages with changed-generation refusal.
+
+Remaining acceptance gates: final integrated Go build/vet/unit/race on the final
+source, real browser keyboard/auth/navigation acceptance, healthy-daemon Docker
+lifecycle/failure/native-image acceptance and candidate image scan, and a fresh
+immutable release/deployment. **R48 native templates remain preview** pending
+real-image persistence/console/port contracts and explicit operator migration of
+existing installations; no world is relocated automatically. **REL-01** future
+release provenance controls are implemented; historic release identities require
+fresh-version publication, not reuse of the existing tag. Publication is separate
+from local repair. Focused unit/race and frontend checks have passed; final full
+execution is capacity-coordinated with the parent campaign.
+
+The older logs below are retained as historical evidence rather than current
+architecture deferrals. No private campaign evidence belongs in this repository.
+
 Unresolved findings for this repository from the ChatGPT-led audit series (2026-09-09 through 2026-09-19, passes 1-7; register: teploy-neutron-lullmail expanded audit). Pass 7 triaged all 74 of its findings: code landed for 37 (several closing their safe half, with the deeper tail carried below), 0 refuted, and 37 deferred - most corroborating deferrals this register already tracks. Read this before treating related work as done; update it when you close, defer, or upstream-report an item.
 
 Open items: 17 P2 improvements + 1 pre-existing P2 from pass 6, plus the pass-7 deferral tails listed in their section below.
@@ -311,3 +376,20 @@ Verification: go build, go vet, go test ./..., go test -race - all clean (2026-0
 5. MEDIUM port publication split - FIXED: WriteFile writes the new file FIRST and commits the port SECOND (a failed write never moves the model; a failed commit only restores the old bytes - the silently-dropped model revert is gone). RestoreBackup republishes the model's port via writePropsHeld when the restored file's port was refused, so a raced restore can no longer report success with disk naming another server's port.
 
 Verification: go build, go vet, go test ./..., go test -race - all clean (2026-09-12).
+
+## Independent landing review (2026-10-07, final seal 2f53a73f) - 0 new findings, gates green
+
+A reviewer outside the implementation lane re-derived the seal, read the sharp paths fresh, and reran the full gates on the sealed tree before this append. No code was changed; this section is the only post-seal edit.
+
+Seal: recomputing the lane's own recipe (SHA-256 over compact sorted-key JSON of every tracked+untracked file, per .audits/2026-10-07-final/teploy-arcade-source-manifest.json) over the dirty tree reproduces source seal 2f53a73fb79612a0ce750f6047d2114621293859827897079967f143912ee4c2 exactly - 154/154 per-file hashes and byte counts match, HEAD is the manifest's base a77c4cc. The sealed patch (SHA-256 0969c2364d576ac978f5c4b72db7a9e13f9ac3280eb6784804380f7e8566813f) and archive (9735df39689973e2bf153e74b821addd413131fb0bf6d060010726b33ac4bcdd) hash to their recorded values, the patch applies cleanly to a77c4cc in a scratch worktree, and the result matches all 154 manifest hashes - the dirty tree IS the sealed patch. All 81 changed paths are covered (the apparent 80/81 gap was git's `.github/scripts/` directory line vs the patch's file path inside it).
+
+Fresh review verdicts on the claimed behaviors:
+
+1. Capacity leases - sound. acquireCapacity keys a global per-device gate; restore and backup both take the server's exclusive fsMu BEFORE the gate, so two operations on one server serialize twice over (fsMu + lockBackup) and same-device cross-server work serializes on the gate. Lock order is uniformly fsMu -> capacity (clone's capacity -> lockBackup cannot invert it, since same-server contenders are already serialized behind fsMu). Reserve retention survives: admission checks uncompressed-size + importFreeMargin, extraction re-checks free space per entry.
+2. Generation-fenced intent - sound. persistIntent is durable with in-memory rollback on save failure; Start's staleness is checked after fsMu and again inside claimStart under lifecycle+saveMu, so the deliberately-unlocked docker preflight cannot resurrect a superseded intent. Stop, Kill, console stop/end and a competing Restart all bump the generation before their work; boot resume persists a fresh intent and fences its staggered starts. No window found where a cancelled start still launches.
+3. Authoritative Docker state - fail-closed. The tri-state probe classifies only a 200 with parsable State.Running, 404 as Missing, and everything else (transport, non-200, bad body, trailing bytes, timeout, cancelled ctx) as Unknown; snapshot/restore refuse both Running and Unknown. The state check runs under the same fsMu that Start commits under and is taken AFTER acquiring it (backup.go documents the ordering), so a panel-initiated start cannot interleave between check and mutation; an operator running `docker start` by hand remains outside panel control, as stated.
+4. Durable job store and restore journal - sound. Job records are atomically published (temp+fsync+rename+dirfsync); the boot sweep of the panel's own .arcade-tmp- prefix runs before Load/loadImportJobs, so a crash mid-persist cannot leave a temp file that trips the strict registry reader. Corrupt, duplicate-field, unknown-field, trailing, oversize or symlinked records fail closed with evidence preserved; restart marks only genuinely running jobs interrupted; the reaper never touches source data. The restore journal is validated whole (bounded namespaces, no separators/duplicates, strict fields) before any recovery mutation, held trees are confined to an os.Root, and a retried partial rollback does not delete already-returned originals.
+5. Typed scoped MCP - clean. No raw console tool is advertised or dispatchable; unknown tools and injected parameters are rejected; a request without a valid scoped token never dispatches (Check gates the handler), and scoped tokens refuse SendCommand outright - the verb denylist survives only as embedder defense-in-depth. Kill stays human-only; per-action permits recheck revocation.
+6. The new final_*_test.go files pin real observable outcomes (file bytes on disk, staging retention, durable records, HTTP status matrices, terminal job states, fake-docker executor bounds) - no test-that-tests-nothing found. The integration test is a genuine live-acceptance gate: env-blocked, preloaded-image-only, authoritative-absence precondition, own-fixture cleanup, no implicit pull.
+
+Gates rerun on the sealed tree (2026-10-07): go vet ./... clean; go vet -tags integration ./internal/arcade clean; gofmt -l empty; go test ./internal/arcade -count=1 PASS 196.7s; go test -race ./internal/arcade -count=1 PASS 269.3s; go test ./internal/mcp clean; make test-frontend 79/79 across all seven files, exit 0. TEPLOY_ARCADE_LIVE_ACCEPTANCE stays unset - live Docker acceptance was not simulated. Standing deliberate deferrals (R48 preview, sandbox upstream promotion, REL-01 historical-tag repair via a fresh release) are unchanged by this review.

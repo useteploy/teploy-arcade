@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -51,7 +52,6 @@ type Backend interface {
 	ListServers() (string, error)
 	GetServer(id string) (string, error)
 	ConsoleTail(id string, lines int) (string, error)
-	SendCommand(id, text string) (string, error)
 	Lifecycle(id, action string) (string, error)
 	ListBackups(id string) (string, error)
 	CreateBackup(id, note string) (string, error)
@@ -63,9 +63,10 @@ type Backend interface {
 type TokenChecker func(token string) bool
 
 type Handler struct {
-	Backend Backend
-	Check   TokenChecker
-	Logf    func(string, ...any)
+	Backend      Backend
+	Check        TokenChecker
+	Logf         func(string, ...any)
+	PublicOrigin string
 }
 
 func (h *Handler) logf(f string, a ...any) {
@@ -89,6 +90,33 @@ func bearerToken(h string) (string, bool) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	for _, key := range []string{"Origin", "MCP-Protocol-Version", "Authorization"} {
+		if len(r.Header.Values(key)) > 1 {
+			http.Error(w, "ambiguous MCP transport header", http.StatusBadRequest)
+			return
+		}
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		expected := h.PublicOrigin
+		if expected == "" {
+			scheme := "http"
+			if r.TLS != nil {
+				scheme = "https"
+			}
+			expected = scheme + "://" + r.Host
+		}
+		u, err := url.Parse(origin)
+		if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" || origin != expected {
+			http.Error(w, "invalid MCP origin", http.StatusForbidden)
+			return
+		}
+	}
+	version := r.Header.Get("MCP-Protocol-Version")
+	if version != "" && !supportedProtocols[version] {
+		http.Error(w, "unsupported MCP protocol version", http.StatusBadRequest)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
 		http.Error(w, "MCP endpoint accepts POST only", http.StatusMethodNotAllowed)
@@ -105,9 +133,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
 	if err != nil {
 		writeRPC(w, nil, nil, &rpcError{Code: -32700, Message: "unreadable body"})
+		return
+	}
+	if len(body) > 1<<20 {
+		http.Error(w, "MCP request too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	// R09: a bounded reader alone does not prove the body fits - a valid JSON
@@ -127,8 +159,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// carrying an ID must be string or number - MCP forbids null and
 	// fractional IDs. An absent ID means notification, which never gets a
 	// response body.
-	isNotification := len(req.ID) == 0 || string(req.ID) == "null"
-	if req.JSONRPC != "" && req.JSONRPC != "2.0" {
+	isNotification := len(req.ID) == 0
+	if req.JSONRPC != "2.0" {
 		writeRPC(w, req.ID, nil, &rpcError{Code: -32600, Message: `jsonrpc must be "2.0"`})
 		return
 	}
@@ -148,7 +180,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var p struct {
 			ProtocolVersion string `json:"protocolVersion"`
 		}
-		_ = json.Unmarshal(req.Params, &p)
+		if json.Unmarshal(req.Params, &p) != nil || p.ProtocolVersion == "" {
+			writeRPC(w, req.ID, nil, &rpcError{Code: -32602, Message: "protocolVersion is required"})
+			return
+		}
 		proto := latestProtocol
 		if supportedProtocols[p.ProtocolVersion] {
 			proto = p.ProtocolVersion

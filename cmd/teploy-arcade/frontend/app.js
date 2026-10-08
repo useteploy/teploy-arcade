@@ -22,7 +22,9 @@ function fmtUptime(sec) {
   return `${ss}s`;
 }
 
-function fmtMB(mb) { return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB'; }
+function fmtMB(mb) {
+  return usageKnown(mb) ? (mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB') : '—';
+}
 
 // ------------------------------------------------------------ player heads
 
@@ -95,14 +97,190 @@ const STATUS_CLASS = {
 };
 
 async function api(path, opts = {}) {
+  const publicRoute = /^\/api\/(me|login|logout|setup)$/.test(path);
+  if (state.authLost && !publicRoute) throw new Error('Please sign in');
+  const epoch = state.authEpoch || 0;
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
     ...opts,
+    headers: { 'Content-Type': 'application/json', ...opts.headers },
   });
   let body = null;
   try { body = await res.json(); } catch { /* no body */ }
-  if (!res.ok) throw new Error((body && body.error) || `${res.status} ${res.statusText}`);
+  if (res.status === 401 && !publicRoute) loseSession();
+  if (!publicRoute && epoch !== (state.authEpoch || 0)) throw new Error('Please sign in');
+  if (!res.ok) {
+    const error = new Error((body && body.error) || `${res.status} ${res.statusText}`);
+    error.status = res.status;
+    throw error;
+  }
   return body;
+}
+
+function loseSession() {
+  if (state.authLost) return;
+  state.authLost = true;
+  state.authEpoch = (state.authEpoch || 0) + 1;
+  state.me = null;
+  ++routerGeneration;
+  state.events?.close();
+  clearInterval(state.hostTimer);
+  state.console?.destroy();
+  state.console = null;
+  for (const action of [...(state.asyncActions || [])]) action.dispose();
+  const view = $('#view');
+  view?.firstElementChild?.dispatchEvent(new CustomEvent('gss:teardown'));
+  // Dialog controllers own their requests/timers through this event.
+  window.dispatchEvent(new Event('hashchange'));
+  $('#modalHost')?.replaceChildren();
+  state.servers = [];
+  state.host = null;
+  document.querySelector('.app').style.display = 'none';
+  const login = window.extraViews.viewLogin();
+  document.body.appendChild(login);
+  login.querySelector('input')?.focus();
+}
+
+async function checkSession() {
+  if (state.authLost) return false;
+  try {
+    const me = await api('/api/me');
+    if (!me.user && !me.auth_disabled) { loseSession(); return false; }
+    state.me = me;
+    applyRole(document.body);
+    return true;
+  } catch { return !state.authLost; } // A daemon outage is not revocation.
+}
+
+// Accepted operations belong to the panel. This controller owns only browser
+// polling; dismissal cancels its reads without pretending to cancel the work.
+function startAsyncAction(root, button, config) {
+  const original = button.innerHTML;
+  const openedAt = location.hash;
+  let closed = false, busy = false, timer = null, request = null, job = null;
+  const key = crypto.randomUUID ? crypto.randomUUID() : [...crypto.getRandomValues(new Uint8Array(16))].map(n => n.toString(16).padStart(2, '0')).join('');
+  const active = () => !closed && root.isConnected && !state.authLost && location.hash === openedAt;
+  const dispose = () => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    request?.abort();
+    root.removeEventListener('gss:teardown', dispose);
+    window.removeEventListener('hashchange', dispose);
+    state.asyncActions?.delete(controller);
+  };
+  const finish = result => {
+    if (!active()) { dispose(); return; }
+    dispose();
+    button.disabled = false;
+    button.innerHTML = original;
+    if (result.state === 'failed') toast(result.error || 'Operation failed', 'err');
+    config.onFinish?.(result);
+  };
+  const handle = result => {
+    if (!active()) { dispose(); return; }
+    if (!result?.id) throw new Error('Agent did not return an operation ID');
+    job = result;
+    button.title = `Accepted operation ${job.id}; leaving this view stops polling, not the operation`;
+    if (job.state === 'done' || job.state === 'failed') { finish(job); return; }
+    button.disabled = true;
+    button.textContent = config.label || 'Working…';
+    timer = setTimeout(poll, 900);
+  };
+  const poll = async () => {
+    if (!active()) { dispose(); return; }
+    if (busy || !job) return;
+    busy = true;
+    timer = null;
+    request = new AbortController();
+    try {
+      handle(await api(`/api/servers/${encodeURIComponent(config.serverId)}/operations/${encodeURIComponent(job.id)}`, {signal: request.signal}));
+    } catch (error) {
+      if (!active()) { dispose(); return; }
+      button.disabled = false;
+      button.textContent = 'Retry status';
+      button.title = `Operation ${job.id} continues on the panel. Retry reads its status and does not submit it again.`;
+      toast(error.message, 'err');
+    } finally { busy = false; }
+  };
+  const controller = { dispose, retry() {
+    if (!active() || busy || !job) return;
+    clearTimeout(timer);
+    button.disabled = true;
+    poll();
+  }};
+  if (!state.asyncActions) state.asyncActions = new Set();
+  state.asyncActions.add(controller);
+  root.addEventListener('gss:teardown', dispose);
+  window.addEventListener('hashchange', dispose);
+  button.disabled = true;
+  button.textContent = config.label || 'Submitting…';
+  request = new AbortController();
+  api(config.url, {method: 'POST', body: JSON.stringify(config.body || {}), headers: {'Prefer': 'respond-async', 'Idempotency-Key': key}, signal: request.signal})
+    .then(handle)
+    .catch(error => {
+      if (!active()) { dispose(); return; }
+      if (error.status) { finish({state: 'failed', error: error.message}); return; }
+      // A lost submission response is not proof the operation did not start.
+      // Never blindly create a second backup/install/restore from this view.
+      button.disabled = true;
+      button.textContent = 'Submission outcome unknown';
+      button.title = `Submission key ${key}. Inspect panel operations before retrying.`;
+      toast('The submission response was lost. The operation may be running; inspect the panel before submitting another.', 'err');
+    });
+  return controller;
+}
+
+function readinessTitle(server) {
+  if (server.status !== 'running') return STATUS_LABEL[server.status] || 'Unknown';
+  if (server.runtime === 'sim') return 'Simulator running; readiness is simulated';
+  return server.readiness === 'observed' ? 'Game readiness observed in server output' : 'Container running; game readiness is unverified';
+}
+
+function playerLatency(player) {
+  return typeof player.ping_ms === 'number' && Number.isFinite(player.ping_ms) && player.ping_ms >= 0 ? `${player.ping_ms} ms` : '—';
+}
+
+function playerObservation(player) {
+  const source = ['log', 'rcon', 'simulation'].includes(player.source) ? player.source : 'unknown';
+  return `Observation: ${source} · UUID: ${player.uuid || '—'}`;
+}
+
+function showEditConflict(host, loadCurrent, describeCurrent, applyLatest) {
+  host.querySelector('[data-edit-conflict]')?.remove();
+  const panel = h(`<div data-edit-conflict class="panelbox" role="status" style="margin:12px;overflow:auto;max-height:40vh;flex-shrink:0">
+    <p>Another edit changed the saved version. Your draft is still here. Compare it with the current version before saving again.</p>
+    <button type="button" class="btn btn-sm" data-compare>Compare current version</button>
+    <button type="button" class="btn btn-sm" data-reload>Reload current version and discard draft</button>
+    <textarea data-current readonly hidden aria-label="Current saved version" style="width:100%;min-height:180px"></textarea>
+    <p data-conflict-error></p>
+  </div>`);
+  host.appendChild(panel);
+  let busy = false;
+  const read = async (reload) => {
+    if (busy || !panel.isConnected) return;
+    if (reload && !confirm('Discard this draft and reload the current saved version?')) return;
+    busy = true;
+    try {
+      const current = await loadCurrent();
+      if (!panel.isConnected) return;
+      if (reload) { applyLatest(current); panel.remove(); }
+      else {
+        const comparison = panel.querySelector('[data-current]');
+        comparison.hidden = false;
+        comparison.value = describeCurrent(current);
+      }
+    } catch (error) {
+      if (panel.isConnected) panel.querySelector('[data-conflict-error]').textContent = error.message;
+    } finally { busy = false; }
+  };
+  panel.querySelector('[data-compare]').addEventListener('click', () => read(false));
+  panel.querySelector('[data-reload]').addEventListener('click', () => read(true));
+}
+
+function gameAddress(server) {
+  const host = String(state.host?.public_game_host || '').replace(/^\[|\]$/g, '');
+  if (!host) return `Port ${server.address.port} · configure -game-host to share a join address`;
+  return `${host.includes(':') ? `[${host}]` : host}:${server.address.port}`;
 }
 
 function toast(msg, kind = '') {
@@ -144,8 +322,8 @@ function railActiveFor(nav, route) {
 // The panel reports 0 for a capacity it could not measure. Rendering that as
 // "/ 0 GB" with a full red bar invents a crisis; rendering it as unknown says
 // what is actually true. Every consumer of a total goes through here.
-const capKnown = (total) => typeof total === 'number' && total > 0;
-const capPct = (used, total) => capKnown(total) ? Math.min(100, used / total * 100) : 0;
+const capKnown = (total) => typeof total === 'number' && Number.isFinite(total) && total > 0;
+const capPct = (used, total) => capKnown(total) && usageKnown(used) ? Math.min(100, used / total * 100) : 0;
 const capOver = (used, total) => capKnown(total) && used > total;
 
 function renderRail() {
@@ -185,6 +363,7 @@ let tabDragging = false;
 function renderTabstrip() {
   const strip = $('#tabstrip');
   const cur = state.route.id;
+  const focusedId = strip.contains(document.activeElement) ? document.activeElement.dataset.sid : null;
 
   // The metrics feed redraws this every two seconds. Rebuilding the strip
   // mid-drag destroys the element under the pointer, which cancels the drag and
@@ -208,11 +387,12 @@ function renderTabstrip() {
         <span class="gm gm-xs gm-${esc(s.mark)}"></span>
         <span class="nm">${esc(s.name)}</span>
         ${pc}
-        <span class="st ${cls}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span>
+        <span class="st ${cls}" title="${esc(readinessTitle(s))}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span>
       </a>`;
   }).join('');
 
   wireTabDrag(strip);
+  if (focusedId) [...strip.querySelectorAll('.stab')].find(el => el.dataset.sid === focusedId)?.focus();
   // Keep the server you are looking at in view when the strip scrolls.
   const active = strip.querySelector('.stab.is-active');
   if (active) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -236,7 +416,26 @@ function wireTabDrag(strip) {
   let dragId = null;
 
   strip.querySelectorAll('.stab').forEach((el) => {
+    el.title += ' — arrow keys move focus; Alt+arrow reorders (operator)';
+    el.addEventListener('keydown', async event => {
+      if (!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
+      event.preventDefault();
+      const tabs = [...strip.querySelectorAll('.stab')], at = tabs.indexOf(el);
+      const to = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : at + (event.key === 'ArrowLeft' ? -1 : 1);
+      if (to < 0 || to >= tabs.length) return;
+      if (!event.altKey) { tabs[to].focus(); return; }
+      if (myRoleRank() < 2) return;
+      const prior = [...state.servers], moved = state.servers.splice(at, 1)[0];
+      state.servers.splice(to, 0, moved);
+      try {
+        const res = await api('/api/servers/order', {method: 'POST', body: JSON.stringify({order: state.servers.map(server => server.id)})});
+        if (res?.servers) state.servers = res.servers;
+      } catch (error) { state.servers = prior; toast(error.message, 'err'); }
+      renderTabstrip();
+      [...strip.querySelectorAll('.stab')].find(tab => tab.dataset.sid === el.dataset.sid)?.focus();
+    });
     el.addEventListener('dragstart', (e) => {
+      if (myRoleRank() < 2) { e.preventDefault(); return; }
       dragId = el.dataset.sid;
       tabDragging = true;
       el.classList.add('is-dragging');
@@ -317,7 +516,7 @@ function serverHeader(s, tab) {
        <button type="button" class="btn btn-quiet" data-act="delete"><i class="ico ico-sm ico-trash"></i> Delete</button>`;
 
   const meta = [
-    `<span><i class="ico ico-sm ico-network"></i> <span class="mono val">${esc(s.address.host)}:${s.address.port}</span></span>`,
+    `<span><i class="ico ico-sm ico-network"></i> <span class="mono val">${esc(gameAddress(s))}</span></span>`,
     `<span><i class="ico ico-sm ico-flask"></i> ${softwareLabel(s)}</span>`,
     s.players ? `<span><i class="ico ico-sm ico-users"></i> <span class="val">${s.players.online}/${s.players.max}</span> players</span>` : '',
     running ? `<span><i class="ico ico-sm ico-clock"></i> up <span class="val">${fmtUptime(s.uptime)}</span></span>` : '',
@@ -337,7 +536,7 @@ function serverHeader(s, tab) {
       <div class="srv-id">
         <span class="gm gm-lg gm-${esc(s.mark)}"></span>
         <div><h1 class="srv-name">${esc(s.name)}</h1></div>
-        <span class="srv-state ${cls}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span>
+        <span class="srv-state ${cls}" title="${esc(readinessTitle(s))}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span>
         <span class="badge-mute" style="margin-left:4px">${esc(s.runtime)}</span>
         <div class="srv-actions">${actions}</div>
       </div>
@@ -387,6 +586,38 @@ function wireHeaderActions(root, id) {
 
 // ------------------------------------------------------------ servers view
 
+function usageKnown(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function scopeLabel(scope) {
+  const labels = {panel_cgroup: 'panel cgroup', proc_visible_host: 'host visible through /proc', panel_host: 'panel host', panel_process_limit: 'panel process limit', docker_daemon: 'Docker daemon'};
+  return Object.hasOwn(labels, scope) ? labels[scope] : 'unknown scope';
+}
+
+function measurementTitle(measurement) {
+  return `Scope: ${scopeLabel(measurement?.scope)} · Source: ${measurement?.source || 'unknown'} · Sampled: ${measurement?.sampled_at || measurement?.sample_at || 'unknown'}${measurement?.stale ? ' · stale' : ''}`;
+}
+
+function runtimeCapacity(host, runtime) {
+  if (runtime === 'docker') {
+    const capacity = host?.docker_capacity;
+    return {scope: 'docker_daemon', total_mb: capacity?.known && capKnown(capacity.total_mb) ? capacity.total_mb : null, total_vcpu: capacity?.known && capKnown(capacity.total_vcpu) ? capacity.total_vcpu : null, source: capacity?.source, sampled_at: capacity?.sampled_at};
+  }
+  return {scope: 'panel_process_limit', total_mb: capKnown(host?.memory?.total_mb) ? host.memory.total_mb : null, total_vcpu: capKnown(host?.cpu?.total_vcpu) ? host.cpu.total_vcpu : null};
+}
+
+function capacityLabel(host, runtime) {
+  const capacity = runtimeCapacity(host, runtime);
+  return `${scopeLabel(capacity.scope)} capacity: ${capKnown(capacity.total_vcpu) ? capacity.total_vcpu + ' vCPU' : 'CPU unknown'} · ${capKnown(capacity.total_mb) ? fmtMB(capacity.total_mb) : 'memory unknown'}`;
+}
+
+function memoryScopesComparable(memory) {
+  // /proc usage can describe a whole host while the capacity is a process
+  // cgroup limit. Showing that ratio invents an exhaustion measurement.
+  return ['panel_cgroup', 'panel_host'].includes(memory.usage?.scope);
+}
+
 // Host tiles, shared by the Servers page and the Dashboard.
 //
 // These were duplicated and drifted: one page was corrected to show measured
@@ -396,9 +627,11 @@ function wireHeaderActions(root, id) {
 // server runs at once, which is a planning question, not a live one.
 function hostTiles(host) {
   if (!host) return '';
-  const bar = (used, total) => capKnown(total)
+  const bar = (used, total) => capKnown(total) && usageKnown(used)
     ? `<div class="bar"><i class="${used / total > 0.9 ? 'warn' : ''}" style="width:${capPct(used, total)}%"></i></div>` : '';
-  const cpuPct = host.cpu.used_percent != null ? host.cpu.used_percent : null;
+  const cpuPct = !host.cpu.stale && usageKnown(host.cpu.used_percent) ? host.cpu.used_percent : null;
+  const memoryKnown = usageKnown(host.memory.used_mb);
+  const memoryComparable = memoryScopesComparable(host.memory);
 
   return `<div class="tiles">
     <div class="tile">
@@ -406,14 +639,15 @@ function hostTiles(host) {
       <div class="v">${host.running}<small> / ${host.servers} running</small></div>
     </div>
     <div class="tile">
-      <div class="k"><i class="ico ico-sm ico-cpu"></i> Host CPU</div>
+      <div class="k" title="${esc(measurementTitle(host.cpu))}"><i class="ico ico-sm ico-cpu"></i> Host CPU</div>
       <div class="v">${cpuPct == null ? '-' : cpuPct + '<small> %</small>'}</div>
       ${cpuPct == null ? '' : bar(cpuPct, 100)}
     </div>
     <div class="tile">
-      <div class="k"><i class="ico ico-sm ico-memory"></i> Host memory</div>
-      <div class="v">${(host.memory.used_mb / 1024).toFixed(1)}<small> / ${capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) + ' GB' : 'unknown'}</small></div>
-      ${bar(host.memory.used_mb, host.memory.total_mb)}
+      <div class="k" title="${esc(measurementTitle(host.memory.usage))}"><i class="ico ico-sm ico-memory"></i> ${host.memory.usage?.scope === 'panel_cgroup' ? 'Panel memory' : 'Host memory'}</div>
+      <div class="v">${memoryKnown ? (host.memory.used_mb / 1024).toFixed(1) + '<small> GB used</small>' : '—'}${memoryComparable ? `<small> / ${capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) + ' GB' : 'unknown'}</small>` : ''}</div>
+      <div class="muted" style="font-size:11px">${esc(scopeLabel(host.memory.usage?.scope))}${!memoryComparable ? ` · Panel limit: ${capKnown(host.memory.total_mb) ? fmtMB(host.memory.total_mb) : 'unknown'}` : ''}</div>
+      ${memoryComparable ? bar(host.memory.used_mb, host.memory.total_mb) : ''}
     </div>
     <div class="tile">
       <div class="k"><i class="ico ico-sm ico-box"></i> Disk</div>
@@ -523,7 +757,7 @@ function serverCard(s) {
 
   const statusExtra = s.status === 'failed'
     ? `<div class="st off" style="display:flex;align-items:center;gap:6px"><i class="ico ico-sm ico-warning"></i> Failed</div>`
-    : `<div class="st ${cls}">${STATUS_LABEL[s.status]}</div>`;
+    : `<div class="st ${cls}" title="${esc(readinessTitle(s))}">${STATUS_LABEL[s.status]}</div>`;
 
   return `<div class="card ${busy ? 'is-busy' : ''} ${s.status === 'failed' ? '' : ''}" data-id="${s.id}"
       ${s.status === 'failed' ? 'style="border-color:#5a3330"' : ''}>
@@ -542,7 +776,7 @@ function serverCard(s) {
     </div>
     <div class="card-chart">
       <svg viewBox="0 0 200 34" preserveAspectRatio="none">${memArea}</svg>
-      <div class="lbl"><b>${running ? s.memory.used_mb : 0}</b> MB RAM</div>
+      <div class="lbl"><b>${running && usageKnown(s.memory.used_mb) ? s.memory.used_mb : '—'}</b> MB RAM</div>
     </div>
     <div class="card-act">${actions}</div>
   </div>`;
@@ -718,7 +952,7 @@ class ConsoleController {
   }
 
   connect() {
-    if (this.closed) return;
+    if (this.closed || state.authLost) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${proto}//${location.host}/ws/console?server=${encodeURIComponent(this.id)}`);
     this.ws = ws;
@@ -730,8 +964,8 @@ class ConsoleController {
       this.handle(m);
     };
 
-    ws.onclose = () => {
-      if (this.closed) return;
+    ws.onclose = async () => {
+      if (this.closed || state.authLost || !await checkSession() || this.closed) return;
       this.retries++;
       const wait = Math.min(8000, 500 * Math.pow(2, Math.min(4, this.retries)));
       this.setConn('retry', `Reconnecting - attempt ${this.retries}`);
@@ -893,7 +1127,7 @@ class ConsoleController {
     list.innerHTML = players.map((p) => {
       return `<div class="player">
         ${skinMarkup(p.name)}
-        <span><div class="pn">${esc(p.name)}</div><div class="pm">${p.ping_ms} ms</div></span>
+        <span><div class="pn">${esc(p.name)}</div><div class="pm" title="${esc(playerObservation(p))}">${playerLatency(p)}</div></span>
         <span class="pa">
           <button type="button" class="btn btn-ghost btn-sm btn-icon" title="Kick" data-kick="${esc(p.name)}"><i class="ico ico-sm ico-close"></i></button>
         </span>
@@ -955,6 +1189,9 @@ async function viewSettings(id) {
 
   const s = data.server;
   const changes = {};
+  const originalETag = data.etag;
+  const resourceCapacity = runtimeCapacity(state.host, s.runtime);
+  let saving = false;
 
   const ctl = (k) => {
     const meta = k;
@@ -1006,17 +1243,18 @@ async function viewSettings(id) {
       <div style="padding:0 22px 26px;max-width:900px">
         <div class="panelbox" id="resBox">
           <h3>Resources</h3>
+          <div class="row muted" title="${esc(measurementTitle(resourceCapacity))}">${esc(capacityLabel(state.host, s.runtime))}</div>
           <div class="row">
             <span class="k">Max memory</span>
             <span class="spacer"></span>
-            <input class="inp mono" id="resMem" value="${s.memory.limit_mb}" style="width:110px">
+            <input class="inp mono" id="resMem" type="number" step="1" ${capKnown(resourceCapacity.total_mb) ? `max="${resourceCapacity.total_mb}"` : ''} value="${s.memory.limit_mb}" style="width:110px">
             <span class="muted">MB</span>
             <span class="muted" style="font-size:12px;margin-left:10px">JVM heap gets ${s.memory.heap_mb} MB; the rest is headroom the JVM needs outside the heap.</span>
           </div>
           <div class="row">
             <span class="k">CPU</span>
             <span class="spacer"></span>
-            <input class="inp mono" id="resCpu" value="${s.cpu.limit_vcpu}" style="width:110px">
+            <input class="inp mono" id="resCpu" type="number" step="0.1" ${capKnown(resourceCapacity.total_vcpu) ? `max="${resourceCapacity.total_vcpu}"` : ''} value="${s.cpu.limit_vcpu}" style="width:110px">
             <span class="muted">vCPU</span>
           </div>
           <div class="row">
@@ -1047,6 +1285,7 @@ async function viewSettings(id) {
   if (resBtn) resBtn.addEventListener('click', async () => {
     const mem = parseInt($('#resMem', root).value, 10) || 0;
     const cpu = parseFloat($('#resCpu', root).value) || 0;
+    if (capOver(mem, resourceCapacity.total_mb) || capOver(cpu, resourceCapacity.total_vcpu)) { toast(`Resource limits exceed measured ${scopeLabel(resourceCapacity.scope)} capacity`, 'err'); return; }
     resBtn.disabled = true;
     try {
       const res = await api(`/api/servers/${id}`, {
@@ -1101,14 +1340,22 @@ async function viewSettings(id) {
   $('#discardBtn', root).addEventListener('click', () => router(true));
 
   const save = async (restart) => {
+    if (saving) return;
+    saving = true;
     try {
-      const res = await api(`/api/servers/${id}/settings`, { method: 'PATCH', body: JSON.stringify(changes) });
+      const res = await api(`/api/servers/${id}/settings`, { method: 'PATCH', headers: originalETag ? {'If-Match': originalETag} : {}, body: JSON.stringify(changes) });
       toast(res.requires_restart.length
         ? `Saved. ${res.requires_restart.join(', ')} need a restart.`
         : 'Saved.');
       if (restart) { await api(`/api/servers/${id}/restart`, { method: 'POST' }); toast('Restarting…'); }
       router(true);
-    } catch (e) { toast(e.message, 'err'); }
+    } catch (e) {
+      if (e.status === 412) showEditConflict(root.querySelector('.content'),
+        () => api(`/api/servers/${id}/settings`),
+        current => current.groups.flatMap(group => group.keys.map(key => `${key.key}=${key.value}`)).join('\n'),
+        () => router(true));
+      else toast(e.message, 'err');
+    } finally { saving = false; }
   };
   $('#saveBtn', root).addEventListener('click', () => save(false));
   $('#saveRestartBtn', root).addEventListener('click', () => save(true));
@@ -1234,6 +1481,7 @@ async function openCreate() {
     $('#rtNote', modal).textContent = rt === 'sim'
       ? 'Runs in-process. Starts instantly, no image to pull - use it to drive the panel.'
       : `Real container from ${picked.image}. The first start pulls the image, which can take several minutes.`;
+    budget();
   };
   $('#rtSim', modal).addEventListener('click', () => setRuntime('sim'));
   $('#rtDocker', modal).addEventListener('click', () => setRuntime('docker'));
@@ -1243,8 +1491,10 @@ async function openCreate() {
     if (!host) return;
     const mem = parseInt($('#fMem', modal).value || '0', 10);
     const cpu = parseFloat($('#fCpu', modal).value || '0');
+    const capacity = runtimeCapacity(host, runtime);
     const newMem = host.memory.allocated_mb + mem, newCpu = host.cpu.allocated_vcpu + cpu;
-    const memOver = capOver(newMem, host.memory.total_mb), cpuOver = capOver(newCpu, host.cpu.total_vcpu);
+    const memOver = capOver(newMem, capacity.total_mb), cpuOver = capOver(newCpu, capacity.total_vcpu);
+    const individualOver = capOver(mem, capacity.total_mb) || capOver(cpu, capacity.total_vcpu);
 
     // Disk is the one the agent will actually refuse on, and it refuses on
     // free space rather than on commitment - so the two are shown as two
@@ -1255,18 +1505,19 @@ async function openCreate() {
     const freeGB = Math.max(0, host.disk.total_gb - host.disk.used_gb);
     const wontFit = capKnown(host.disk.total_gb) && disk > freeGB;
     $('#budget', modal).innerHTML = `
+      <div class="muted" style="margin-bottom:8px" title="${esc(measurementTitle(capacity))}">${esc(capacityLabel(host, runtime))}</div>
       <div class="row-flex" style="justify-content:space-between;margin-bottom:5px">
-        <span>CPU</span><span class="num"><b style="color:var(--t-0)">${newCpu.toFixed(1)}</b> / ${capKnown(host.cpu.total_vcpu) ? host.cpu.total_vcpu + ' vCPU' : 'unknown'}</span>
+        <span>CPU</span><span class="num"><b style="color:var(--t-0)">${newCpu.toFixed(1)}</b> / ${capKnown(capacity.total_vcpu) ? capacity.total_vcpu + ' vCPU' : 'unknown'}</span>
       </div>
-      <div class="bar" style="margin-bottom:12px"><i class="${cpuOver ? 'warn' : ''}" style="width:${capPct(newCpu, host.cpu.total_vcpu)}%"></i></div>
+      ${capKnown(capacity.total_vcpu) ? `<div class="bar" style="margin-bottom:12px"><i class="${cpuOver ? 'warn' : ''}" style="width:${capPct(newCpu, capacity.total_vcpu)}%"></i></div>` : ''}
       <div class="row-flex" style="justify-content:space-between;margin-bottom:5px">
-        <span>Memory</span><span class="num"><b style="color:var(--t-0)">${(newMem / 1024).toFixed(1)}</b> / ${capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) + ' GB' : 'unknown'}</span>
+        <span>Memory</span><span class="num"><b style="color:var(--t-0)">${(newMem / 1024).toFixed(1)}</b> / ${capKnown(capacity.total_mb) ? (capacity.total_mb / 1024).toFixed(0) + ' GB' : 'unknown'}</span>
       </div>
-      <div class="bar" style="margin-bottom:12px"><i class="${memOver ? 'warn' : ''}" style="width:${capPct(newMem, host.memory.total_mb)}%"></i></div>
+      ${capKnown(capacity.total_mb) ? `<div class="bar" style="margin-bottom:12px"><i class="${memOver ? 'warn' : ''}" style="width:${capPct(newMem, capacity.total_mb)}%"></i></div>` : ''}
       <div class="row-flex" style="justify-content:space-between;margin-bottom:5px">
         <span>Disk</span><span class="num"><b style="color:var(--t-0)">${newDisk}</b> / ${capKnown(host.disk.total_gb) ? host.disk.total_gb + ' GB' : 'unknown'}${capKnown(host.disk.total_gb) ? ` <span class="muted">(${freeGB} GB free)</span>` : ''}</span>
       </div>
-      <div class="bar"><i class="${diskOver ? 'warn' : ''}" style="width:${capPct(newDisk, host.disk.total_gb)}%"></i></div>
+      ${capKnown(host.disk.total_gb) ? `<div class="bar"><i class="${diskOver ? 'warn' : ''}" style="width:${capPct(newDisk, host.disk.total_gb)}%"></i></div>` : ''}
       ${wontFit ? `<div class="warnbox"><i class="ico ico-sm ico-warning"></i>
         <span>This will be refused: the template asks for ${disk} GB and only ${freeGB} GB is free. Delete a backup or an unused server first.</span></div>` : ''}
       ${(memOver || cpuOver || diskOver) ? `<div class="warnbox"><i class="ico ico-sm ico-warning"></i>
@@ -1275,10 +1526,10 @@ async function openCreate() {
     // The agent will refuse this create, and the sidebar that says so is below
     // the fold. Say it on the button you were about to press.
     const create = $('#createBtn', modal);
-    create.disabled = wontFit;
+    create.disabled = wontFit || individualOver;
     create.title = wontFit
       ? `Needs ${disk} GB; only ${freeGB} GB is free on the host.`
-      : '';
+      : individualOver ? `Requested limit exceeds measured ${scopeLabel(capacity.scope)} capacity.` : '';
   };
 
   const applyPick = (t) => {
@@ -1404,13 +1655,13 @@ function viewDashboard() {
                    <button type="button" class="btn btn-ghost btn-sm btn-icon" data-dact="restart" data-sid="${esc(s.id)}" title="Restart"><i class="ico ico-sm ico-restart"></i></button>`
                 : `<button type="button" class="btn btn-ghost btn-sm btn-icon" data-dact="start" data-sid="${esc(s.id)}" title="Start"><i class="ico ico-sm ico-play"></i></button>`}
             </td>
-            <td><div class="bar bar-sm"><i style="width:${Math.min(100, cpu)}%"></i></div>
-                <span class="muted">${up ? cpu + '%' : '—'}</span></td>
+            <td><div class="bar bar-sm"><i style="width:${usageKnown(cpu) ? Math.min(100, cpu) : 0}%"></i></div>
+                <span class="muted">${up && usageKnown(cpu) ? cpu + '%' : '—'}</span></td>
             <td><div class="bar bar-sm"><i style="width:${capPct(memU, memL)}%"></i></div>
                 <span class="muted">${up ? fmtMB(memU) + ' / ' + fmtMB(memL) : '—'}</span></td>
             <td>${diskCell(s)}</td>
             <td class="mono">${s.players ? s.players.online + ' / ' + s.players.max : '—'}</td>
-            <td><span class="st ${cls}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span></td>
+            <td><span class="st ${cls}" title="${esc(readinessTitle(s))}"><span class="dot dot-${cls === 'on' ? 'on' : cls === 'starting' ? 'starting' : 'off'}"></span> ${STATUS_LABEL[s.status]}</span></td>
           </tr>`;
         }).join('') || '<tr><td colspan="7" class="muted">No servers.</td></tr>'}
         </tbody>
@@ -1421,9 +1672,10 @@ function viewDashboard() {
     <div class="panelbox">
       <h3>Committed</h3>
       <div class="row"><span class="k">CPU</span>
-        <span class="mono">${host ? host.cpu.allocated_vcpu : '-'} / ${host ? host.cpu.total_vcpu : '-'} vCPU</span></div>
+        <span class="mono">${host ? host.cpu.allocated_vcpu : '-'} vCPU configured</span></div>
       <div class="row"><span class="k">Memory</span>
-        <span class="mono">${host ? (host.memory.allocated_mb / 1024).toFixed(1) : '-'} / ${host && capKnown(host.memory.total_mb) ? (host.memory.total_mb / 1024).toFixed(0) : '?'} GB</span></div>
+        <span class="mono">${host ? (host.memory.allocated_mb / 1024).toFixed(1) : '-'} GB configured</span></div>
+      <div class="row muted">${host ? esc(capacityLabel(host, 'docker')) : 'Docker daemon capacity unknown'}</div>
       <div class="row"><span class="muted" style="font-size:12px">Every server's configured limit added up, running or not. Limits are caps rather than reservations, so exceeding the host is normal &mdash; it only matters if they all run at once.</span></div>
     </div>
 
@@ -1468,6 +1720,7 @@ function parseHash() {
 }
 
 async function router(force) {
+  if (state.authLost) return;
   const next = parseHash();
   const same = next.name === state.route.name && next.id === state.route.id;
   state.route = next;
@@ -1517,6 +1770,7 @@ async function router(force) {
 
   host.innerHTML = '';
   host.appendChild(el);
+  enhanceAccessibility(host);
   applyRole(host);
   renderRail();
   renderTabstrip();
@@ -1547,15 +1801,15 @@ const GUARDED = [
     '[data-act="start"]', '[data-act="stop"]', '[data-act="restart"]',
     '[data-dact="start"]', '[data-dact="stop"]', '[data-dact="restart"]',
     '[data-act="clear-failures"]',
-    '#cmdInput', '#mkBackup', '#newFolder', '#save', '#saveBtn', '#saveRestartBtn',
-    '#addBtn', '#newTask', '#plInstall', '#createBtn',
+    '#cmdInput', '.cbx[data-key]', '[data-key]', '#mkBackup', '#newFolder', '#save', '#saveBtn', '#saveRestartBtn',
+    '#addBtn', '#newTask', '#plInstall',
     '[data-run]', '[data-edit]', '[data-toggle]', '[data-rm]',
     '[data-need="operator"]',
   ]],
   [3, [
     '[data-act="kill"]', '[data-act="delete"]',
     '[data-restore]', '[data-del]',
-    '#impScan', '#impGo', '#clGo',
+    '#impScan', '#impGo', '#clGo', '#createBtn', '#resSave',
     '[data-need="admin"]',
   ]],
 ];
@@ -1563,9 +1817,7 @@ const GUARDED = [
 function myRoleRank() {
   const me = state.me;
   if (!me) return 0;
-  // An unclaimed panel has no accounts, so nobody is an admin and everybody can
-  // do everything - the same rule viewAdmin applies to its own controls.
-  if (me.unclaimed) return 3;
+  if (me.auth_disabled && me.effective_role === 'admin') return 3;
   return ROLE_RANK[me.user && me.user.role] || 0;
 }
 
@@ -1576,9 +1828,9 @@ function applyRole(root) {
     if (rank >= need) continue;
     const label = need === 3 ? 'an admin' : 'an operator';
     for (const el of root.querySelectorAll(selectors.join(','))) {
+      if (el.disabled !== true) el.disabled = true;
       if (el.dataset.denied) continue;
       el.dataset.denied = '1';
-      el.disabled = true;
       el.classList.add('is-denied');
       el.title = `Only ${label} can do this`;
     }
@@ -1591,8 +1843,7 @@ function applyRole(root) {
 // with live controls the moment anything refreshed, which is the same bug with
 // a delay. One observer covers every path, present and future.
 function watchRoleSurface() {
-  if (myRoleRank() >= 3) return;
-  const host = document.getElementById('view');
+  const host = document.body;
   if (!host || typeof MutationObserver === 'undefined') return;
   let queued = false;
   new MutationObserver(() => {
@@ -1602,11 +1853,105 @@ function watchRoleSurface() {
   }).observe(host, { childList: true, subtree: true });
 }
 
+// Keyboard semantics for the existing custom controls. Native controls keep
+// their own browser behavior; custom controls activate through their click owner.
+function enhanceAccessibility(root) {
+  root.querySelectorAll('.swatch,.bgswatch,.scale,.subtab,.tgl,.tpl,.cbx,.strip-btn,a[data-act],a[data-raw],.filerow .fname').forEach(el => {
+    if (el.dataset.keyboard) return;
+    el.dataset.keyboard = '1';
+    el.setAttribute('role', 'button');
+    el.tabIndex = 0;
+    const name = el.title || el.textContent.trim() || (el.matches('.strip-btn') ? 'Close dialog' : el.matches('.tgl') ? 'Toggle task enabled' : 'Select option');
+    el.setAttribute('aria-label', name);
+    el.addEventListener('keydown', event => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      if (!el.disabled && !el.dataset.denied) el.click();
+    });
+  });
+  root.querySelectorAll('.cbx,.tgl,.tpl,.scale,.subtab,.swatch,.bgswatch').forEach(el => {
+    el.setAttribute('aria-pressed', String(el.classList.contains('is-on') || el.classList.contains('is-picked') || el.classList.contains('on')));
+  });
+  root.querySelectorAll('button.btn-icon').forEach(el => {
+    if (el.hasAttribute('aria-label')) return;
+    const icon = el.querySelector('.ico');
+    const name = el.title || (icon?.className.match(/ico-(close|x|trash|edit)/)?.[1] || 'Action');
+    el.setAttribute('aria-label', name === 'x' ? 'Close dialog' : name);
+  });
+  root.querySelectorAll('input,select,textarea').forEach(el => {
+    if (el.hasAttribute('aria-label') || el.labels?.length) return;
+    const label = el.closest('.field,.setrow,.row')?.querySelector('label,.k,.lb');
+    el.setAttribute('aria-label', label?.textContent.trim() || el.placeholder || el.id || 'Value');
+  });
+}
+
+function manageDialog(scrim) {
+  if (scrim.dataset.dialogManaged) return;
+  scrim.dataset.dialogManaged = '1';
+  const dialog = scrim.querySelector('.modal');
+  if (!dialog) return;
+  const opener = document.activeElement;
+  const app = document.querySelector('.app');
+  app.inert = true;
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-label', dialog.querySelector('.modal-bar')?.textContent.trim() || 'Dialog');
+  const focusable = () => [...dialog.querySelectorAll('button,input,select,textarea,a[href],[tabindex="0"]')].filter(el => !el.disabled && !el.hidden && el.getClientRects().length);
+  const remove = scrim.remove.bind(scrim);
+  scrim.remove = () => {
+    remove();
+    app.inert = !!$('#modalHost .scrim');
+    if (opener?.isConnected && !app.inert && !state.authLost) opener.focus();
+  };
+  scrim.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      const close = dialog.querySelector('#cx,#x,#closeX,#clCancel,#back,#cancelBtn');
+      if (close) close.click(); else scrim.remove();
+    }
+    if (event.key === 'Tab') {
+      const items = focusable(), first = items[0], last = items.at(-1);
+      if (!first) { event.preventDefault(); dialog.focus(); }
+      else if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
+    }
+  });
+  dialog.tabIndex = -1;
+  (focusable()[0] || dialog).focus();
+}
+
+function installAccessibility() {
+  $('.skip-link').addEventListener('click', event => {
+    event.preventDefault();
+    $('#view').focus();
+  });
+  new MutationObserver(records => {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        enhanceAccessibility(node.parentElement || node);
+        if (node.matches('.scrim')) manageDialog(node);
+      }
+      if (record.type === 'attributes' && record.attributeName === 'class') {
+        const el = record.target;
+        if (el.hasAttribute('aria-pressed')) el.setAttribute('aria-pressed', String(el.classList.contains('is-on') || el.classList.contains('is-picked') || el.classList.contains('on')));
+      }
+    }
+    const app = document.querySelector('.app');
+    if (!$('#modalHost .scrim')) app.inert = false;
+    applyRole(document.body);
+  }).observe(document.body, {childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'disabled']});
+}
+
 // -------------------------------------------------------------- live feed
 
 function connectEvents() {
+  if (state.authLost) return;
+  state.events?.close();
   const es = new EventSource('/api/events');
+  state.events = es;
   es.onmessage = (ev) => {
+    if (state.authLost) return;
     let m; try { m = JSON.parse(ev.data); } catch { return; }
     if (m.servers) {
       state.servers = m.servers;
@@ -1631,7 +1976,7 @@ function connectEvents() {
       }
     }
   };
-  es.onerror = () => { /* EventSource retries on its own */ };
+  es.onerror = () => { checkSession(); }; // Revoke before native retries continue.
 }
 
 async function boot() {
@@ -1660,11 +2005,7 @@ async function boot() {
     state.servers = data.servers;
     state.host = data.host;
   } catch (e) {
-    if (String(e.message).includes('sign in')) {
-      document.querySelector('.app').style.display = 'none';
-      document.body.appendChild(window.extraViews.viewLogin());
-      return;
-    }
+    if (state.authLost) return;
     $('#view').innerHTML = `<div class="empty"><div><div class="big">Can't reach the agent</div><div>${esc(e.message)}</div></div></div>`;
     return;
   }
@@ -1677,8 +2018,9 @@ async function boot() {
   if (new URLSearchParams(location.search).has('nolive')) return;
 
   // keep host stats fresh for the budget maths
-  setInterval(async () => { try { state.host = await api('/api/host'); } catch {} }, 5000);
+  state.hostTimer = setInterval(async () => { try { state.host = await api('/api/host'); } catch {} }, 5000);
   connectEvents();
 }
 
+installAccessibility();
 boot();

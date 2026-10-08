@@ -16,6 +16,8 @@ func newTestAgent(t *testing.T) (*httptest.Server, *Manager) {
 	t.Helper()
 	hub := NewHub()
 	mgr := NewManager(t.TempDir(), hub)
+	// Join owned work before testing removes its isolated state directory.
+	t.Cleanup(mgr.Close)
 	if err := mgr.Load(); err != nil {
 		t.Fatalf("load: %v", err)
 	}

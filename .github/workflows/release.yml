@@ -4,6 +4,10 @@ on:
   push:
     tags: ['v*']
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   packages: write
@@ -21,36 +25,41 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: '1.26'
-      - uses: goreleaser/goreleaser-action@v6
+      - name: Reject reused release versions and tag drift
+        run: python3 .github/scripts/release-guard.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
-          version: latest
+          version: v2.18.2
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # DEPLOY.md tells people to run ghcr.io/useteploy/teploy-arcade, and that
-  # image has never existed. Either the doc was wrong or this job was missing;
-  # this is the half that makes the doc true.
+  # Publish an image only after binary publication succeeds; scan the exact
+  # locally loaded image and push it without a second build.
   image:
-    needs: verify
+    needs: [verify, release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require the same immutable source tag as the binary release
+        run: python3 .github/scripts/release-guard.py --identity-only
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         id: meta
         with:
           images: ghcr.io/useteploy/teploy-arcade
@@ -65,10 +74,28 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          push: true
+          push: false
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: VERSION=${{ github.ref_name }}
+
+      - name: Scan the exact image before publishing its tags
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          image=$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa \
+            image --exit-code 1 --severity HIGH,CRITICAL "$image"
+      - name: Publish the scanned image without rebuilding
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          python3 .github/scripts/release-guard.py --identity-only
+          while IFS= read -r image; do
+            test -z "$image" || docker push "$image"
+          done <<< "$IMAGE_TAGS"

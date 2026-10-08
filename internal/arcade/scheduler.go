@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -29,16 +30,18 @@ import (
 //	say Restarting in 60s; !wait 60; !restart
 
 type Task struct {
-	ID       string `json:"id"`
-	ServerID string `json:"server_id"`
-	Name     string `json:"name"`
-	Commands string `json:"commands"`
-	Time     string `json:"time"` // HH:MM or HH:MM:SS, 24h, host local
-	Repeat   bool   `json:"repeat"`
-	Enabled  bool   `json:"enabled"`
-	LastRun  int64  `json:"last_run"`
-	LastErr  string `json:"last_err"`
-	Runs     int    `json:"runs"`
+	ID        string `json:"id"`
+	ServerID  string `json:"server_id"`
+	Name      string `json:"name"`
+	Commands  string `json:"commands"`
+	Time      string `json:"time"` // HH:MM or HH:MM:SS, 24h, host local
+	Repeat    bool   `json:"repeat"`
+	Enabled   bool   `json:"enabled"`
+	LastRun   int64  `json:"last_run"`
+	LastErr   string `json:"last_err"`
+	PendingAt int64  `json:"pending_at,omitempty"`
+	RunState  string `json:"run_state,omitempty"`
+	Runs      int    `json:"runs"`
 }
 
 type Scheduler struct {
@@ -51,6 +54,7 @@ type Scheduler struct {
 	// the task waits — while mu is taken and released repeatedly underneath.
 	runMu   sync.Mutex
 	running map[string]bool
+	cancels map[string]context.CancelFunc
 
 	// slots bounds how many distinct tasks may execute at once. The loop
 	// starts one goroutine per due task, and nothing capped how many could
@@ -85,6 +89,13 @@ func newScheduler(dataDir string, m *Manager) *Scheduler {
 			if err := validateTask(t); err != nil {
 				log.Printf("scheduler: dropped task %q (%s): %v", t.Name, t.ID, err)
 				continue
+			}
+			if t.RunState == "running" {
+				t.RunState = "interrupted"
+				if !t.Repeat {
+					t.Enabled = false
+				}
+				t.LastErr = "panel stopped during execution; outcome may be incomplete; inspect before retrying"
 			}
 			kept = append(kept, t)
 		}
@@ -184,6 +195,7 @@ func (sc *Scheduler) Add(t *Task) (*Task, error) {
 
 	created := *t
 	created.Runs, created.LastRun, created.LastErr = 0, 0, ""
+	created.PendingAt, created.RunState = 0, ""
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -253,6 +265,11 @@ func (sc *Scheduler) Update(serverID, id string, fn func(*Task)) (*Task, error) 
 		}
 		before := *t
 		fn(t)
+		if before.Enabled && !t.Enabled && t.RunState == "pending" {
+			t.PendingAt = 0
+			t.RunState = "cancelled"
+			t.LastErr = "pending occurrence cancelled because task was disabled"
+		}
 		if err := validateTask(t); err != nil {
 			// A rejected edit must not survive in memory. Leaving a bad
 			// task on the live schedule would keep firing a task the
@@ -285,12 +302,17 @@ func (sc *Scheduler) record(id string, fn func(*Task)) error {
 	defer sc.mu.Unlock()
 	for _, t := range sc.tasks {
 		if t.ID == id {
+			before := *t
 			fn(t)
 			next := make([]*Task, 0, len(sc.tasks))
 			for _, existing := range sc.tasks {
 				next = append(next, existing)
 			}
-			return sc.persist(next)
+			if err := sc.persist(next); err != nil {
+				*t = before
+				return err
+			}
+			return nil
 		}
 	}
 	return fmt.Errorf("no such task")
@@ -312,6 +334,7 @@ func (sc *Scheduler) Delete(serverID, id string) error {
 			return err
 		}
 		sc.tasks = next
+		sc.cancelTask(id)
 		return nil
 	}
 	return fmt.Errorf("no such task")
@@ -340,6 +363,7 @@ func (sc *Scheduler) DropServer(serverID string) int {
 	dropped := 0
 	for _, t := range sc.tasks {
 		if t.ServerID == serverID {
+			sc.cancelTask(t.ID)
 			dropped++
 			continue
 		}
@@ -418,62 +442,48 @@ func (sc *Scheduler) loop() {
 	defer recoverPanic("scheduler loop")
 	t := time.NewTicker(20 * time.Second)
 	defer t.Stop()
-	for now := range t.C {
-		secsNow := now.Hour()*3600 + now.Minute()*60 + now.Second()
-
-		sc.mu.RLock()
-		due := []*Task{}
-		for _, task := range sc.tasks {
-			if !task.Enabled {
-				continue
-			}
-			at, err := parseClock(task.Time)
-			if err != nil {
-				continue
-			}
-			// Fire within a 60s window after the scheduled second, so a 20s
-			// tick cannot miss it, and never twice for the same occurrence.
-			if secsNow < at || secsNow > at+59 {
-				continue
-			}
-			if task.LastRun > 0 && sameLocalDate(time.Unix(task.LastRun, 0), now) {
-				continue
-			}
-			due = append(due, task)
+	for {
+		select {
+		case <-sc.mgr.ctx.Done():
+			return
+		case now := <-t.C:
+			sc.dispatchDue(now)
 		}
-		sc.mu.RUnlock()
+	}
+}
 
-		for _, task := range due {
-			// Admission before the goroutine: without it a panel restarting
-			// into a pile of due tasks spawned one goroutine per task, all
-			// waiting (and then all running) at once.
-			//
-			// R54 (audit pass 7): a due occurrence that cannot get a slot is
-			// REPORTED, not silently dropped. The old path just skipped it, so
-			// four long jobs could eat every slot for the whole 60-second due
-			// window and a promised nightly backup or restart vanished with
-			// nothing anywhere saying it had. The occurrence stays unrun
-			// (LastRun is not touched) and the reason is written onto the task
-			// where the UI already shows last-run failures - the queue redesign
-			// that keeps and runs late occurrences is tracked in AUDIT_OPEN.
-			select {
-			case sc.slots <- struct{}{}:
-			default:
-				log.Printf("scheduler: %d task runs are already executing; %q could not start this occurrence",
-					maxConcurrentTaskRuns, task.Name)
-				if err := sc.record(task.ID, func(t *Task) {
-					t.LastErr = fmt.Sprintf("skipped at %s: all %d task slots were busy for the whole due window",
-						now.Format("15:04:05"), maxConcurrentTaskRuns)
-				}); err != nil {
-					log.Printf("scheduler: could not record the skipped occurrence of %q: %v", task.Name, err)
-				}
+// Persist pending occurrences before admission, so capacity pressure and a
+// panel restart cannot silently drop the day's work. Completed one-shots stay
+// disabled. Interrupted claims are reported and never automatically replayed.
+func (sc *Scheduler) dispatchDue(now time.Time) {
+	for _, task := range sc.List("") {
+		if !task.Enabled {
+			continue
+		}
+		at, err := parseClock(task.Time)
+		if err != nil {
+			continue
+		}
+		secs := now.Hour()*3600 + now.Minute()*60 + now.Second()
+		if task.PendingAt == 0 {
+			if secs < at || task.LastRun > 0 && sameLocalDate(time.Unix(task.LastRun, 0), now) {
 				continue
 			}
-			go func(id string) {
-				defer recoverPanic("scheduled task " + id)
-				defer func() { <-sc.slots }()
-				_ = sc.Run("", id, "scheduler")
-			}(task.ID)
+			if err := sc.record(task.ID, func(t *Task) {
+				if t.Enabled {
+					t.PendingAt = now.Unix()
+					t.RunState = "pending"
+				}
+			}); err != nil {
+				continue
+			}
+		}
+		select {
+		case sc.slots <- struct{}{}:
+			if !sc.mgr.own(func() { _ = sc.runTask("", task.ID, "scheduler", true) }) {
+				<-sc.slots
+			}
+		default:
 		}
 	}
 }
@@ -484,6 +494,32 @@ func (sc *Scheduler) loop() {
 // server ID in their URL pass it so a mismatched URL cannot drive another
 // server's task.
 func (sc *Scheduler) Run(serverID, id, actor string) error {
+	return sc.runTask(serverID, id, actor, false)
+}
+func (sc *Scheduler) runTask(serverID, id, actor string, admitted bool) error {
+	if admitted {
+		defer func() { <-sc.slots }()
+	}
+	if err := sc.mgr.ctx.Err(); err != nil {
+		return err
+	}
+	sc.mgr.workerMu.Lock()
+	if sc.mgr.closing {
+		sc.mgr.workerMu.Unlock()
+		return context.Canceled
+	}
+	sc.mgr.workers.Add(1)
+	sc.mgr.workerMu.Unlock()
+	defer sc.mgr.workers.Done()
+	if !admitted {
+		select {
+		case sc.slots <- struct{}{}:
+			defer func() { <-sc.slots }()
+		default:
+			return fmt.Errorf("all task execution slots are busy; occurrence remains pending")
+		}
+	}
+
 	// The loop decides a task is due before LastRun is written back at the end of
 	// the run, so "Run now" landing in that window would execute a second copy:
 	// two lifecycle calls on one server, or two interleaved
@@ -493,10 +529,17 @@ func (sc *Scheduler) Run(serverID, id, actor string) error {
 		sc.runMu.Unlock()
 		return fmt.Errorf("that task is already running")
 	}
+	if sc.cancels == nil {
+		sc.cancels = map[string]context.CancelFunc{}
+	}
+	runCtx, cancel := context.WithCancel(sc.mgr.ctx)
+	sc.cancels[id] = cancel
 	sc.running[id] = true
 	sc.runMu.Unlock()
 	defer func() {
 		sc.runMu.Lock()
+		cancel()
+		delete(sc.cancels, id)
 		delete(sc.running, id)
 		sc.runMu.Unlock()
 	}()
@@ -513,13 +556,30 @@ func (sc *Scheduler) Run(serverID, id, actor string) error {
 		return fmt.Errorf("no such server")
 	}
 
+	// Claim is durable before any side effect. A crash cannot replay a
+	// restart/backup whose successful response was lost.
+	claimed := false
+	if err := sc.record(id, func(t *Task) {
+		if admitted && !t.Enabled {
+			return
+		}
+		claimed = true
+		t.LastRun = time.Now().Unix()
+		t.PendingAt = 0
+		t.RunState = "running"
+	}); err != nil {
+		return err
+	}
+	if !claimed {
+		return context.Canceled
+	}
 	var runErr error
 	for _, step := range strings.Split(task.Commands, ";") {
 		step = strings.TrimSpace(step)
 		if step == "" {
 			continue
 		}
-		if err := sc.step(s, step, actor); err != nil {
+		if err := sc.stepContext(runCtx, s, step, actor); err != nil {
 			runErr = fmt.Errorf("%q: %w", step, err)
 			break
 		}
@@ -529,6 +589,10 @@ func (sc *Scheduler) Run(serverID, id, actor string) error {
 	if err := sc.record(id, func(t *Task) {
 		t.LastRun = now.Unix()
 		t.Runs++
+		t.RunState = "completed"
+		if runErr != nil {
+			t.RunState = "failed"
+		}
 		if runErr != nil {
 			t.LastErr = runErr.Error()
 		} else {
@@ -556,6 +620,16 @@ func (sc *Scheduler) Run(serverID, id, actor string) error {
 // step runs one element of a task. `!` marks a panel action; anything else goes
 // to the game's console.
 func (sc *Scheduler) step(s *Server, step, actor string) error {
+	return sc.stepContext(sc.mgr.ctx, s, step, actor)
+}
+
+func (sc *Scheduler) stepContext(ctx context.Context, s *Server, step, actor string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := sc.mgr.requireRegistered(s); err != nil {
+		return err
+	}
 	if !strings.HasPrefix(step, "!") {
 		if s.State() != StatusRunning {
 			return fmt.Errorf("server is not running")
@@ -569,11 +643,20 @@ func (sc *Scheduler) step(s *Server, step, actor string) error {
 	}
 	switch fields[0] {
 	case "restart":
-		return sc.mgr.Restart(s.ID)
+		if err := sc.mgr.Restart(s.ID); err != nil {
+			return err
+		}
+		return sc.waitLifecycle(ctx, s, StatusRunning)
 	case "stop":
-		return sc.mgr.Stop(s.ID)
+		if err := sc.mgr.Stop(s.ID); err != nil {
+			return err
+		}
+		return sc.waitLifecycle(ctx, s, StatusStopped)
 	case "start":
-		return sc.mgr.Start(s.ID)
+		if err := sc.mgr.Start(s.ID); err != nil {
+			return err
+		}
+		return sc.waitLifecycle(ctx, s, StatusRunning)
 	case "backup":
 		note := "scheduled"
 		if len(fields) > 1 {
@@ -597,8 +680,7 @@ func (sc *Scheduler) step(s *Server, step, actor string) error {
 		if d < 0 || d > 900 {
 			return fmt.Errorf("wait must be between 0 and 900 seconds")
 		}
-		time.Sleep(time.Duration(d) * time.Second)
-		return nil
+		return waitContext(ctx, time.Duration(d)*time.Second)
 	}
 	return fmt.Errorf("unknown action !%s (try restart, stop, start, backup, wait)", fields[0])
 }
@@ -621,4 +703,32 @@ func (sc *Scheduler) TaskView(serverID string) []map[string]any {
 		})
 	}
 	return out
+}
+
+func (sc *Scheduler) waitLifecycle(ctx context.Context, s *Server, want string) error {
+	ctx, cancel := context.WithTimeout(ctx, restartStopWait)
+	defer cancel()
+	for {
+		if err := sc.mgr.requireRegistered(s); err != nil {
+			return err
+		}
+		st := s.State()
+		if st == want {
+			return nil
+		}
+		if st == StatusFailed {
+			return fmt.Errorf("lifecycle failed")
+		}
+		if err := waitContext(ctx, 100*time.Millisecond); err != nil {
+			return err
+		}
+	}
+}
+
+func (sc *Scheduler) cancelTask(id string) {
+	sc.runMu.Lock()
+	defer sc.runMu.Unlock()
+	if cancel := sc.cancels[id]; cancel != nil {
+		cancel()
+	}
 }

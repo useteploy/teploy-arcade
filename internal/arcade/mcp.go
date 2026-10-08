@@ -31,10 +31,12 @@ import (
 const lastUseResolution = 60
 
 type mcpToken struct {
-	Name    string `json:"name"`
-	Hash    string `json:"hash"` // sha256 of the token; the plaintext is shown once
-	Created int64  `json:"created"`
-	LastUse int64  `json:"last_use"`
+	Name      string   `json:"name"`
+	Hash      string   `json:"hash"` // sha256 of the token; the plaintext is shown once
+	Created   int64    `json:"created"`
+	LastUse   int64    `json:"last_use"`
+	ServerIDs []string `json:"server_ids"`
+	Actions   []string `json:"actions"`
 }
 
 type mcpTokens struct {
@@ -106,6 +108,13 @@ func (t *mcpTokens) Revoke(name string) error {
 }
 
 func (t *mcpTokens) Issue(name string) (string, error) {
+	return t.IssueScoped(name, []string{"*"}, []string{"server.read", "host.read"})
+}
+
+func (t *mcpTokens) IssueScoped(name string, serverIDs, actions []string) (string, error) {
+	if err := validateMCPScope(serverIDs, actions); err != nil {
+		return "", err
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", fmt.Errorf("name is required")
@@ -138,7 +147,7 @@ func (t *mcpTokens) Issue(name string) (string, error) {
 	next := make([]mcpToken, 0, len(t.toks)+1)
 	next = append(next, t.toks...)
 	next = append(next, mcpToken{
-		Name: name, Hash: hashMCPToken(raw), Created: time.Now().Unix(),
+		Name: name, Hash: hashMCPToken(raw), Created: time.Now().Unix(), ServerIDs: append([]string{}, serverIDs...), Actions: append([]string{}, actions...),
 	})
 	if err := t.persistLocked(next); err != nil {
 		return "", err
@@ -177,7 +186,7 @@ func (t *mcpTokens) Check(raw string) bool {
 		// Constant-time, like the password path: a plain == returns at the
 		// first differing byte, which tells a caller timing how much of a
 		// guessed token's hash was right.
-		if subtle.ConstantTimeCompare([]byte(t.toks[i].Hash), []byte(h)) == 1 {
+		if subtle.ConstantTimeCompare([]byte(t.toks[i].Hash), []byte(h)) == 1 && len(t.toks[i].Actions) > 0 {
 			// Debounced. Rewriting the file on every authenticated call meant
 			// an agent under load kept the token store permanently mid-write;
 			// one crash in that window destroyed every token.
@@ -199,7 +208,7 @@ func (t *mcpTokens) List() []map[string]any {
 	out := make([]map[string]any, 0, len(t.toks))
 	for _, x := range t.toks {
 		out = append(out, map[string]any{
-			"name": x.Name, "created": x.Created, "last_use": x.LastUse,
+			"name": x.Name, "created": x.Created, "last_use": x.LastUse, "server_ids": x.ServerIDs, "actions": x.Actions, "requires_reissue": len(x.Actions) == 0,
 		})
 	}
 	return out
@@ -207,7 +216,10 @@ func (t *mcpTokens) List() []map[string]any {
 
 // ---------------------------------------------------------------- backend
 
-type mcpBackend struct{ m *Manager }
+type mcpBackend struct {
+	m     *Manager
+	scope *mcpToken
+}
 
 func (b mcpBackend) js(v any) (string, error) {
 	out, err := json.MarshalIndent(v, "", "  ")
@@ -222,9 +234,25 @@ func (b mcpBackend) server(id string) (*Server, error) {
 	return s, nil
 }
 
-func (b mcpBackend) ListServers() (string, error) { return b.js(b.m.listSnapshot()) }
+func (b mcpBackend) ListServers() (string, error) {
+	if err := b.permit("", "server.read"); err != nil {
+		return "", err
+	}
+	snapshots := b.m.listSnapshot()
+	filtered := snapshots[:0]
+	for _, snapshot := range snapshots {
+		id, _ := snapshot["id"].(string)
+		if b.permit(id, "server.read") == nil {
+			filtered = append(filtered, snapshot)
+		}
+	}
+	return b.js(filtered)
+}
 
 func (b mcpBackend) GetServer(id string) (string, error) {
+	if err := b.permit(id, "server.read"); err != nil {
+		return "", err
+	}
 	s, err := b.server(id)
 	if err != nil {
 		return "", err
@@ -235,6 +263,9 @@ func (b mcpBackend) GetServer(id string) (string, error) {
 }
 
 func (b mcpBackend) ConsoleTail(id string, lines int) (string, error) {
+	if err := b.permit(id, "server.read"); err != nil {
+		return "", err
+	}
 	if _, err := b.server(id); err != nil {
 		return "", err
 	}
@@ -283,6 +314,9 @@ func consoleVerb(text string) string {
 }
 
 func (b mcpBackend) SendCommand(id, text string) (string, error) {
+	if b.scope != nil {
+		return "", fmt.Errorf("raw console commands are not available to MCP tokens")
+	}
 	if _, err := b.server(id); err != nil {
 		return "", err
 	}
@@ -302,6 +336,9 @@ func (b mcpBackend) SendCommand(id, text string) (string, error) {
 }
 
 func (b mcpBackend) Lifecycle(id, action string) (string, error) {
+	if err := b.permit(id, "server."+action); err != nil {
+		return "", err
+	}
 	s, err := b.server(id)
 	if err != nil {
 		return "", err
@@ -313,6 +350,8 @@ func (b mcpBackend) Lifecycle(id, action string) (string, error) {
 		err = b.m.Stop(id)
 	case "restart":
 		err = b.m.Restart(id)
+	default:
+		return "", fmt.Errorf("action must be start, stop or restart")
 	}
 	if err != nil {
 		return "", err
@@ -326,6 +365,9 @@ func (b mcpBackend) Lifecycle(id, action string) (string, error) {
 }
 
 func (b mcpBackend) ListBackups(id string) (string, error) {
+	if err := b.permit(id, "server.read"); err != nil {
+		return "", err
+	}
 	s, err := b.server(id)
 	if err != nil {
 		return "", err
@@ -338,6 +380,9 @@ func (b mcpBackend) ListBackups(id string) (string, error) {
 }
 
 func (b mcpBackend) CreateBackup(id, note string) (string, error) {
+	if err := b.permit(id, "server.backup"); err != nil {
+		return "", err
+	}
 	s, err := b.server(id)
 	if err != nil {
 		return "", err
@@ -349,7 +394,12 @@ func (b mcpBackend) CreateBackup(id, note string) (string, error) {
 	return fmt.Sprintf("Backup %s created (%s).", bk.ID, humanSize(bk.Size)), nil
 }
 
-func (b mcpBackend) HostStatus() (string, error) { return b.js(b.m.Host()) }
+func (b mcpBackend) HostStatus() (string, error) {
+	if err := b.permit("", "host.read"); err != nil {
+		return "", err
+	}
+	return b.js(b.m.Host())
+}
 
 // ------------------------------------------------------------------ routes
 
@@ -358,25 +408,48 @@ func (a *API) mcpRoutes(mux *http.ServeMux) {
 	// legitimately issued before the first admin exists (the minting route is
 	// gated), and honouring a pre-setup token here would let a credential
 	// minted during the open window outlive the setup it preceded.
-	h := &mcp.Handler{Backend: mcpBackend{m: a.mgr}, Check: func(raw string) bool {
-		if a.mgr.auth.SetupRequired() {
-			return false
+	mux.Handle("/api/mcp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Snapshot scope per request; every backend action rechecks revocation.
+		parts := strings.Fields(r.Header.Get("Authorization"))
+		var scope *mcpToken
+		if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") && !a.mgr.auth.SetupRequired() {
+			scope = a.mgr.mcp.Scope(parts[1])
 		}
-		return a.mgr.mcp.Check(raw)
-	}}
-	mux.Handle("/api/mcp", h)
+		h := &mcp.Handler{Backend: mcpBackend{m: a.mgr, scope: scope}, Check: func(raw string) bool { return scope != nil && a.mgr.mcp.Check(raw) }, PublicOrigin: a.mgr.publicOrigin}
+		h.ServeHTTP(w, r)
+	}))
 
 	auth := a.mgr.auth
 	mux.HandleFunc("GET /api/mcp-tokens", auth.require(RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"tokens": a.mgr.mcp.List()})
 	}))
 	mux.HandleFunc("POST /api/mcp-tokens", auth.require(RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Name string }
+		var body struct {
+			Name      string
+			ServerIDs []string `json:"server_ids"`
+			Actions   []string `json:"actions"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeErr(w, 400, err)
 			return
 		}
-		raw, err := a.mgr.mcp.Issue(body.Name)
+		// Existing clients that only send a name get read-only access to the
+		// current server set. Newly created servers need explicit reissuance.
+		if body.Actions == nil {
+			body.Actions = []string{"server.read"}
+		}
+		if body.ServerIDs == nil {
+			for _, server := range a.mgr.List() {
+				body.ServerIDs = append(body.ServerIDs, server.ID)
+			}
+		}
+		for _, id := range body.ServerIDs {
+			if id == "*" || a.mgr.Get(id) == nil {
+				writeErr(w, 400, fmt.Errorf("scope needs existing explicit server IDs"))
+				return
+			}
+		}
+		raw, err := a.mgr.mcp.IssueScoped(body.Name, body.ServerIDs, body.Actions)
 		if err != nil {
 			writeErr(w, 400, err)
 			return
@@ -394,4 +467,85 @@ func (a *API) mcpRoutes(mux *http.ServeMux) {
 		a.mgr.audit(actorOf(r), "mcp.token_revoke", name, "")
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	}))
+}
+
+var mcpActions = map[string]bool{"server.read": true, "server.start": true, "server.stop": true, "server.restart": true, "server.backup": true, "host.read": true}
+
+func validateMCPScope(ids, actions []string) error {
+	if len(ids) > 1024 || len(actions) == 0 || len(actions) > len(mcpActions) {
+		return fmt.Errorf("MCP scope needs explicit supported actions and at most 1024 server IDs")
+	}
+	seen := map[string]bool{}
+	for _, action := range actions {
+		if !mcpActions[action] || seen[action] {
+			return fmt.Errorf("unsupported or duplicate MCP action %q", action)
+		}
+		seen[action] = true
+	}
+	needsServers := false
+	for _, action := range actions {
+		if strings.HasPrefix(action, "server.") {
+			needsServers = true
+		}
+	}
+	if needsServers && len(ids) == 0 {
+		return fmt.Errorf("server actions need at least one server ID")
+	}
+	seen = map[string]bool{}
+	for _, id := range ids {
+		if id == "" || len(id) > 128 || seen[id] {
+			return fmt.Errorf("invalid or duplicate server ID")
+		}
+		seen[id] = true
+	}
+	return nil
+}
+func (t *mcpTokens) Scope(raw string) *mcpToken {
+	h := hashMCPToken(raw)
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, x := range t.toks {
+		if subtle.ConstantTimeCompare([]byte(x.Hash), []byte(h)) == 1 && len(x.Actions) > 0 {
+			copy := x
+			copy.Actions = append([]string{}, x.Actions...)
+			copy.ServerIDs = append([]string{}, x.ServerIDs...)
+			return &copy
+		}
+	}
+	return nil
+}
+func (b mcpBackend) permit(id, action string) error {
+	if b.scope == nil {
+		return nil
+	} // only direct internal callers; HTTP rejects absent scope
+	b.m.mcp.mu.RLock()
+	live := false
+	for _, x := range b.m.mcp.toks {
+		if x.Hash == b.scope.Hash {
+			live = true
+			break
+		}
+	}
+	b.m.mcp.mu.RUnlock()
+	if !live {
+		return fmt.Errorf("MCP token revoked")
+	}
+	allowed := false
+	for _, a := range b.scope.Actions {
+		if a == action {
+			allowed = true
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("MCP action %q is outside token scope", action)
+	}
+	if id == "" {
+		return nil
+	}
+	for _, server := range b.scope.ServerIDs {
+		if server == id || server == "*" {
+			return nil
+		}
+	}
+	return fmt.Errorf("server is outside MCP token scope")
 }

@@ -3,8 +3,10 @@ package arcade
 import (
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -67,6 +69,17 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		return nil, fmt.Errorf("no such server")
 	}
 
+	src.fsMu.Lock()
+	sourceHeld := true
+	defer func() {
+		if sourceHeld {
+			src.fsMu.Unlock()
+		}
+	}()
+	if err := m.requireRegistered(src); err != nil {
+		return nil, err
+	}
+
 	// Resolved, because an adopted-in-place server's directory is a link to
 	// the operator's own tree. Following it copies the world; not following it
 	// copies a symlink and produces an empty server.
@@ -78,7 +91,21 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		srcDir = resolved
 	}
 
+	src.mu.Lock()
 	tpl := templateBySlug(src.Template)
+	if tpl != nil {
+		frozen := *tpl
+		frozen.Protocols = slices.Clone(src.Protocols)
+		frozen.PortSpan = src.PortSpan
+		frozen.ExtraPorts = slices.Clone(src.ExtraPorts)
+		frozen.ReadyLog = src.ReadyLog
+		frozen.DataPath = src.DataPath
+		frozen.Env = maps.Clone(src.Env)
+		frozen.Args = slices.Clone(src.Args)
+		frozen.Console = src.Console
+		tpl = &frozen
+	}
+	src.mu.Unlock()
 	if tpl == nil {
 		return nil, fmt.Errorf("the source server's template %q no longer exists", src.Template)
 	}
@@ -127,7 +154,11 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 			src.Name, humanSize(size+importFreeMargin), humanSize(free))
 	}
 
-	s := m.newServer(name, tpl, src.Version, port, src.Runtime)
+	src.mu.Lock()
+	version, runtime := src.Version, src.Runtime
+	src.mu.Unlock()
+	s := m.newServer(name, tpl, version, port, runtime)
+	src.mu.Lock()
 	// The clone runs what the source runs, not what the template would pick.
 	// An imported modpack's jar is the case that matters: matching by version
 	// hands the clone a loader build its mods were not compiled against.
@@ -140,7 +171,6 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 	// Under the source's lock: Go panics fatally, unrecoverably, on a
 	// concurrent map read/write, and reloadProps writes this map whenever
 	// server.properties changes.
-	src.mu.Lock()
 	for k, v := range src.Props {
 		s.Props[k] = v
 	}
@@ -162,17 +192,37 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		SizeHuman: humanSize(size),
 	}
 	job := newImportJob(sc, "clone", name)
+	job.ctx = m.ctx
+	if err := m.trackImportJob(job); err != nil {
+		return nil, err
+	}
 	claimHeld = false // the goroutine owns the claim now
 
-	go func() {
+	sourceHeld = false
+	if !m.own(func() {
 		defer recoverPanic("clone of " + src.Name)
 
 		// A clone is a snapshot transaction: exclusive on the source's
 		// filesystem gate, so settings writes, file edits and restores
 		// cannot interleave generations into the copy. For a stopped source
 		// the old shape took no gate at all.
-		src.fsMu.Lock()
 		defer src.fsMu.Unlock()
+		defer m.releaseReservation(lease)
+		defer func() {
+			if r := recover(); r != nil {
+				job.fail(fmt.Errorf("clone interrupted by internal panic"))
+			}
+		}()
+		release, err := acquireCapacity(m.ctx, m.dataDir)
+		if err != nil {
+			job.fail(err)
+			return
+		}
+		defer release()
+		if free, err := diskFree(m.dataDir); err != nil || free < size+importFreeMargin {
+			job.fail(fmt.Errorf("insufficient measurable free space for clone"))
+			return
+		}
 
 		if !m.lockBackup(src.ID) {
 			m.releaseReservation(lease)
@@ -212,6 +262,16 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		}
 		defer func() { _ = resumeOrFail() }()
 
+		if err := claimServerDirectory(dst); err != nil {
+			job.fail(err)
+			return
+		}
+		registered := false
+		defer func() {
+			if !registered {
+				_ = os.RemoveAll(dst)
+			}
+		}()
 		if err := copyTreeFiltered(srcDir, dst, job, cloneSkip); err != nil {
 			// A half-copied tree is a server that boots on a truncated world.
 			_ = os.RemoveAll(dst)
@@ -252,6 +312,8 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		// fsMu reachable inside): a provisional clone must never be startable
 		// before its Save commits, or rollback would orphan a running server.
 		m.lifecycle.Lock()
+		m.saveMu.Lock()
+		defer m.saveMu.Unlock()
 		defer m.lifecycle.Unlock()
 		m.mu.Lock()
 		m.servers[s.ID] = s
@@ -265,7 +327,7 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 		// Save cannot record exists only in memory and vanishes on the next
 		// restart, so the registration is rolled back and the job fails
 		// rather than reporting a success the panel cannot keep.
-		if err := m.Save(); err != nil {
+		if err := m.saveHeld(); err != nil {
 			m.mu.Lock()
 			delete(m.servers, s.ID)
 			for i, id := range m.order {
@@ -282,9 +344,15 @@ func (m *Manager) StartClone(req CloneRequest, actor string) (*ImportJob, error)
 
 		m.audit(actor, "server.clone", s.ID, fmt.Sprintf("%s from %s (%s)",
 			s.Name, src.Name, humanSize(size)))
+		registered = true
 		m.broadcastEvent("server.created", s.ID)
 		job.done(s.ID)
-	}()
+	}) {
+		src.fsMu.Unlock()
+		m.releaseReservation(lease)
+		job.fail(fmt.Errorf("panel is shutting down"))
+		return nil, fmt.Errorf("panel is shutting down")
+	}
 
 	view := job.view()
 	return &view, nil

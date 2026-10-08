@@ -303,6 +303,10 @@ func TestAuditIsAppendOnlyAndNewestFirst(t *testing.T) {
 // ---------------------------------------------------------------- Phase 6
 
 func TestTemplatesLoadFromDiskAndValidate(t *testing.T) {
+	tplMu.RLock()
+	previous := append([]Template{}, tplLoaded...)
+	tplMu.RUnlock()
+	defer func() { tplMu.Lock(); tplLoaded = previous; tplMu.Unlock() }()
 	dir := t.TempDir()
 
 	// First load seeds the directory from the built-ins.
@@ -314,6 +318,7 @@ func TestTemplatesLoadFromDiskAndValidate(t *testing.T) {
 		t.Fatalf("only %d templates after seeding", len(seeded))
 	}
 
+	priorTerraria := templateBySlugLoaded("terraria")
 	// A new game is a file drop, no code change - that is Phase 6's DoD.
 	custom := `{
 	  "slug": "terraria", "name": "Terraria", "game": "terraria",
@@ -326,16 +331,25 @@ func TestTemplatesLoadFromDiskAndValidate(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(templatesDir(dir), "terraria.json"), []byte(custom), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A malformed one must be skipped, not fatal.
+	// A malformed addition rejects the entire candidate without changing active catalog.
 	if err := os.WriteFile(filepath.Join(templatesDir(dir), "broken.json"), []byte(`{"slug":"broken"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	err := LoadTemplates(dir)
-	if err == nil || !strings.Contains(err.Error(), "skipped") {
+	if err == nil || !strings.Contains(err.Error(), "catalog rejected") {
 		t.Errorf("a malformed template should be reported, got %v", err)
 	}
 
+	if tpl := templateBySlugLoaded("terraria"); tpl == nil || tpl.MaxPlayers != priorTerraria.MaxPlayers || tpl.Image != priorTerraria.Image {
+		t.Fatal("invalid candidate changed active template")
+	}
+	if err := os.Remove(filepath.Join(templatesDir(dir), "broken.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadTemplates(dir); err != nil {
+		t.Fatalf("valid corrected candidate: %v", err)
+	}
 	if tpl := templateBySlugLoaded("terraria"); tpl == nil {
 		t.Fatal("the dropped-in template was not picked up")
 	} else if tpl.MaxPlayers != 8 {
@@ -345,10 +359,6 @@ func TestTemplatesLoadFromDiskAndValidate(t *testing.T) {
 		t.Error("an invalid template was loaded anyway")
 	}
 
-	// Restore the built-in set for the other tests in this package.
-	tplMu.Lock()
-	tplLoaded = nil
-	tplMu.Unlock()
 }
 
 // The JVM heap must sit below the container limit, or the kernel kills the
@@ -378,6 +388,9 @@ func TestJVMHeapLeavesHeadroomUnderTheContainerLimit(t *testing.T) {
 func TestPlayerListsRouteThroughTheGameWhenRunning(t *testing.T) {
 	_, mgr := newTestAgent(t)
 	s := mgr.List()[0]
+	s.mu.Lock()
+	s.Props["online-mode"] = "false"
+	s.mu.Unlock()
 
 	// stopped -> written straight to disk
 	if err := mgr.AddToList(s, ListWhitelist, "Notch", "", "tester"); err != nil {
@@ -432,6 +445,9 @@ func TestPlayerListsRouteThroughTheGameWhenRunning(t *testing.T) {
 func TestPlayerListValidation(t *testing.T) {
 	_, mgr := newTestAgent(t)
 	s := mgr.List()[0]
+	s.mu.Lock()
+	s.Props["online-mode"] = "false"
+	s.mu.Unlock()
 
 	if err := mgr.AddToList(s, ListWhitelist, "  ", "", "t"); err == nil {
 		t.Error("blank name accepted")

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // memTotalMB reports physical memory on macOS.
@@ -67,3 +68,12 @@ func memUsedMB() int {
 type cpuSample struct{ busy, total uint64 }
 
 func readCPUSample() (cpuSample, bool) { return cpuSample{}, false }
+
+func memoryUsageView() map[string]any {
+	used := memUsedMB()
+	var value any
+	if used > 0 {
+		value = used
+	}
+	return map[string]any{"used_mb": value, "scope": "panel_host", "source": "vm_stat", "sampled_at": time.Now()}
+}

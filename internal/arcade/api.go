@@ -109,7 +109,7 @@ func (a *API) createServer(w http.ResponseWriter, r *http.Request) {
 		Runtime  string  `json:"runtime"`
 		Start    bool    `json:"start"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -139,7 +139,7 @@ func (a *API) patchServer(w http.ResponseWriter, r *http.Request) {
 		MemoryMB int     `json:"memory_mb"`
 		CPU      float64 `json:"cpu"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -163,7 +163,7 @@ func (a *API) reorderServers(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Order []string `json:"order"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -180,7 +180,20 @@ func (a *API) reorderServers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deleteServer(w http.ResponseWriter, r *http.Request) {
-	if err := a.mgr.Delete(r.PathValue("id")); err != nil {
+	deleteData, deleteBackups := true, true
+	switch r.URL.Query().Get("intent") {
+	case "", "delete":
+	case "detach":
+		deleteData, deleteBackups = false, false
+	case "delete_managed_data":
+		deleteBackups = false
+	case "delete_backups":
+		deleteData = false
+	default:
+		writeErr(w, 400, fmt.Errorf("invalid deletion intent"))
+		return
+	}
+	if err := a.mgr.DeleteIntent(r.PathValue("id"), deleteData, deleteBackups); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -214,8 +227,8 @@ func (a *API) serverAction(w http.ResponseWriter, r *http.Request) {
 		// a colleague, into both the console echo and the audit log - and the
 		// audit row carried an empty detail, so the forged command text was never
 		// recorded anywhere. The console socket has always derived it this way.
-		var body struct{ Text, Mode string }
-		if e := json.NewDecoder(r.Body).Decode(&body); e != nil {
+		var body struct{ Text, Mode, Actor string } // legacy actor claims are accepted but ignored
+		if e := decodeJSON(r, &body); e != nil {
 			writeErr(w, 400, e)
 			return
 		}
@@ -244,9 +257,11 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, fmt.Errorf("no such server"))
 		return
 	}
+	w.Header().Set("ETag", settingsETag(s))
 	writeJSON(w, 200, map[string]any{
 		"server": s.Snapshot(),
 		"groups": a.mgr.SettingsView(s),
+		"etag":   settingsETag(s),
 	})
 }
 
@@ -257,13 +272,13 @@ func (a *API) patchSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var changes map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&changes); err != nil {
-		writeErr(w, 400, err)
+	if err := decodeJSON(r, &changes); err != nil {
+		writeErr(w, editErrorCode(err), err)
 		return
 	}
-	needRestart, err := a.mgr.ApplySettings(s, changes)
+	needRestart, err := a.mgr.ApplySettingsConditional(s, changes, r.Header.Get("If-Match"))
 	if err != nil {
-		writeErr(w, 400, err)
+		writeErr(w, editErrorCode(err), err)
 		return
 	}
 	a.mgr.audit(actorOf(r), "server.settings", s.ID, fmt.Sprintf("%d key(s)", len(changes)))

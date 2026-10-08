@@ -1,14 +1,19 @@
 package arcade
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -16,15 +21,17 @@ import (
 // one call, so cmd/teploy-arcade/main.go stays flag parsing and nothing else -
 // the same shape as teploy-dash.
 type Config struct {
-	Host     string
-	Port     int
-	DataDir  string
-	Web      fs.FS // embedded frontend
-	Version  string
-	Commit   string
-	NoAuth   bool
-	Origins  []string // extra hostnames allowed to open the console socket
-	DataHost string   // host-side path matching DataDir, when containerised
+	Host           string
+	Port           int
+	DataDir        string
+	Web            fs.FS // embedded frontend
+	Version        string
+	Commit         string
+	NoAuth         bool
+	Origins        []string // extra hostnames allowed to open the console socket
+	DataHost       string   // host-side path matching DataDir, when containerised
+	PublicOrigin   string   // explicit browser origin when TLS terminates at a trusted proxy
+	PublicGameHost string   // game-client hostname, independent of the panel listener
 
 	// Credentials to create the first admin with, when the panel has none.
 	// Supplying them is how a deployment skips the first-run flow entirely -
@@ -34,6 +41,34 @@ type Config struct {
 }
 
 func Run(cfg Config) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return RunContext(ctx, cfg)
+}
+
+// RunContext binds before loading/recovering state or launching any workers.
+func RunContext(ctx context.Context, cfg Config) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cfg.NoAuth {
+		host, err := canonicalNoAuthHost(cfg.Host)
+		if err != nil {
+			return err
+		}
+		cfg.Host = host
+	}
+	if cfg.PublicOrigin != "" {
+		u, err := url.Parse(cfg.PublicOrigin)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("public-origin must be an absolute HTTPS origin without a path")
+		}
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)))
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
 	hostAddr = cfg.Host
 	allowedOrigins = cfg.Origins
 	// Disk is measured on the data directory, not "/", because that is where
@@ -53,15 +88,28 @@ func Run(cfg Config) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("data dir: %w", err)
 	}
+	hostDiskGB = diskTotalGB(cfg.DataDir)
 	sweepTempFiles(cfg.DataDir)
 
 	// Templates load before state, so a server can resolve its template on load.
 	if err := LoadTemplates(cfg.DataDir); err != nil {
-		log.Printf("templates: %v", err)
+		return fmt.Errorf("load templates: %w", err)
 	}
 
+	engineInspector.RLock()
+	previousClient, previousBase := engineInspector.client, engineInspector.base
+	engineInspector.RUnlock()
+	defer func() {
+		engineInspector.Lock()
+		engineInspector.client, engineInspector.base = previousClient, previousBase
+		engineInspector.Unlock()
+	}()
 	hub := NewHub()
 	mgr := NewManager(cfg.DataDir, hub)
+	mgr.cancel()
+	mgr.ctx, mgr.cancel = context.WithCancel(ctx)
+	mgr.publicOrigin, mgr.publicGameHost = cfg.PublicOrigin, cfg.PublicGameHost
+	defer mgr.Close()
 	if err := mgr.auth.Load(); err != nil {
 		return fmt.Errorf("load users: %w", err)
 	}
@@ -92,35 +140,79 @@ func Run(cfg Config) error {
 	} else if err := mgr.auth.BeginSetup(); err != nil {
 		return err
 	}
+	probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
+	engineErr := configureEngineInspector(probeCtx)
+	probeCancel()
+	if engineErr != nil {
+		return engineErr
+	}
 	if err := mgr.Load(); err != nil {
 		return fmt.Errorf("load state: %w", err)
 	}
 
-	go mgr.metricsLoop()
-	go mgr.sampleLoop()
-	go mgr.guardLoop()
-	go mgr.playerSyncLoop()
-	go mgr.sched.loop()
+	mgr.own(mgr.metricsLoop)
+	mgr.own(mgr.sampleLoop)
+	mgr.own(mgr.guardLoop)
+	mgr.own(mgr.playerSyncLoop)
+	mgr.own(mgr.sched.loop)
+	mgr.own(func() {
+		timer := time.NewTicker(time.Minute)
+		defer timer.Stop()
+		for {
+			select {
+			case <-mgr.ctx.Done():
+				return
+			case <-timer.C:
+				if err := mgr.reapImportJobs(); err != nil {
+					storageUncertain.Store(true)
+					log.Printf("operation metadata reaping failed: %v", err)
+				}
+			}
+		}
+	})
 
 	api := &API{mgr: mgr, hub: hub}
 	mux := http.NewServeMux()
 	api.Routes(mux)
 	mux.Handle("/", noCache(http.FileServer(http.FS(cfg.Web))))
 
-	go func() {
+	mgr.own(func() {
 		defer recoverPanic("session reaper")
 		t := time.NewTicker(30 * time.Minute)
 		defer t.Stop()
-		for range t.C {
+		for {
+			select {
+			case <-mgr.ctx.Done():
+				return
+			case <-t.C:
+			}
 			mgr.auth.reapSessions()
 		}
-	}()
+	})
 
 	srv := newHTTPServer(net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
-		limitBodies(mgr.auth.attach(mux)))
+		mutationPolicy(cfg.PublicOrigin, limitBodies(mgr.auth.attach(mux))))
 
 	banner(cfg, mgr)
-	return srv.ListenAndServe()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			mgr.cancel()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				_ = srv.Close()
+			}
+		case <-done:
+		}
+	}()
+	err = srv.Serve(ln)
+	close(done)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }
 
 // canonicalNoAuthHost is the address --no-auth may bind: a literal loopback

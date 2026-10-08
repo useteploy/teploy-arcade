@@ -1,291 +1,72 @@
 # Teploy Arcade
 
-One static Go binary with an embedded frontend: manages game servers on a single
-host and serves the panel that drives them. Teploy installs it; it is the
-long-running runtime, not part of the CLI (`PLAN.md` §9).
-
-Covers `PLAN.md` **phases 1-8** to varying depth — see "What is and isn't done"
-at the bottom, and the per-phase notes in `PLAN.md` itself.
-
-## Install
-
-A tagged release publishes a static binary for linux and darwin on amd64 and
-arm64, plus a container image. There is nothing to install alongside it: the
-frontend is embedded in the binary.
-
-```sh
-# binary - the supported path, see DEPLOY.md for the systemd unit
-curl -fsSLO https://github.com/useteploy/teploy-arcade/releases/latest/download/teploy-arcade_linux_amd64.tar.gz
-tar xzf teploy-arcade_linux_amd64.tar.gz
-sudo install -m 0755 teploy-arcade /usr/local/bin/teploy-arcade
-sudo install -d -m 0700 /var/teploy-arcade
-teploy-arcade -host 0.0.0.0 -port 3457 -data /var/teploy-arcade
-```
-
-It needs a Docker daemon on the same host to run anything real; without one it
-falls back to an in-process simulator so the panel is still usable. `DEPLOY.md`
-covers the unit file, the first admin account, the firewall and the container
-route.
-
-**Status: beta.** It runs a real 8-server network, and there are areas nobody
-has exercised — `TODO.md` is the honest list, kept current rather than
-aspirational. Bug reports against it are the point.
-
-## Licence
-
-MIT. See `LICENSE`.
-
-**The documents, and what each is for:**
-
-| | |
-|---|---|
-| `TODO.md` | Everything not done: blockers, gaps, deferred decisions. Start here. |
-| `BUGS.md` | Every defect found and fixed, with what each one taught. |
-| `DEPLOY.md` | How to install, provision the first admin, and migrate from another panel. |
-| `PLAN.md` | The original concept, architecture and build order. |
-| `NEUTRON-ISSUES.md` | Framework bugs and gaps found while building. |
+A single-process game-server panel with an embedded browser UI, Docker lifecycle management, console streaming, files, backups, players, scheduled tasks, imports, clones, and scoped MCP access. State is stored locally as JSON; metrics history is in memory.
 
 ## Run
 
 ```sh
-make build && ./bin/teploy-arcade      # http://127.0.0.1:3457
-go run ./cmd/teploy-arcade -port 9000  # different port
-go run ./cmd/teploy-arcade -host 0.0.0.0
-go run ./cmd/teploy-arcade -no-auth    # development only
+make build
+./bin/teploy-arcade -data ./data -game-host games.example.com
+# Open http://127.0.0.1:3457 and complete the token-gated first-admin form.
+# Development simulator only, on a literal loopback address:
+./bin/teploy-arcade -data ./demo-data -no-auth
 ```
 
-Layout follows teploy-dash: `cmd/teploy-arcade` for the binary, `internal/` for
-everything else, frontend embedded via `//go:embed` so the binary works outside
-its source tree, `make build|test|vet|clean`, and goreleaser passing
-`main.version/commit/date`.
+Go 1.26 and Node 22 are used in CI. The frontend is plain JavaScript embedded in the binary, so it runs outside the source tree without a separate frontend build. Fresh state seeds demonstration servers and local templates; demonstrations use the simulator. Select Docker when creating a real server. Docker must be available to the panel process, with the data path visible at the same host path or translated by `-data-host`.
 
-One Go dependency, nothing to configure. State lands in `/var/teploy-arcade`
-when writable and `./data` otherwise; delete it to start over. First run seeds
-five servers so the panel isn't empty.
+The first run is locked until the administrator uses the bootstrap token printed in the process log, or provisions an administrator through the environment. `-no-auth` is limited to literal loopback addresses. Do not delete the state directory to repair a problem: it contains managed server trees, credentials, backups and panel configuration. See [DEPLOY.md](DEPLOY.md) for installation and recovery precautions.
 
-```sh
-make test                # Go tests, then all frontend regression scripts
-make test-frontend       # Node-only routing, modal lifecycle and Makefile guards
-```
+## Features and deliberate constraints
 
-On first run the panel is **open** — no users, loopback only, no ceremony. Create
-the first admin in **Settings → Access** and auth switches on from that moment.
-The startup banner shouts if the agent is bound to a non-loopback address with no
-users configured.
-
-## Runtimes
-
-Every server records which runtime it uses, and the panel shows it. Nothing
-pretends to be a container when it isn't.
-
-| | What it is | When to use it |
-|---|---|---|
-| **`sim`** | In-process simulator. Emits a realistic Minecraft log, tracks players, answers console commands. | Default. Starts in ~2.5s with nothing to pull — this is what makes the panel usable immediately. |
-| **`docker`** | **Verified end to end 2026-08-12** against a real Paper 1.20.4 server: boot, world generation, console commands reaching stdin, a 166 MB live-world backup with the save-off/save-on cycle confirmed in the game's own log, and a graceful stop that saved chunks. Real container: `docker run -i` with our own stdin pipe, `--memory` and `--cpus` as hard limits, the panel's own server directory bind-mounted at `/data` so files and backups work identically for both runtimes. | Actual game servers. The first start pulls the image (`itzg/minecraft-server` is ~500 MB). |
-
-Pick the runtime in the create dialog. Docker is offered only when the daemon is
-reachable.
-
-## Console commands the simulator understands
-
-`help`, `list`, `say <msg>`, `whitelist add|remove <player>`, `kick <player>`,
-`time set <day|night>`, `weather <clear|rain>`, `stop`
-
-Two exist purely to make failure states reachable on demand:
-
-- **`flood`** — pushes 5000 lines at once. Watch the dropped-line marker appear
-  inline in the stream: that count comes from the socket's own drop counter, not
-  a guess in the browser.
-- **`crash`** — forces an OOM exit so the failed state, exit code and restart
-  count are reachable without waiting for a real crash.
-
-## Roles
-
-| Role | Can |
-|---|---|
-| `viewer` | Read everything, watch the console. Cannot type in it. |
-| `operator` | Start/stop/restart/kill, run console commands, edit settings and files, take backups. |
-| `admin` | The above, plus create/delete servers, restore backups, manage users. |
-
-Enforced on every mutating route *and* on the console socket — a viewer holding a
-session cannot start a server by POSTing directly, and cannot send a command over
-the WebSocket. Passwords are PBKDF2-HMAC-SHA256, 120k iterations, per-user salt,
-constant-time compare, standard library only.
-
-## MCP
-
-`POST /api/mcp` — hand-rolled JSON-RPC 2.0, same shape as `teploy-dash/internal/mcp`
-so a client attached to both behaves identically. Bearer tokens are separate from
-panel sessions and are minted at `/api/mcp-tokens` (admin only), stored hashed and
-shown once.
-
-Tools are namespaced `arcade_*`, not `teploy_*`: dash owns that prefix, both
-servers can be attached at once, and "server" means a deploy target there but a
-game server here — an unprefixed name would actively mislead a model holding both
-toolsets.
-
-```
-arcade_list_servers    arcade_get_server     arcade_console_tail
-arcade_send_command    arcade_lifecycle      arcade_list_backups
-arcade_create_backup   arcade_host_status
-```
-
-The tool surface is deliberately narrower than the HTTP API: reads, the lifecycle
-verbs and backups. No delete, no restore, no user management. `kill` is refused
-with a reason — it is SIGKILL and loses unsaved chunks, so it stays a human
-decision. Everything an agent does is attributed to actor `mcp` in the audit log.
+- Three roles: viewers read, operators manage routine lifecycle/files/plugins/tasks, administrators create/import/clone/delete, restore backups, allocate resources, manage users and issue tokens.
+- Docker servers survive panel restarts and are reconciled on boot. The simulator is for demonstrations, not a substitute for a game process.
+- Imports support copying a stopped directory or explicitly adopting it in place. Imported Minecraft jars use the custom-jar runtime and a version-appropriate JRE. Do not adopt a directory another panel still manages.
+- Backup, plugin-install and restore actions use durable async operation IDs and idempotency keys in the browser. Closing a view stops status polling without cancelling accepted panel work. Interrupted operations recover as failed after restart and are never automatically replayed. Status-read retries poll the same job; an ambiguous lost submission response is shown explicitly.
+- Clone jobs copy an existing server with status/progress polling. Closing the dialog stops browser polling; accepted jobs remain owned by the panel.
+- Scheduled tasks support console steps and `!start`, `!stop`, `!restart`, `!backup`, `!wait` at a local civil time, with optional daily repetition.
+- Plugin/mod installs use an operator-supplied URL, structural ZIP validation and optional SHA-256. There is no remote plugin catalogue. Public HTTPS endpoints are the default; trusted mirror exceptions are documented in DEPLOY.md.
+- File and settings editors save against the ETag of their original draft. A concurrent change returns a conflict and retains the draft; comparison shows the saved version separately, and reloading requires explicit discard confirmation.
+- Player observations identify log/RCON/simulation provenance. Unknown latency or UUID is displayed as a dash rather than invented values.
+- Player heads are off by default. Explicit opt-in sends player names to mc-heads.net from the browser with no referrer; disabling them retains local gradient avatars.
+- MCP tokens grant selected existing server IDs and typed actions. New tokens default to server reads; lifecycle/backup and host reads are explicit capabilities. Raw console, kill, delete, restore and user management are excluded. Legacy unscoped tokens must be reissued. Tokens are shown once and stored hashed.
+- Memory and CPU limits are enforced by Docker. Disk allocation is a declared limit; no portable per-directory filesystem quota is enforced. Metrics history is lost on panel restart. Templates remain local JSON files.
 
 ## API
 
+Requests use the same-origin session cookie. JSON mutations require `Content-Type: application/json`; a missing session returns 401, insufficient role 403, and unclaimed setup state 503. Bootstrap endpoints and health remain accessible before sign-in.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/health`, `GET /api/me` | Health and session/setup state |
+| `POST /api/login`, `/api/logout`, `/api/setup` | Authentication and first-admin setup |
+| `GET /api/host`, `/api/templates`, `/api/servers` | Host, templates and server inventory |
+| `POST /api/servers`, `DELETE /api/servers/{id}` | Admin create/delete |
+| `POST /api/servers/{id}/start`, `/stop`, `/restart`, `/kill`, `/command` | Lifecycle and console; kill requires admin |
+| `GET`, `PATCH /api/servers/{id}/settings` | Settings schema/values and updates |
+| `PATCH /api/servers/{id}` | Admin memory/CPU allocation; reports restart-pending limits |
+| `GET /api/servers/{id}/files`, `/file`, `/download`; `PUT`, `DELETE /file`; `POST /mkdir` | Files below the server root |
+| `GET`, `POST /api/servers/{id}/backups`; `POST /backups/{bid}/restore`; `DELETE /backups/{bid}` | Backup inventory/create/restore/delete |
+| `GET`, `POST /api/servers/{id}/tasks`; `PATCH`, `DELETE /tasks/{tid}`; `POST /tasks/{tid}/run` | Scheduled task management |
+| `POST /api/import/scan`, `/api/import`, `/api/clone`; `GET /api/import/{job}` | Import and clone jobs |
+| `GET`, `POST /api/mcp-tokens`; `DELETE /api/mcp-tokens/{name}` | Admin scoped-token management |
+| `GET /api/servers/{id}/operations/{job}` | Scoped async backup/plugin/restore status |
+| `GET /api/events`, `/ws/console?server={id}` | Session-authorized SSE and WebSocket streams |
+
+The WebSocket down protocol carries `replay`, `line`, `dropped`, `status`, `players`, `command_ack`; up carries `command`. Each room has bounded replay with monotonic sequence numbers and per-connection drop accounting. Commands route to the game, not to other viewers.
+
+Backups quiesce supported running games before archiving, and restore requires a stopped server. Accepted commands alone do not prove a durable game save; unsupported live snapshot contracts must be refused or handled by stopping the game. Restore retains recovery staging when rollback cannot complete. Read the failure response and preserve that staging until recovery finishes.
+
+## Verify and release
+
+```sh
+make build
+make vet
+make test
+make race
+for script in cmd/teploy-arcade/frontend/*.js; do node --check "$script"; done
+go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 ```
-GET    /api/host                        host allocation ledger
-GET    /api/templates                   templates + next free port
-GET    /api/servers                     list + host
-POST   /api/servers                     create                       (admin)
-GET    /api/servers/{id}
-DELETE /api/servers/{id}                                             (admin)
-POST   /api/servers/{id}/start|stop|restart|kill|command             (operator)
-GET    /api/servers/{id}/settings       schema joined to current values
-PATCH  /api/servers/{id}/settings       returns requires_restart[]   (operator)
-GET    /api/servers/{id}/metrics        ?window=5m|15m|1h
-GET    /api/metrics                     host aggregate
-GET    /api/servers/{id}/files          ?path=
-GET    /api/servers/{id}/file           ?path=          read
-PUT    /api/servers/{id}/file           write                        (operator)
-DELETE /api/servers/{id}/file           ?path=                       (operator)
-POST   /api/servers/{id}/mkdir                                       (operator)
-GET    /api/servers/{id}/download       ?path=
-GET    /api/servers/{id}/backups
-POST   /api/servers/{id}/backups        create (quiesced)            (operator)
-POST   /api/servers/{id}/backups/{bid}/restore                       (admin)
-DELETE /api/servers/{id}/backups/{bid}                               (admin)
-GET    /api/auth/me
-POST   /api/auth/login | /api/auth/logout | /api/auth/setup
-GET    /api/users | POST /api/users | DELETE /api/users/{name}       (admin)
-GET    /api/audit                       append-only action log
-GET    /api/events                      SSE: status transitions + metrics
-GET    /ws/console?server={id}          WebSocket console
-```
 
-## Templates are data, not code
+Tagged releases depend on CI, including race/frontend checks and a scanned candidate container. Actions and base images are pinned by immutable identifiers; GoReleaser is pinned and verifies dependency manifests without running `go mod tidy`. Dependabot proposes updates. Real game runtime, browser keyboard/session lifecycle, restore failure and deployed TLS acceptance must be exercised on the candidate before promotion; a passing source test is not proof of a deployed service.
 
-`data/templates/*.json`, seeded from the built-ins on first run. Drop a file in,
-restart, and the game appears in the create dialog — no code change. A malformed
-file is skipped and reported rather than fatal.
-
-The format is clean-slate rather than Pterodactyl's egg JSON. That is `PLAN.md`
-§12 question 2, and the answer got easy once the UI existed: what the panel needs
-from a template is *display* metadata — group, description, recommended flag,
-maturity, per-field help — which Ptero's format does not carry. Adopting it would
-import an installer-script model and licence questions for no gain.
-
-## Backups
-
-`save-off` → `save-all flush` → wait → archive → `save-on`. File writes are
-refused for the whole window, so a snapshot can never catch a half-written chunk
-(`PLAN.md` §8). Saves resume even if the archive fails — a server left with
-`save-off` is a far worse outcome than a failed backup. Restore keeps the old
-tree until the new one lands, and refuses to run while the server is up.
-
-The WS protocol is the one written up in `VISUAL-HANDBACK.md` §4.4. Down:
-`replay`, `line`, `dropped`, `status`, `players`, `command_ack`. Up: `command`.
-
-Three properties it holds, each with a test in `console_test.go`:
-
-- **Inbound commands route to the game's stdin, never to other viewers**
-  (`NEUTRON-ISSUES.md` NI-002). `TestCommandRoutesToServerNotPeers` proves a
-  peer never receives the raw command but does receive its output.
-- **Every socket counts its own dropped lines** (NI-008). The hub here does what
-  `neutronrealtime` doesn't: `Conn.Dropped()`. Without it the "N lines dropped"
-  notice would be a lie. `TestBackpressureIsCountedAndReported` asserts nothing
-  vanishes unaccounted — delivered + dropped == published.
-- **Every line carries a monotonic per-room `seq`**, so a client can localise a
-  gap and dedupe a replay. Cheap now, impossible to retrofit.
-
-## Feature coverage
-
-| Area | Status |
-|---|---|
-| **Players** | ✅ Built — whitelist / operators / banned / banned IPs, sub-tabs, add bar, file-editor switch. Changes route through the game console while running and straight to the file while stopped, so the game never overwrites an edit; while a server is `starting` or `stopping` the edit is refused rather than written, because the game owns the files in both transient states. |
-| **Scheduler** | ✅ Built — named tasks at a 24h time, daily repeat, run-now. Adds panel actions beyond plain console commands: `!restart`, `!backup`, `!stop`, `!start`, `!wait`, so the nightly restart is expressible. |
-| **Panel dashboard** | ✅ Built — host CPU, memory and disk as measured usage (not summed limits), plus a per-server table: CPU, memory against limit, on-disk size, players, status, and start/stop/restart per row. Commitment (every server's configured limit added up) is shown separately, since limits are caps rather than reservations. |
-| **Server tab strip** | ✅ Every server gets a tab; the strip scrolls and tabs drag to reorder, persisted via `POST /api/servers/order`. |
-| **Dashboard** | ✅ Built — CPU/RAM/UPTIME tiles, Server Statistics panel, 1m/5m/30m/1h/4h time scale, CPU area + RAM area + players bar chart with right-aligned readouts, players sidebar. |
-| **Plugins** | ✅ Built, minus a catalogue browser — lists the jars in the one directory the template actually reads (`plugins/` for Paper/Spigot/Purpur/Velocity, `mods/` for Forge/Fabric/NeoForge/Quilt, an explanation for Vanilla and Bedrock), enable/disable by renaming to `.jar.disabled`, delete, and install from a URL. No Modrinth/Spigot index: that is a network dependency and a licensing question, so the URL bar is the whole install surface. |
-| **Import an existing server** | ✅ Built — scans a directory on the host, identifies the template from the jar name, reads the port from `velocity.toml` for proxies and `server.properties` otherwise, warns when another panel is still pointed at the same tree, then either copies it in or adopts it in place by symlink. It does not launch a bare jar: the panel runs the simulator or `itzg/minecraft-server`, and the scan says so rather than implying otherwise. |
-| **Clone an existing server** | Not built |
-
-Global settings are deliberately shallow for now — the agent, users and the
-audit log. Auto-update, autostart and per-tab display toggles are not built.
-
-Player avatars are gradient placeholders rather than fetched player heads.
-
-## Audit findings (2026-08-12)
-
-A deliberate bug-hunting pass, after two earlier passes each turned up real
-defects. Everything below was found and fixed:
-
-| Found | Why it mattered |
-|---|---|
-| **Cross-origin WebSocket accepted** — `InsecureSkipVerify` disabled the Origin check | WebSockets bypass CORS, so that check was the only defence. Any page the operator visited could open a console socket and run commands on their servers. |
-| **Data races on `Server.Status`** | Runner goroutines write it while HTTP handlers read it. Found by `-race`, not by reading. All reads now go through a locked `State()`. |
-| **`Save()` marshalled without locks** | `json.Marshal` reads every field while runners write them; persistence raced state changes. |
-| **Per-server dashboard navigated away from itself** | `#/dashboard` and `#/s/<id>/dashboard` share a route name, so the event feed re-rendered the global dashboard over it every 2s, leaking a timer each time. |
-| **Console rooms leaked on delete** | Each holds a 500-line ring buffer, kept for the life of the process. |
-| **No crash-loop breaker** | A server dying instantly was restarted forever. Now opens after 5 failures in 10 minutes, with an explicit clear. |
-| **Port conflicts only checked at create** | A hand-edited `server.properties` let two servers fight over a port until Docker failed the bind. |
-| **Tab strip hid the open server** | Opening the 6th server showed a strip with no active tab. |
-
-Second pass, on failure recovery and resource bounds:
-
-| Found | Why it mattered |
-|---|---|
-| **A corrupt state file stopped the panel booting** | One bad byte in `servers.json` and nobody could reach any server. Bad files are now quarantined beside the original and the panel starts, loudly. |
-| **A panic in any background goroutine killed the process** | One bad scheduled task or runner would take down the panel and every server's management with it. Contained per goroutine. |
-| **Unbounded request bodies** | A single POST could exhaust memory. Capped at 8 MB by middleware, reported as 413 rather than a decode failure. |
-| **Unbounded console lines** | The ring holds 500 lines and fans each to every viewer; modded servers really do print megabyte stack dumps on one line. Capped at 8 KB with an explicit truncation marker. |
-| **Expired sessions were never reaped** | They were only dropped when looked up again, so the map grew for the process lifetime. |
-
-Third pass, on the dimensions that only show up under stress or in a deploy:
-
-| Found | Why it mattered |
-|---|---|
-| **Containers outlived the panel, invisibly** | After a panel restart the server showed as stopped while its container ran. Pressing Start force-removed a *live* server with no graceful save. Fires on every redeploy or reboot. The panel now reconciles with Docker on boot and re-adopts. |
-| **`docker attach` was the wrong adoption mechanism** | It does not exit cleanly and would wedge shutdown. Adoption streams via `docker logs -f --tail 200` and sends commands over RCON, the channel Crafty and Pterodactyl use. |
-| **The first adoption fix broke exit detection** | An adopted container stopping was never noticed; the server hung in "stopping" forever. Replaced with `docker wait`. |
-| **Bind mounts broke when the panel was containerised** | `docker run -v` resolves on the *host*, so a containerised panel gave game servers paths that do not exist. Docker creates them empty — the game boots a blank world while the file manager shows the real one. Silent. Fixed with `-data-host`, an identical-path bind mount in `teploy.yml`, and a startup warning. |
-| **Filesystem errors leaked internal paths** | A full disk reported the panel's `.tmp` path. Now names the cause and the file the operator asked for. |
-
-`make race` runs the detector; `make test` includes the frontend routing cases.
-
-## What is and isn't done
-
-Done: control API, console streaming, panel UI, resource history and graphs,
-file manager, backups with the quiesce window, templates as data, auth with
-three roles, audit log, Dockerfile and `teploy.yml`.
-
-Not done, and worth knowing before trusting this anywhere real:
-
-- **Storage is a JSON file**, not Postgres via `nucleus-go`. `PLAN.md` §3 locks
-  Postgres as the v1 default; that swap is a `Store` implementation away and was
-  skipped so this runs with zero setup. NI-006 (neutron-go isn't `go get`-able
-  and its `replace` breaks on paths containing spaces) makes it a chore today.
-- **The panel is vanilla JS, not Neutron-TS.** Views map onto the components
-  named in `mockups/`, so the port is mechanical — but it is still owed.
-- **`teploy.yml` has never been run on a real VPS.** Reviewed draft, not a
-  proven deploy.
-- **No disk quota per volume.** Needs XFS project quotas or a loop device;
-  docker has no portable equivalent. The number in the UI is the declared limit,
-  not an enforced one.
-- **No scheduled backups.** That is the `neutronjobs` cron half; the Scheduler
-  tab is still marked v1.1.
-- **No plugin catalogue.** Plugins install from a URL you supply; nothing here
-  browses Modrinth or SpigotMC.
-- **No max-restart circuit breaker**, no disk-full handling, no network-partition
-  behaviour. `PLAN.md` §8's chaos scripts were not written.
-- **No remote template registry** — templates are local files.
-- **The console token flow in `PLAN.md` §6** (Ed25519, browser→agent direct) is
-  not implemented, because the panel and agent are one process here and the
-  browser talks to a single origin. It matters again the moment they split.
-- **Metrics are in-memory only** and are lost on restart. `nucleus/ts` would
-  take this over.
+[DEPLOY.md](DEPLOY.md) describes native systemd and container deployment. [AUDIT_OPEN.md](AUDIT_OPEN.md) tracks unresolved defects and acceptance gates. Historical PLAN/TODO and audit reports describe earlier checkpoints and may differ from current code.

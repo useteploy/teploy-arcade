@@ -1,7 +1,7 @@
 package arcade
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +34,7 @@ func (a *API) RoutesExt(mux *http.ServeMux) {
 
 	// ---- Phase 5: backups
 	mux.HandleFunc("GET /api/servers/{id}/backups", auth.require(RoleViewer, a.listBackups))
+	mux.HandleFunc("GET /api/servers/{id}/operations/{job}", auth.require(RoleOperator, a.operationStatus))
 	mux.HandleFunc("POST /api/servers/{id}/backups", auth.require(RoleOperator, a.createBackup))
 	mux.HandleFunc("POST /api/servers/{id}/backups/{bid}/restore", auth.require(RoleAdmin, a.restoreBackup))
 	mux.HandleFunc("DELETE /api/servers/{id}/backups/{bid}", auth.require(RoleAdmin, a.deleteBackup))
@@ -129,12 +130,16 @@ func (a *API) listFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Query().Get("path")
-	entries, truncated, err := a.mgr.ListFiles(s, path)
+	entries, next, err := a.mgr.ListFilesPage(r.Context(), s, path, r.URL.Query().Get("cursor"))
 	if err != nil {
-		writeErr(w, 400, err)
+		code := 400
+		if errors.Is(err, errStaleCursor) {
+			code = 409
+		}
+		writeErr(w, code, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"path": path, "entries": entries, "truncated": truncated})
+	writeJSON(w, 200, map[string]any{"path": path, "entries": entries, "truncated": next != "", "next_cursor": next})
 }
 
 func (a *API) readFile(w http.ResponseWriter, r *http.Request) {
@@ -147,7 +152,9 @@ func (a *API) readFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"path": r.URL.Query().Get("path"), "content": content})
+	etag := contentETag(content)
+	w.Header().Set("ETag", etag)
+	writeJSON(w, 200, map[string]any{"path": r.URL.Query().Get("path"), "content": content, "etag": etag})
 }
 
 func (a *API) writeFile(w http.ResponseWriter, r *http.Request) {
@@ -156,12 +163,12 @@ func (a *API) writeFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct{ Path, Content string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	if err := a.mgr.WriteFile(s, body.Path, body.Content); err != nil {
-		writeErr(w, 400, err)
+	if err := a.mgr.WriteFileConditional(s, body.Path, body.Content, r.Header.Get("If-Match")); err != nil {
+		writeErr(w, editErrorCode(err), err)
 		return
 	}
 	a.mgr.audit(actorOf(r), "file.write", s.ID, body.Path)
@@ -188,7 +195,7 @@ func (a *API) mkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct{ Path string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -275,7 +282,7 @@ func (a *API) setBackupRetention(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Keep int `json:"keep"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, fmt.Errorf("keep must be a number"))
 		return
 	}
@@ -296,7 +303,7 @@ func (a *API) createBackup(w http.ResponseWriter, r *http.Request) {
 	// order cleared deadlines first and then read whatever arrived, however
 	// slowly. An empty body is fine; a malformed one is not.
 	var body struct{ Note string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	if err := decodeJSON(r, &body); err != nil && !errors.Is(err, io.EOF) {
 		writeErr(w, 400, err)
 		return
 	}
@@ -311,6 +318,17 @@ func (a *API) createBackup(w http.ResponseWriter, r *http.Request) {
 	// at the end still happens or fails on its own.
 	clearStreamDeadlines(w)
 
+	if wantsAsync(r) {
+		actor := actorOf(r)
+		job, err := a.mgr.startOperation(s, "backup", actor, r.Header.Get("Idempotency-Key"), body.Note, func(ctx context.Context) error { _, err := a.mgr.CreateBackup(s, body.Note, actor); return err })
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		w.Header().Set("Location", "/api/servers/"+s.ID+"/operations/"+job.ID)
+		writeJSON(w, 202, publicOperation(job))
+		return
+	}
 	b, err := a.mgr.CreateBackup(s, body.Note, actorOf(r))
 	if err != nil {
 		writeErr(w, 400, err)
@@ -328,6 +346,17 @@ func (a *API) restoreBackup(w http.ResponseWriter, r *http.Request) {
 	// and the client then sees EOF while the archive lands on disk anyway - the
 	// same "the panel lied about a backup" outcome M13 was filed to stop.
 	clearStreamDeadlines(w)
+	if wantsAsync(r) {
+		actor, bid := actorOf(r), r.PathValue("bid")
+		job, err := a.mgr.startOperation(s, "restore", actor, r.Header.Get("Idempotency-Key"), bid, func(ctx context.Context) error { return a.mgr.RestoreBackup(s, bid, actor) })
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		w.Header().Set("Location", "/api/servers/"+s.ID+"/operations/"+job.ID)
+		writeJSON(w, 202, publicOperation(job))
+		return
+	}
 	if err := a.mgr.RestoreBackup(s, r.PathValue("bid"), actorOf(r)); err != nil {
 		writeErr(w, 400, err)
 		return
@@ -356,17 +385,19 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 	// the second one needs setup. A panel run with -no-auth has accounts and is
 	// not claimable - reporting needs_setup there put the create-first-admin
 	// form in front of an operator whose panel already had an admin.
+	enabled, setupRequired := auth.gateState()
 	unclaimed := !auth.HasUsers()
 	resp := map[string]any{
-		"auth_enabled": auth.Enabled(),
-		"needs_setup":  unclaimed,
+		"auth_enabled":  auth.Enabled(),
+		"needs_setup":   setupRequired,
+		"auth_disabled": !enabled && !setupRequired,
 	}
 	if s != nil {
 		resp["user"] = map[string]any{"name": s.User, "role": s.Role}
 		// The panel puts a change-password screen in front of everything else
 		// while this is set, and the API refuses the rest regardless.
 		resp["must_change"] = auth.MustChangePassword(s.User)
-	} else if unclaimed {
+	} else if !enabled && !setupRequired {
 		// No account, no session - so no user. This used to answer with an
 		// invented {name: "local", role: "admin"}, which the settings screen
 		// then rendered as "Signed in as local (admin)". That conflates two
@@ -379,6 +410,8 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 		// The authority is still reported, under a name that cannot be mistaken
 		// for an account.
 		resp["effective_role"] = RoleAdmin
+	}
+	if unclaimed {
 		resp["unclaimed"] = true
 	}
 	writeJSON(w, 200, resp)
@@ -407,7 +440,7 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, s *Session) {
 		// X-Forwarded-Proto header is the proxy's claim, not the panel's
 		// knowledge, and honouring it blindly would flip the flag on for a
 		// plaintext request whenever someone asked it to.
-		Secure:   r.TLS != nil,
+		Secure:   secureRequest(r),
 		SameSite: http.SameSiteLaxMode,
 		Expires:  s.Expires,
 	})
@@ -415,7 +448,7 @@ func setSessionCookie(w http.ResponseWriter, r *http.Request, s *Session) {
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	var body struct{ Name, Password string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -433,6 +466,11 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, fmt.Errorf("too many authentication attempts in flight; try again shortly"))
 		return
 	}
+	if !a.mgr.auth.AllowLoginOrigin(r.RemoteAddr) || !a.mgr.auth.AllowLoginAccount(body.Name) {
+		w.Header().Set("Retry-After", "60")
+		writeErr(w, 429, fmt.Errorf("too many login attempts; try again later"))
+		return
+	}
 	s, err := a.mgr.auth.Login(body.Name, body.Password)
 	if err != nil {
 		// The attempted name is caller-supplied and unbounded in principle;
@@ -442,10 +480,15 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 			claimed = claimed[:64] + "..."
 		}
 		a.mgr.audit(claimed, "auth.login_failed", "", "")
+		if errors.Is(err, ErrSessionLimit) {
+			w.Header().Set("Retry-After", "60")
+			writeErr(w, 429, err)
+			return
+		}
 		writeErr(w, 401, err)
 		return
 	}
-	setSessionCookie(w, r, s)
+	setSessionCookie(w, withPublicOrigin(r, a.mgr.publicOrigin), s)
 	a.mgr.audit(s.User, "auth.login", "", s.Role)
 	writeJSON(w, 200, map[string]any{"user": map[string]any{"name": s.User, "role": s.Role}})
 }
@@ -455,7 +498,7 @@ func (a *API) logout(w http.ResponseWriter, r *http.Request) {
 		a.mgr.auth.Logout(c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{Name: "gss_session", Value: "", Path: "/", MaxAge: -1,
-		Secure: r.TLS != nil, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+		Secure: secureRequest(withPublicOrigin(r, a.mgr.publicOrigin)), HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -469,7 +512,7 @@ func (a *API) setup(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name, Password, Token string
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -503,7 +546,7 @@ func (a *API) setup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err)
 		return
 	}
-	setSessionCookie(w, r, s)
+	setSessionCookie(w, withPublicOrigin(r, a.mgr.publicOrigin), s)
 	a.mgr.audit(u.Name, "auth.setup", "", "first admin created")
 	writeJSON(w, 201, map[string]any{"user": map[string]any{"name": u.Name, "role": u.Role}})
 }
@@ -514,7 +557,7 @@ func (a *API) listUsers(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 	var body struct{ Name, Password, Role string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -535,7 +578,7 @@ func (a *API) setPassword(w http.ResponseWriter, r *http.Request) {
 		Current string `json:"current"`
 		New     string `json:"new"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -654,7 +697,7 @@ func (a *API) addPlayer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct{ List, Name, Reason string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -703,7 +746,7 @@ func (a *API) createTask(w http.ResponseWriter, r *http.Request) {
 		Repeat   bool   `json:"repeat"`
 		Enabled  *bool  `json:"enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
@@ -734,7 +777,7 @@ func (a *API) updateTask(w http.ResponseWriter, r *http.Request) {
 		Repeat   *bool   `json:"repeat"`
 		Enabled  *bool   `json:"enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, 400, err)
 		return
 	}

@@ -137,7 +137,8 @@ func TestAdoptedContainerStopsPollingAfterItExits(t *testing.T) {
 // neither used to touch the proc's cancel func the way simRunner.Stop does.
 func TestDockerStopAndKillCancelTheRunner(t *testing.T) {
 	fakeDockerBin(t, false)
-	r := &dockerRunner{}
+	// Production runners always inherit their owning manager's cancellation.
+	r := &dockerRunner{mgr: &Manager{ctx: context.Background()}}
 
 	for _, tc := range []struct {
 		name string
@@ -217,10 +218,12 @@ func TestDockerExitHandlerRecoversItsPanic(t *testing.T) {
 func TestSimulatorCommandGoroutinesRecoverTheirPanic(t *testing.T) {
 	sink := captureRunnerLog(t)
 
-	// A nil manager stands in for any fault on the publish path these commands
-	// reach through m.Stop and m.fail.
-	r := &simRunner{}
-	s := &Server{ID: "sim1", MaxPlayers: 20}
+	// Work admission requires an owning manager. A nil hub injects the fault
+	// downstream on the publish path, inside the admitted command worker.
+	s := &Server{ID: "sim1", MaxPlayers: 20, Status: StatusRunning}
+	mgr := &Manager{ctx: context.Background(), dataDir: t.TempDir(), servers: map[string]*Server{s.ID: s}}
+	r := &simRunner{mgr: mgr}
+	defer mgr.workers.Wait()
 	quiet := func(Line) {}
 
 	r.handleCommand(s, "stop", quiet)

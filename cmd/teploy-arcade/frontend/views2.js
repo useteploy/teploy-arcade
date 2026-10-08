@@ -84,12 +84,12 @@ async function viewServerDashboard(id) {
       <div class="stat">
         <span class="glyph" style="background:#5b5bd6"><i class="ico ico-lg ico-cpu"></i></span>
         <span class="t"><span class="k" style="color:#8f8ff0">CPU</span>
-          <span class="v">${running ? cur.cpu.percent : 0} %</span></span>
+          <span class="v">${running && usageKnown(cur.cpu.percent) ? cur.cpu.percent + ' %' : '—'}</span></span>
       </div>
       <div class="stat">
         <span class="glyph" style="background:#2f86d6"><i class="ico ico-lg ico-memory"></i></span>
         <span class="t"><span class="k" style="color:#68b6ef">RAM</span>
-          <span class="v">${running ? cur.memory.used_mb : 0} MB</span></span>
+          <span class="v">${running ? fmtMB(cur.memory.used_mb) : '—'}</span></span>
       </div>
       <div class="stat">
         <span class="glyph" style="background:#2bb673"><i class="ico ico-lg ico-clock"></i></span>
@@ -103,7 +103,7 @@ async function viewServerDashboard(id) {
       ? players.map((p) => {
           return `<div class="player">
             ${skinMarkup(p.name)}
-            <span><div class="pn">${esc(p.name)}</div><div class="pm">${p.ping_ms} ms</div></span>
+            <span><div class="pn">${esc(p.name)}</div><div class="pm" title="${esc(playerObservation(p))}">${playerLatency(p)}</div></span>
           </div>`;
         }).join('')
       : `<div style="padding:14px 9px;color:var(--t-2);font-size:12px">Nobody online.</div>`;
