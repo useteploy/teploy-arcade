@@ -30,7 +30,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.26'
+          go-version: '1.27.3'
       - name: Reject reused release versions and tag drift
         run: python3 .github/scripts/release-guard.py
         env:
