@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
 # R70 (audit pass 7): Alpine 3.20 left scheduled support in April 2026;
 # 3.24 is a supported branch. The runtime packages (docker-cli,
 # ca-certificates, tzdata) re-resolve from 3.24's repos on every build.
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 RUN apk add --no-cache ca-certificates docker-cli tzdata
 WORKDIR /app
 # The frontend is embedded in the binary, so nothing else ships.
