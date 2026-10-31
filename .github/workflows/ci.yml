@@ -55,7 +55,7 @@ jobs:
           chmod 700 "$fixture"
           docker run --detach --name arcade-ci --publish 127.0.0.1:3457:3457 \
             --volume "$fixture:$fixture" teploy-arcade:ci -host 0.0.0.0 -port 3457 -data "$fixture"
-          trap 'docker rm -f arcade-ci; rm -rf "$fixture"' EXIT
+          trap 'docker rm -f arcade-ci; sudo rm -rf "$fixture"' EXIT
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:3457/api/health; then break; fi
             sleep 1
