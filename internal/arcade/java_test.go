@@ -103,6 +103,12 @@ func TestOldServersAreCreatedOnAJavaEightImage(t *testing.T) {
 // a test that only checked the field would pass with the runner ignoring it.
 func TestAnImportedServerRunsItsOwnJar(t *testing.T) {
 	_, mgr := newImportAgent(t)
+	// The import's docker preflight is the only thing here that needs a
+	// daemon; the assertions are on the container command, not a container.
+	oldReach := dockerReachable
+	t.Cleanup(func() { dockerReachable = oldReach })
+	dockerReachable = func() bool { return true }
+
 	dir := mkTree(t, "rlcraft", map[string]string{
 		"forge-1.12.2-14.23.5.2860.jar": "PK\x03\x04 forge",
 		"server.properties":             "server-port=25572\nmotd=RL Craft\n",
@@ -115,7 +121,9 @@ func TestAnImportedServerRunsItsOwnJar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
-	waitImport(t, job.ID, 20*time.Second)
+	if done := waitImport(t, job.ID, 20*time.Second); done.State != ImportDone {
+		t.Fatalf("import ended %q: %s", done.State, done.Error)
+	}
 
 	var s *Server
 	for _, c := range mgr.List() {

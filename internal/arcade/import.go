@@ -779,7 +779,8 @@ func (m *Manager) StartImport(req ImportRequest, actor string) (*ImportJob, erro
 	if runtime != RuntimeSim && runtime != RuntimeDocker {
 		return nil, fmt.Errorf("unknown runtime %q", runtime)
 	}
-	if runtime == RuntimeDocker && !dockerAvailable() {
+	// The same seam Create and Start probe through: one question, one answer.
+	if runtime == RuntimeDocker && !dockerReachable() {
 		return nil, fmt.Errorf("docker is not reachable on this host")
 	}
 

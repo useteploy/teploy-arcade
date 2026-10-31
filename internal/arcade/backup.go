@@ -781,6 +781,11 @@ func (m *Manager) DeleteBackup(s *Server, backupID, actor string) error {
 // file could block it forever. Files are opened nonblocking and must be
 // regular.
 func tarGz(src, dst string) (int64, error) { return tarGzContext(context.Background(), src, dst) }
+
+// Seam, so a backup destination that refuses writes is testable as root, which
+// a permission bit cannot model.
+var createArchiveTemp = os.CreateTemp
+
 func tarGzContext(ctx context.Context, src, dst string) (int64, error) {
 	root, err := os.OpenRoot(src)
 	if err != nil {
@@ -788,7 +793,7 @@ func tarGzContext(ctx context.Context, src, dst string) (int64, error) {
 	}
 	defer root.Close()
 
-	f, err := os.CreateTemp(filepath.Dir(dst), ".arcade-tmp-backup-*")
+	f, err := createArchiveTemp(filepath.Dir(dst), ".arcade-tmp-backup-*")
 	if err != nil {
 		return 0, err
 	}

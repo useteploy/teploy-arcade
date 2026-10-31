@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,16 +24,18 @@ func TestFailedBackupStillResumesSaves(t *testing.T) {
 	_, mgr := newTestAgent(t)
 	s := startServer(t, mgr)
 
-	// Make the backup destination unwritable, the way a full or read-only
-	// disk would.
+	// Make the backup destination refuse the archive, the way a read-only
+	// disk would. Injected rather than chmod'd: root ignores a 0500 directory,
+	// so a permission bit made this pass only for unprivileged runs.
 	dir := mgr.backupDir(s.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
+	oldCreate := createArchiveTemp
+	t.Cleanup(func() { createArchiveTemp = oldCreate })
+	createArchiveTemp = func(d, pattern string) (*os.File, error) {
+		if d == dir {
+			return nil, &os.PathError{Op: "open", Path: filepath.Join(d, pattern), Err: syscall.EROFS}
+		}
+		return oldCreate(d, pattern)
 	}
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Skipf("cannot chmod in this environment: %v", err)
-	}
-	defer os.Chmod(dir, 0o755)
 
 	_, err := mgr.CreateBackup(s, "should fail", "tester")
 	if err == nil {

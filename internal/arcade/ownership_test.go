@@ -1,6 +1,7 @@
 package arcade
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,24 +23,55 @@ import (
 // Nothing in the panel noticed, because the write itself succeeded. On the
 // deployed host it was visible only as one file out of eight owned by 0:0.
 
+// chownCall is one handover the panel would have made. tree is true for the
+// Lchown seam, which only chownTree uses: a whole tree being given away, as
+// opposed to one replaced file keeping its owner.
+type chownCall struct {
+	path     string
+	uid, gid int
+	tree     bool
+}
+
 // withChownRecorder makes the process look like root and records what it would
 // have handed over, so the logic is testable without actually being root.
 // Both seams are recorded: regular files go through Chown, and since R13
 // (audit pass 7) tree repair goes through Lchown so a symlink in the tree
 // changes its own inode, never its target.
-func withChownRecorder(t *testing.T) *[][3]any {
+func withChownRecorder(t *testing.T) *[]chownCall {
 	t.Helper()
-	calls := &[][3]any{}
+	calls := &[]chownCall{}
 	oldChown, oldLchown, oldEuid := chownFile, chownLink, geteuid
 	t.Cleanup(func() { chownFile, chownLink, geteuid = oldChown, oldLchown, oldEuid })
 	geteuid = func() int { return 0 }
-	rec := func(path string, uid, gid int) error {
-		*calls = append(*calls, [3]any{path, uid, gid})
+	chownFile = func(path string, uid, gid int) error {
+		*calls = append(*calls, chownCall{path, uid, gid, false})
 		return nil
 	}
-	chownFile = rec
-	chownLink = rec
+	chownLink = func(path string, uid, gid int) error {
+		*calls = append(*calls, chownCall{path, uid, gid, true})
+		return nil
+	}
 	return calls
+}
+
+// handToGameUser gives path to the container's user for real when the test runs
+// as root, which is the deployed state of a docker server's files. Unprivileged,
+// the test's own non-root user already owns it, and that answers the same
+// question: the file belongs to someone other than root.
+func handToGameUser(t *testing.T, path string) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		return
+	}
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Lchown(p, containerRunUID, containerRunGID)
+	})
+	if err != nil {
+		t.Fatalf("handing %s to the game user: %v", path, err)
+	}
 }
 
 func TestAtomicWriteKeepsTheGameAsOwnerOfItsFile(t *testing.T) {
@@ -48,6 +80,7 @@ func TestAtomicWriteKeepsTheGameAsOwnerOfItsFile(t *testing.T) {
 	if err := os.WriteFile(target, []byte("server-port=25565\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	handToGameUser(t, target)
 	uid, gid, ok := fileOwner(target)
 	if !ok {
 		t.Skip("no ownership information on this filesystem")
@@ -62,8 +95,8 @@ func TestAtomicWriteKeepsTheGameAsOwnerOfItsFile(t *testing.T) {
 		t.Fatalf("the replacement was not handed back to the file's owner: %v", *calls)
 	}
 	got := (*calls)[0]
-	if got[1] != uid || got[2] != gid {
-		t.Errorf("handed to %v:%v, want %d:%d", got[1], got[2], uid, gid)
+	if got.uid != uid || got.gid != gid {
+		t.Errorf("handed to %d:%d, want %d:%d", got.uid, got.gid, uid, gid)
 	}
 }
 
@@ -101,10 +134,10 @@ func TestANewTreeIsHandedToTheContainerUser(t *testing.T) {
 
 	var got []string
 	for _, c := range *calls {
-		if c[1] != containerRunUID || c[2] != containerRunGID {
-			t.Errorf("%v handed to %v:%v, want %d:%d", c[0], c[1], c[2], containerRunUID, containerRunGID)
+		if c.uid != containerRunUID || c.gid != containerRunGID {
+			t.Errorf("%s handed to %d:%d, want %d:%d", c.path, c.uid, c.gid, containerRunUID, containerRunGID)
 		}
-		rel, _ := filepath.Rel(root, c[0].(string))
+		rel, _ := filepath.Rel(root, c.path)
 		got = append(got, rel)
 	}
 	sort.Strings(got)
@@ -135,6 +168,14 @@ func TestSavingSettingsKeepsTheGameAsOwner(t *testing.T) {
 	if err := mgr.writeProps(s); err != nil {
 		t.Fatalf("seed props: %v", err)
 	}
+	handToGameUser(t, filepath.Join(mgr.dataDir, "servers", s.ID))
+	// Read before the save: the file being replaced is what decides, and with
+	// the chown recorded rather than made, the replacement on disk is the
+	// writer's.
+	uid, gid, ok := fileOwner(filepath.Join(mgr.dataDir, "servers", s.ID, "server.properties"))
+	if !ok {
+		t.Skip("no ownership information on this filesystem")
+	}
 
 	oldRootChown, oldEuid := rootChown, geteuid
 	t.Cleanup(func() { rootChown, geteuid = oldRootChown, oldEuid })
@@ -151,10 +192,6 @@ func TestSavingSettingsKeepsTheGameAsOwner(t *testing.T) {
 
 	if len(handed) == 0 {
 		t.Fatal("saving a setting replaced server.properties without handing it back to the game's user")
-	}
-	uid, gid, ok := fileOwner(filepath.Join(mgr.dataDir, "servers", s.ID, "server.properties"))
-	if !ok {
-		t.Skip("no ownership information on this filesystem")
 	}
 	for _, h := range handed {
 		if h[1] != uid || h[2] != gid {
@@ -185,21 +222,28 @@ func TestCreatingADockerServerHandsTheTreeToTheGameUser(t *testing.T) {
 
 	// Scoped to the server's own tree. The same run also rewrites servers.json,
 	// which is panel state and correctly keeps the data directory's owner - a
-	// create must not hand the panel's ledger to the game.
+	// create must not hand the panel's ledger to the game. Compared against
+	// that owner rather than against the game's uid, because the user running
+	// the suite can itself be uid 1000.
+	panelUID, panelGID, ok := fileOwner(mgr.dataDir)
+	if !ok {
+		t.Skip("no ownership information on this filesystem")
+	}
 	want := filepath.Join(mgr.dataDir, "servers", s.ID)
 	var sawRoot bool
 	for _, c := range *calls {
-		p := c[0].(string)
-		if !strings.HasPrefix(p, want) {
-			if c[1] == containerRunUID && c[2] == containerRunGID {
-				t.Errorf("%s is outside the server tree but was handed to the game's user", p)
+		if !strings.HasPrefix(c.path, want) {
+			if c.tree || c.uid != panelUID || c.gid != panelGID {
+				t.Errorf("%s is outside the server tree but was handed to %d:%d (tree=%v); "+
+					"panel state keeps the data directory's owner %d:%d",
+					c.path, c.uid, c.gid, c.tree, panelUID, panelGID)
 			}
 			continue
 		}
-		if c[1] != containerRunUID || c[2] != containerRunGID {
-			t.Errorf("%s handed to %v:%v, want %d:%d", p, c[1], c[2], containerRunUID, containerRunGID)
+		if c.uid != containerRunUID || c.gid != containerRunGID {
+			t.Errorf("%s handed to %d:%d, want %d:%d", c.path, c.uid, c.gid, containerRunUID, containerRunGID)
 		}
-		if p == want {
+		if c.path == want {
 			sawRoot = true
 		}
 	}
@@ -216,13 +260,24 @@ func TestCreatingASimulatorServerDoesNotChangeOwnership(t *testing.T) {
 	if err := mgr.Load(); err != nil {
 		t.Fatalf("load: %v", err)
 	}
+	panelUID, panelGID, ok := fileOwner(mgr.dataDir)
+	if !ok {
+		t.Skip("no ownership information on this filesystem")
+	}
 	calls := withChownRecorder(t)
 	if _, err := mgr.Create("Sim", "paper", "1.20.4", 25601, 0, 0, RuntimeSim); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	// No tree handover at all, and every replaced file keeps the panel's own
+	// owner. Both, because the suite's user can be uid 1000 itself, which
+	// makes a handover to the container user indistinguishable by uid alone.
 	for _, c := range *calls {
-		if c[1] == containerRunUID {
-			t.Fatalf("a simulator server's tree was handed to the container user: %v", c)
+		if c.tree {
+			t.Fatalf("a simulator server's tree was handed over: %+v", c)
+		}
+		if c.uid != panelUID || c.gid != panelGID {
+			t.Fatalf("%s was handed to %d:%d; the simulator runs as the panel's own %d:%d",
+				c.path, c.uid, c.gid, panelUID, panelGID)
 		}
 	}
 }

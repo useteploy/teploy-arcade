@@ -212,12 +212,15 @@ func TestCloneFailsWhenServerPropertiesCannotBeWritten(t *testing.T) {
 // done would be a success that vanishes on the next restart.
 func TestCloneFailsWhenTheServerListCannotBeSaved(t *testing.T) {
 	mgr, src := cloneFixture(t)
-	// servers.json lives in the data dir; making that unwritable is what a
-	// full or read-only system disk looks like to Save().
-	if err := os.Chmod(mgr.dataDir, 0o500); err != nil {
-		t.Skipf("cannot chmod in this environment: %v", err)
+	// A directory where servers.json should be makes Save's publishing rename
+	// fail for every user, root included - a 0500 data dir did not, because
+	// root ignores the permission bits.
+	if err := os.Remove(mgr.storePath()); err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(mgr.dataDir, 0o755) })
+	if err := os.Mkdir(mgr.storePath(), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	before := len(mgr.List())
 	job, err := mgr.StartClone(CloneRequest{Source: src.ID, Port: 25599}, "tester")
